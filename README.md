@@ -1,54 +1,66 @@
-# Cosmos Bot
+# Cosmos bot
 
-Auto-trades Cosmos insider signals on Polymarket. **Cosmos is the brain** (it decides what
-to trade, via the API); **this bot is just the hands** (it places the orders with *your*
-Polymarket keys, which never leave your machine).
+Trades Cosmos insider signals automatically through **your own** Polymarket keys. Your wallet key
+never leaves your machine — the bot signs orders locally and routes them through the Cosmos relay,
+which meters usage ($0.09 / order) and enforces your daily limit.
 
-Requires the **Bot add-on** (or Gold) on your Cosmos account.
+This repo is intentionally **separate** from the main Cosmos app: it's the only piece that touches
+your private key, so it ships and is reviewed on its own.
 
 ## Install
 
-```bash
-python -m venv .venv && . .venv/Scripts/activate   # Windows
-# python3 -m venv .venv && source .venv/bin/activate  # macOS/Linux
-pip install -r requirements.txt
-cp .env.example .env
+```sh
+git clone https://github.com/<your-org>/cosmos-bot.git
+cd cosmos-bot
+npm install
+npm run setup      # enter your Cosmos token + Polymarket keys + per-trade %
+npm start
 ```
 
-## Configure (`.env`)
+Requires **Node.js 18+** (https://nodejs.org). One-line installers are in `install.ps1` /
+`install.sh` (set your repo URL inside them first).
 
-1. **`COSMOS_TOKEN`** — generate at https://try-cosmos.com/settings → API tokens.
-2. **`POLYMARKET_PRIVATE_KEY`** (+ `POLYMARKET_FUNDER_ADDRESS`, `POLYMARKET_SIGNATURE_TYPE`)
-   — your own Polymarket wallet creds. For email/magic-link accounts use signature type `1`
-   and your proxy address as the funder.
-3. **Filters** — `MIN_INSIDER_SCORE`, `MIN/MAX_PRICE_CENTS`, `TRADE_USD`,
-   `MAX_OPEN_TRADES_PER_DAY`, `CATEGORIES_ALLOW` / `CATEGORIES_BLOCK`.
-4. **`DRY_RUN=true`** (default) — logs every trade it *would* make, places nothing.
+## How it works
 
-## Run
+Each cycle (default 30s):
 
-```bash
-python main.py
-```
+1. **Reads** your settings (`/api/v1/account`) and the **already-filtered** feed
+   (`/api/v1/signals`) — limited to your plan, sources, categories, and min-score.
+2. **Opens** positions: sizes at your per-trade %, skips markets past the insider entry, signs
+   the order locally, and places it through the relay.
+3. **Exits** using your TP/SL setting:
+   - **Cosmos AI** → `/api/v1/positions/advice` (whale-exit measured in shares + price). The bot
+     obeys the verdict.
+   - **Fixed / Percent** → evaluated locally against the live price.
+4. Optionally manages your **existing** Polymarket positions too (`applyToManualTrades`).
 
-It loops every `POLL_SECONDS`: pulls your tier's signals from Cosmos, applies your filters,
-and (when `DRY_RUN=false`) places a Fill-Or-Kill BUY for `TRADE_USD` on each new market.
-It never buys the same market twice (`state.json`) and stops at the daily cap.
+Open positions persist to `positions.json`, so a restart resumes safely.
 
-## Going live
+## Safety
 
-When the dry-run logs look right, set `DRY_RUN=false` and add your `POLYMARKET_PRIVATE_KEY`.
-**You** hold the keys and the risk — Cosmos never sees them, and never executes anything.
+- The private key lives only in `config.json` on your machine and only signs orders.
+- Cosmos never holds or moves funds. CLOB credentials pass through the relay in transit and are
+  **not stored** on Cosmos servers.
+- `config.json` and `positions.json` are git-ignored — never commit them.
 
-## Files
+## Status / to verify
 
-| file | role |
-|---|---|
-| `config.py` | env loading + validation |
-| `cosmos.py` | the Cosmos API (the brain) |
-| `filters.py` | your trade filters + a keyword categorizer |
-| `polymarket.py` | CLOB v2 order execution + token resolution |
-| `state.py` | dedupe + daily cap |
-| `main.py` | the loop |
+The Cosmos-side logic (feed, sizing, dedupe, exits, relay) is complete. The Polymarket glue in
+`src/polymarket.mjs` is written against `@polymarket/clob-client` v4 — **run one small live order
+first** to confirm the three marked spots (create order / L2 headers / relay body) against your
+installed client version before trusting size.
+
+## Config (`config.json`)
+
+| field | meaning |
+| --- | --- |
+| `cosmosApi` | `https://try-cosmos.com` |
+| `cosmosToken` | your `csk_…` API token |
+| `polymarket.privateKey` | wallet key used to sign (local only) |
+| `polymarket.funderAddress` | your Polymarket proxy/funder address |
+| `perTradePct` | % of balance per trade |
+| `pollSeconds` | cycle interval |
+| `maxConcurrent` | max open positions |
+| `applyToManualTrades` | also run exits on your existing positions |
 
 Not financial advice. Trade at your own risk.

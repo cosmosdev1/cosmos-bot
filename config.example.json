@@ -1,0 +1,12 @@
+{
+  "cosmosApi": "https://try-cosmos.com",
+  "cosmosToken": "csk_your_token_here",
+  "polymarket": {
+    "privateKey": "0xYOUR_WALLET_PRIVATE_KEY",
+    "funderAddress": "0xYOUR_POLYMARKET_PROXY_ADDRESS"
+  },
+  "perTradePct": 5,
+  "pollSeconds": 30,
+  "maxConcurrent": 10,
+  "applyToManualTrades": false
+}

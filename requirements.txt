@@ -1,5 +1,0 @@
-# Polymarket migrated to CLOB v2 (2026-04) - the v2 client is REQUIRED, the old
-# py-clob-client returns 400 order_version_mismatch on every order.
-py-clob-client-v2>=1.0.0
-requests>=2.31.0
-python-dotenv>=1.0.0
