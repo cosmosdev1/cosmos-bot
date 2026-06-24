@@ -43,7 +43,7 @@ export async function makePolymarket(config) {
       const key = `${conditionId}:${outcome}`.toLowerCase();
       if (tokenCache.has(key)) return tokenCache.get(key);
       try {
-        const res = await fetch(`${GAMMA}/markets?condition_ids=${conditionId}`);
+        const res = await fetch(`${GAMMA}/markets?condition_ids=${encodeURIComponent(conditionId)}`);
         const arr = await res.json();
         const m = Array.isArray(arr) ? arr[0] : null;
         if (!m) return null;
@@ -70,9 +70,13 @@ export async function makePolymarket(config) {
     },
 
     // Build + sign an order locally; return the exact CLOB request for the relay to forward.
-    async buildSignedOrder({ tokenId, side, sizeShares, priceCents }) {
+    // Default order type is FAK (Fill-And-Kill): fill whatever liquidity is available at this
+    // price NOW and cancel the rest — never rests on the book. The bot passes a *marketable*
+    // price (above mid to buy / below mid to sell) so stops actually execute.
+    async buildSignedOrder({ tokenId, side, sizeShares, priceCents, orderType = "FAK" }) {
       const price = Math.max(0.01, Math.min(0.99, priceCents / 100));
       const size = Math.max(1, Math.floor(sizeShares));
+      const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
 
       // (1) CREATE ORDER — build + sign (EIP-712) with the local wallet.
       const signed = await client.createOrder({
@@ -84,7 +88,7 @@ export async function makePolymarket(config) {
       });
 
       // (2) L2 HEADERS — the POLY_* auth headers Polymarket expects on POST /order.
-      const body = { order: signed, owner: creds.key, orderType: OrderType.GTC };
+      const body = { order: signed, owner: creds.key, orderType: ot };
       const headers = await client.createL2Headers({ method: "POST", requestPath: "/order", body: JSON.stringify(body) });
 
       // (3) RELAY BODY — exactly what /api/v1/orders forwards to clob.polymarket.com.
@@ -97,7 +101,7 @@ export async function makePolymarket(config) {
     // The wallet's current Polymarket holdings (for "apply to manual trades").
     async getMyPositions() {
       try {
-        const res = await fetch(`${DATA_API}/positions?user=${funder}&sizeThreshold=1`);
+        const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=1`);
         const arr = await res.json();
         if (!Array.isArray(arr)) return [];
         return arr

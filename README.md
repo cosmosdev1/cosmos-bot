@@ -38,10 +38,23 @@ Open positions persist to `positions.json`, so a restart resumes safely.
 
 ## Safety
 
-- The private key lives only in `config.json` on your machine and only signs orders.
-- Cosmos never holds or moves funds. CLOB credentials pass through the relay in transit and are
-  **not stored** on Cosmos servers.
+- The private key lives only in `config.json` on your machine (written owner-only, `0600`) and is
+  used solely to sign orders. It is **never** sent anywhere.
+- Cosmos never holds or moves funds. Your CLOB API credentials (not the private key) pass *through*
+  the relay in transit to reach Polymarket and are **not stored** on Cosmos servers.
 - `config.json` and `positions.json` are git-ignored — never commit them.
+- Orders are placed **marketable Fill-And-Kill** (fill now or cancel — they never rest), and the
+  bot **reconciles** `positions.json` against your real wallet each cycle, so state can't drift.
+
+## Supply chain
+
+Pin and review dependencies. After install:
+
+```sh
+npm audit
+```
+
+The only runtime deps are `@polymarket/clob-client` and `ethers`.
 
 ## Status / to verify
 

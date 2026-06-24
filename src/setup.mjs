@@ -46,6 +46,6 @@ const config = {
   maxConcurrent,
   applyToManualTrades: applyAns.startsWith("y"),
 };
-writeFileSync("./config.json", JSON.stringify(config, null, 2));
-console.log("\n  Saved config.json. Start the bot with:  npm start\n");
+writeFileSync("./config.json", JSON.stringify(config, null, 2), { mode: 0o600 }); // owner-only (protects the key)
+console.log("\n  Saved config.json (owner-only). Start the bot with:  npm start\n");
 rl.close();

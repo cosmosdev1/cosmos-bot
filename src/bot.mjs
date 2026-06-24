@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Cosmos API trading bot — main loop. Reads your filtered feed from Cosmos, sizes positions,
-// signs orders locally, places them through the metering relay, and runs the exit logic
-// (Cosmos AI / fixed / percent). Open positions persist to positions.json.
+// signs orders locally, places them through the metering relay (marketable Fill-And-Kill), and
+// runs the exit logic (Cosmos AI / fixed / percent). State is RECONCILED against your real
+// Polymarket holdings each cycle, so positions.json never drifts from reality.
 import { existsSync, readFileSync } from "node:fs";
 import { makeCosmos } from "./cosmos.mjs";
 import { makePolymarket } from "./polymarket.mjs";
@@ -16,6 +17,10 @@ const config = JSON.parse(readFileSync("./config.json", "utf8"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 
+const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
+const SELL_BUFFER = 5; // marketable sell: offer a few cents below mid so stops actually fill
+const HARD_STOP_FRAC = 0.5; // advice unreachable -> still exit if price has halved
+
 // Local TP/SL evaluation (fixed price / percent) against the live price.
 function localExit(settings, entryCents, curCents) {
   if (!curCents) return { action: "HOLD" };
@@ -28,12 +33,15 @@ function localExit(settings, entryCents, curCents) {
 }
 
 async function decideExit(cosmos, pm, settings, pos) {
-  // "Cosmos AI" mode -> ask the server brain (whale-exit + price). Otherwise evaluate locally.
+  // "Cosmos AI" mode -> ask the server brain. If it's unreachable (e.g. rate-limited), still apply
+  // a local hard stop so a crashing position exits rather than riding down.
   if (settings.tp_mode === "ai" || settings.sl_mode === "ai") {
     try {
       return await cosmos.advice(pos);
     } catch (e) {
       warn("advice:", e.message);
+      const cur = await pm.getPriceCents(pos.token_id);
+      if (cur && cur <= pos.entry_cents * HARD_STOP_FRAC) return { action: "STOP_LOSS", reason: "local hard stop (advice unavailable)" };
       return { action: "HOLD" };
     }
   }
@@ -41,73 +49,92 @@ async function decideExit(cosmos, pm, settings, pos) {
   return localExit(settings, pos.entry_cents, cur);
 }
 
-async function sell(cosmos, pm, pos) {
-  const cur = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
-  const shares = pos.size_shares ?? sharesFor(pos.size_usd ?? 0, cur);
-  const order = await pm.buildSignedOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: shares, priceCents: cur });
-  return cosmos.relayOrder(order);
+// Place a marketable Fill-And-Kill SELL for the shares we actually hold.
+async function marketableSell(cosmos, pm, pos) {
+  const mid = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
+  const sellPrice = Math.max(1, mid - SELL_BUFFER);
+  const order = await pm.buildSignedOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
+  return { mid, ...(await cosmos.relayOrder(order)) };
+}
+
+async function holdingsMap(pm) {
+  const m = new Map();
+  for (const p of await pm.getMyPositions()) m.set(p.condition_id, p);
+  return m;
 }
 
 async function cycle(cosmos, pm) {
-  const positions = store.load();
   const account = await cosmos.account();
   const settings = account.settings;
-  const feed = await cosmos.signals();
+
+  // --- RECONCILE: make positions.json match the real wallet (handles unfilled/partial/sold). ---
+  const positions = store.load();
+  const held = await holdingsMap(pm);
+  for (const cid of Object.keys(positions)) {
+    const h = held.get(cid);
+    if (!h || h.size_shares < 1) { delete positions[cid]; continue; } // never filled or already sold
+    positions[cid].size_shares = h.size_shares; // sync to actual holding
+    if (!positions[cid].token_id) positions[cid].token_id = h.token_id;
+  }
+  store.save(positions);
+
   const balance = await pm.getBalanceUsd();
+  const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
   log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · $${balance.toFixed(2)}`);
 
-  // --- ENTRIES ---
-  for (const s of feed.signals) {
-    if (!s.condition_id || positions[s.condition_id]) continue; // dedupe by market (across sources)
-    if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break;
-    if (s.price_cents > s.max_entry_price) continue; // already ran past the insider entry
-
-    const sizeUsd = Math.max(1, (balance * (settings.per_trade_pct ?? config.perTradePct ?? 5)) / 100);
-    if (sizeUsd > balance) continue;
-
-    const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
-    if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; }
-
-    const shares = sharesFor(sizeUsd, s.price_cents);
-    const order = await pm.buildSignedOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: s.price_cents });
-    const r = await cosmos.relayOrder(order);
-    if (r.status === 402) { warn("daily spend limit reached — pausing entries."); break; }
-    if (!r.ok) { warn("entry failed:", r.body?.error || r.status); continue; }
-
-    positions[s.condition_id] = {
-      condition_id: s.condition_id, token_id: tokenId, outcome: s.outcome, source: s.source,
-      entry_cents: s.price_cents, size_usd: sizeUsd, size_shares: shares, entry_whales: s.entry_whales || [],
-      market_question: s.market_question, opened_at: new Date().toISOString(),
-    };
-    store.save(positions);
-    log(`BUY  ${s.outcome} @ ${s.price_cents}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
-  }
-
-  // --- EXITS (bot positions) ---
+  // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   for (const cid of Object.keys(positions)) {
     const pos = positions[cid];
     const v = await decideExit(cosmos, pm, settings, pos);
     if (!v || v.action === "HOLD") continue;
-    const r = await sell(cosmos, pm, pos);
-    if (r.ok) {
-      log(`${v.action} ${pos.outcome} · ${v.reason || ""}`);
-      delete positions[cid];
-      store.save(positions);
-    } else {
-      warn("exit failed:", r.body?.error || r.status);
-    }
+    const r = await marketableSell(cosmos, pm, pos);
+    if (r.ok) log(`${v.action} ${pos.outcome} @ ~${r.mid}c · ${v.reason || ""}`);
+    else warn("exit failed:", r.body?.error || r.status);
+    // Don't delete here — next cycle's reconcile removes it once the holding is actually gone.
+    // FAK never rests, so re-attempting next cycle can't stack duplicate orders.
   }
 
-  // --- MANUAL TRADES (apply the same exits to your own positions, if enabled) ---
+  // --- ENTRIES (respect remaining balance; skip markets already held). ---
+  let remaining = balance;
+  for (const s of feed.signals) {
+    if (!s.condition_id || positions[s.condition_id] || held.has(s.condition_id)) continue;
+    if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break;
+
+    const sizeUsd = Math.max(1, (balance * (settings.per_trade_pct ?? config.perTradePct ?? 5)) / 100);
+    if (sizeUsd > remaining) continue;
+
+    const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
+    if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; }
+
+    const mid = (await pm.getPriceCents(tokenId)) ?? s.price_cents;
+    if (mid > s.max_entry_price) continue; // already ran past the insider entry (checked live)
+
+    const buyPrice = Math.min(98, s.max_entry_price, mid + BUY_BUFFER); // marketable, capped
+    const shares = sharesFor(sizeUsd, buyPrice);
+    const order = await pm.buildSignedOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
+    const r = await cosmos.relayOrder(order);
+    if (r.status === 402) { warn("daily spend limit reached — pausing entries."); break; }
+    if (!r.ok) { warn("entry failed:", r.body?.error || r.status); continue; }
+
+    remaining -= sizeUsd;
+    positions[s.condition_id] = {
+      condition_id: s.condition_id, token_id: tokenId, outcome: s.outcome, source: s.source,
+      entry_cents: mid, size_usd: sizeUsd, size_shares: shares, entry_whales: s.entry_whales || [],
+      market_question: s.market_question, opened_at: new Date().toISOString(),
+    };
+    store.save(positions);
+    log(`BUY  ${s.outcome} @ ~${mid}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
+  }
+
+  // --- MANUAL TRADES (apply the same exits to your existing positions, if enabled). ---
   if (config.applyToManualTrades && (settings.tp_manual || settings.sl_manual)) {
-    const mine = await pm.getMyPositions();
-    for (const m of mine) {
-      if (positions[m.condition_id]) continue; // a bot position — handled above
+    for (const m of held.values()) {
+      if (positions[m.condition_id]) continue; // a bot position — already handled
       const pos = { condition_id: m.condition_id, token_id: m.token_id, outcome: m.outcome, entry_cents: m.entry_cents, size_shares: m.size_shares, entry_whales: [] };
       const v = await decideExit(cosmos, pm, settings, pos);
       if (!v || v.action === "HOLD") continue;
-      const r = await sell(cosmos, pm, pos);
-      if (r.ok) log(`(manual) ${v.action} ${m.outcome} · ${v.reason || ""}`);
+      const r = await marketableSell(cosmos, pm, pos);
+      if (r.ok) log(`(manual) ${v.action} ${m.outcome} @ ~${r.mid}c · ${v.reason || ""}`);
     }
   }
 }
