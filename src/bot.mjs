@@ -156,9 +156,9 @@ async function cycle(cosmos, pm) {
       const shares = sharesFor(sizeUsd, buyPrice);
       const order = await pm.buildSignedOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
       const r = await cosmos.relayOrder(order);
-      if (r.status === 402) { warn("daily spend limit reached — pausing entries."); break; }
       if (!r.ok) { warn("entry failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; }
 
+      // Order placed at Polymarket — record it (even if the daily limit is now reached).
       remaining -= sizeUsd;
       deployed += sizeUsd;
       positions[s.condition_id] = {
@@ -168,6 +168,7 @@ async function cycle(cosmos, pm) {
       };
       store.save(positions);
       log(`BUY  ${s.outcome} @ ~${mid}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
+      if (r.status === 402) { warn("daily spend limit reached — pausing entries."); break; }
     }
     if (sizedOut) log(`${sizedOut} new markets skipped: per-trade size below the $1 minimum (raise your size in the dashboard)`);
   }
