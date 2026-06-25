@@ -107,7 +107,7 @@ async function cycle(cosmos, pm) {
     if (!v || v.action === "HOLD") continue;
     const r = await marketableSell(cosmos, pm, pos);
     if (r.ok) log(`${v.action} ${pos.outcome} @ ~${r.mid}c · ${v.reason || ""}`);
-    else warn("exit failed:", r.body?.error || r.status);
+    else warn("exit failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400));
     // Don't delete here — next cycle's reconcile removes it once the holding is actually gone.
     // FAK never rests, so re-attempting next cycle can't stack duplicate orders.
   }
@@ -135,7 +135,7 @@ async function cycle(cosmos, pm) {
     const order = await pm.buildSignedOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
     const r = await cosmos.relayOrder(order);
     if (r.status === 402) { warn("daily spend limit reached — pausing entries."); break; }
-    if (!r.ok) { warn("entry failed:", r.body?.error || r.status); continue; }
+    if (!r.ok) { warn("entry failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; }
 
     remaining -= sizeUsd;
     deployed += sizeUsd;
