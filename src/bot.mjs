@@ -14,6 +14,9 @@ if (!existsSync("./config.json")) {
   process.exit(1);
 }
 const config = JSON.parse(readFileSync("./config.json", "utf8"));
+// One-time switch: evaluate + buy the markets ALREADY in the feed on this start
+// (instead of only newly-added ones). Set COSMOS_BUY_BACKLOG=1 or config.buyBacklogOnStart.
+const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_BACKLOG === "1";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 
@@ -118,13 +121,14 @@ async function cycle(cosmos, pm) {
   for (const [cid, t] of Object.entries(seen)) if (new Date(t).getTime() < cutoff) delete seen[cid];
   const nowIso = new Date().toISOString();
 
-  if (Object.keys(seen).length === 0) {
+  if (Object.keys(seen).length === 0 && !BUY_BACKLOG) {
     // First run: record the current markets but do NOT buy the backlog — only act on
-    // markets added from now on. (Delete seen.json to re-evaluate the current feed.)
+    // markets added from now on. (Use COSMOS_BUY_BACKLOG=1 to buy the current feed.)
     for (const s of feed.signals) if (s.condition_id) seen[s.condition_id] = nowIso;
     store.saveSeen(seen);
     log(`watching ${Object.keys(seen).length} markets · will buy only newly-added ones`);
   } else {
+    let sizedOut = 0; // markets skipped because the per-trade size was below the $1 min
     // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
     const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? 5, tierPct: {}, conviction: false, maxPerTradeUsd: null, maxExposurePct: null };
     let remaining = balance;
@@ -139,7 +143,8 @@ async function cycle(cosmos, pm) {
       store.saveSeen(seen);
 
       const sizeUsd = sizeForSignal(sizing, s, balance, deployed);
-      if (sizeUsd < 1 || sizeUsd > remaining) continue; // below Polymarket's ~$1 min, or out of balance
+      if (sizeUsd > remaining) continue; // out of balance
+      if (sizeUsd < 1) { sizedOut++; continue; } // below Polymarket's ~$1 min
 
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
       if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; }
@@ -164,6 +169,7 @@ async function cycle(cosmos, pm) {
       store.save(positions);
       log(`BUY  ${s.outcome} @ ~${mid}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
     }
+    if (sizedOut) log(`${sizedOut} new markets skipped: per-trade size below the $1 minimum (raise your size in the dashboard)`);
   }
 
   // --- MANUAL TRADES (apply the same exits to your existing positions, if enabled). ---
