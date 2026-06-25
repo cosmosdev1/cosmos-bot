@@ -96,6 +96,7 @@ async function cycle(cosmos, pm) {
     const h = held.get(cid);
     if (!h || h.size_shares < 1) { delete positions[cid]; continue; } // never filled or already sold
     positions[cid].size_shares = h.size_shares; // sync to actual holding
+    if (h.entry_cents > 0) positions[cid].entry_cents = h.entry_cents; // sync the REAL avg fill price
     if (!positions[cid].token_id) positions[cid].token_id = h.token_id;
   }
   store.save(positions);
@@ -134,42 +135,46 @@ async function cycle(cosmos, pm) {
     const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? 5, tierPct: {}, conviction: false, maxPerTradeUsd: null, maxExposurePct: null };
     let remaining = balance;
     let deployed = Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
+    // Mark a market "evaluated" so it's never reconsidered. Called only after a real decision
+    // (sized-out, price ran past entry, or an order was attempted) — NOT on transient failures
+    // (token unresolved, no live price, out of balance), so a blip doesn't lose a good signal.
+    const markSeen = (cid) => { seen[cid] = nowIso; store.saveSeen(seen); };
+
     for (const s of feed.signals) {
       if (!s.condition_id) continue;
       if (seen[s.condition_id] || positions[s.condition_id] || held.has(s.condition_id)) continue; // already evaluated / held
       if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break; // full — leave for when a slot frees
 
-      // Newly-added market: evaluate it exactly once. Mark seen up front so it never retries.
-      seen[s.condition_id] = nowIso;
-      store.saveSeen(seen);
-
       const sizeUsd = sizeForSignal(sizing, s, balance, deployed);
-      if (sizeUsd > remaining) continue; // out of balance
-      if (sizeUsd < 1) { sizedOut++; continue; } // below Polymarket's ~$1 min
+      if (sizeUsd > remaining) continue; // out of balance now — retry when balance/slots free
+      if (sizeUsd < 1) { sizedOut++; markSeen(s.condition_id); continue; } // too small — a decision
 
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
-      if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; }
+      if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; } // transient — retry
 
-      const mid = (await pm.getPriceCents(tokenId)) ?? s.price_cents;
-      if (mid > s.max_entry_price) continue; // already ran past the insider entry (checked live)
+      const mid = await pm.getPriceCents(tokenId);
+      if (mid == null) { warn("no live price:", (s.market_question || "").slice(0, 50)); continue; } // don't enter at a stale price — retry
+      if (mid > s.max_entry_price) { markSeen(s.condition_id); continue; } // ran past the insider entry — a decision
 
       const buyPrice = Math.min(98, s.max_entry_price, mid + BUY_BUFFER); // marketable, capped
       const shares = sharesFor(sizeUsd, buyPrice);
       const r = await pm.placeOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
+      markSeen(s.condition_id); // order attempted — one shot per market (buy once)
       if (!r.ok) { warn("entry failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; }
 
-      // Order placed at Polymarket — meter the $0.09 + record the position.
+      // Order placed at Polymarket — meter the $0.09 + record the position (entry = the price we bid;
+      // the next reconcile syncs the real avg fill from holdings).
       let paused = false;
       try { const m = await cosmos.meter(r.meta); paused = Boolean(m?.paused); } catch { /* meter best-effort */ }
       remaining -= sizeUsd;
       deployed += sizeUsd;
       positions[s.condition_id] = {
         condition_id: s.condition_id, token_id: tokenId, outcome: s.outcome, source: s.source,
-        entry_cents: mid, size_usd: sizeUsd, size_shares: shares, entry_whales: s.entry_whales || [],
+        entry_cents: buyPrice, size_usd: sizeUsd, size_shares: shares, entry_whales: s.entry_whales || [],
         market_question: s.market_question, opened_at: new Date().toISOString(),
       };
       store.save(positions);
-      log(`BUY  ${s.outcome} @ ~${mid}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
+      log(`BUY  ${s.outcome} @ ~${buyPrice}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
       if (paused) { warn("daily spend limit reached — pausing entries."); break; }
     }
     if (sizedOut) log(`${sizedOut} new markets skipped: per-trade size below the $1 minimum (raise your size in the dashboard)`);
