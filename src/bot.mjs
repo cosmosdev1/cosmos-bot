@@ -89,6 +89,14 @@ async function cycle(cosmos, pm) {
   const account = await cosmos.account();
   const settings = account.settings;
 
+  // --- MASTER STOP: the dashboard Start/Stop switch. When stopped, the bot trades nothing
+  // (no entries, no exits) but stays connected and re-checks every cycle, so Start resumes it. ---
+  if (settings.bot_enabled === false) {
+    const open = Object.keys(store.load()).length;
+    log(`paused · start the bot from your Cosmos dashboard${open ? ` · ${open} open position(s) NOT being managed` : ""}`);
+    return;
+  }
+
   // --- RECONCILE: make positions.json match the real wallet (handles unfilled/partial/sold). ---
   const positions = store.load();
   const held = await holdingsMap(pm);
