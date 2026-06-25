@@ -17,6 +17,24 @@ const config = JSON.parse(readFileSync("./config.json", "utf8"));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 
+// Per-trade USD from the dashboard sizing config (synced from /api/v1/account each cycle).
+//   pct -> % of balance · fixed -> $ · tiered -> % by the signal's tier.
+// Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
+function sizeForSignal(z, s, balance, deployed) {
+  let usd;
+  if (z.mode === "fixed") usd = Number(z.fixedUsd) || 0;
+  else if (z.mode === "tiered") {
+    const tp = z.tierPct || {};
+    usd = (balance * (Number(tp[s.lock_tier] ?? tp.free ?? 0) || 0)) / 100;
+  } else {
+    usd = (balance * (Number(z.pct) || 0)) / 100;
+  }
+  if (z.conviction && s.score) usd *= 0.5 + Number(s.score) / 10; // score 0..10 -> 0.5x..1.5x
+  if (z.maxPerTradeUsd) usd = Math.min(usd, Number(z.maxPerTradeUsd));
+  if (z.maxExposurePct) usd = Math.min(usd, Math.max(0, (balance * Number(z.maxExposurePct)) / 100 - deployed));
+  return usd;
+}
+
 const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
 const SELL_BUFFER = 5; // marketable sell: offer a few cents below mid so stops actually fill
 const HARD_STOP_FRAC = 0.5; // advice unreachable -> still exit if price has halved
@@ -95,13 +113,16 @@ async function cycle(cosmos, pm) {
   }
 
   // --- ENTRIES (respect remaining balance; skip markets already held). ---
+  // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
+  const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? 5, tierPct: {}, conviction: false, maxPerTradeUsd: null, maxExposurePct: null };
   let remaining = balance;
+  let deployed = Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
   for (const s of feed.signals) {
     if (!s.condition_id || positions[s.condition_id] || held.has(s.condition_id)) continue;
     if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break;
 
-    const sizeUsd = Math.max(1, (balance * (settings.per_trade_pct ?? config.perTradePct ?? 5)) / 100);
-    if (sizeUsd > remaining) continue;
+    const sizeUsd = sizeForSignal(sizing, s, balance, deployed);
+    if (sizeUsd < 1 || sizeUsd > remaining) continue; // below Polymarket's ~$1 min, or out of balance
 
     const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
     if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; }
@@ -117,6 +138,7 @@ async function cycle(cosmos, pm) {
     if (!r.ok) { warn("entry failed:", r.body?.error || r.status); continue; }
 
     remaining -= sizeUsd;
+    deployed += sizeUsd;
     positions[s.condition_id] = {
       condition_id: s.condition_id, token_id: tokenId, outcome: s.outcome, source: s.source,
       entry_cents: mid, size_usd: sizeUsd, size_shares: shares, entry_whales: s.entry_whales || [],
