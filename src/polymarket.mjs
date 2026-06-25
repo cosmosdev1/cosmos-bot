@@ -79,12 +79,13 @@ export async function makePolymarket(config) {
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
 
       // (1) CREATE ORDER — build + sign (EIP-712) with the local wallet.
+      // Do NOT pass feeRateBps: the client fetches the market's required rate itself
+      // (GET /fee-rate). Passing 0 trips its mismatch guard when the market fee is non-zero.
       const signed = await client.createOrder({
         tokenID: tokenId,
         price,
         side: side === "SELL" ? Side.SELL : Side.BUY,
         size,
-        feeRateBps: 0,
       });
 
       // (2) L2 HEADERS — the POLY_* auth headers Polymarket expects on POST /order.
