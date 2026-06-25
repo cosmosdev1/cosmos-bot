@@ -9,11 +9,30 @@ import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
 import { log, warn, err } from "./log.mjs";
 
-if (!existsSync("./config.json")) {
-  console.error("No config.json — run `npm run setup` first.");
+// Config comes from config.json (local install via `npm run setup`) OR env vars (cloud/24-7
+// deploy — Render/Railway/Docker, where there's no interactive terminal). Env vars win so a
+// hosted box boots headlessly; the private key is whatever the host stores (never sent to Cosmos).
+function loadConfig() {
+  const f = existsSync("./config.json") ? JSON.parse(readFileSync("./config.json", "utf8")) : {};
+  const e = process.env;
+  return {
+    cosmosApi: (e.COSMOS_API || f.cosmosApi || "https://try-cosmos.com").replace(/\/$/, ""),
+    cosmosToken: e.COSMOS_TOKEN || f.cosmosToken,
+    polymarket: {
+      privateKey: e.POLYMARKET_PRIVATE_KEY || f.polymarket?.privateKey,
+      funderAddress: e.POLYMARKET_FUNDER || f.polymarket?.funderAddress || "",
+    },
+    pollSeconds: Number(e.POLL_SECONDS) || f.pollSeconds || 30,
+    maxConcurrent: Number(e.MAX_CONCURRENT) || f.maxConcurrent || 10,
+    applyToManualTrades: f.applyToManualTrades ?? e.APPLY_TO_MANUAL === "1",
+    buyBacklogOnStart: f.buyBacklogOnStart === true || e.COSMOS_BUY_BACKLOG === "1",
+  };
+}
+const config = loadConfig();
+if (!config.cosmosToken || !config.polymarket.privateKey) {
+  console.error("Missing config. Either run `npm run setup` (local) or set the env vars COSMOS_TOKEN + POLYMARKET_PRIVATE_KEY (+ POLYMARKET_FUNDER) for a 24/7 host.");
   process.exit(1);
 }
-const config = JSON.parse(readFileSync("./config.json", "utf8"));
 // One-time switch: evaluate + buy the markets ALREADY in the feed on this start
 // (instead of only newly-added ones). Set COSMOS_BUY_BACKLOG=1 or config.buyBacklogOnStart.
 const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_BACKLOG === "1";

@@ -20,6 +20,26 @@ npm start
 Requires **Node.js 18+** (https://nodejs.org). One-line installers are in `install.ps1` /
 `install.sh` (set your repo URL inside them first).
 
+## Run it 24/7 (computer can be off)
+
+The bot is a long-running process, so closing your computer stops it. To trade around the clock,
+run it on an always-on box **you control** — your key still never reaches Cosmos. Simplest is a
+one-click deploy to **Render**:
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/cosmosdev1/cosmos-bot)
+
+1. Click the button and sign in to Render.
+2. When prompted, paste 3 secrets: `COSMOS_TOKEN`, `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER`.
+3. Deploy. It runs 24/7 (~$7/mo, billed to **your** Render account).
+
+The blueprint (`render.yaml`) pins **region: Frankfurt** on purpose — Polymarket geoblocks US
+datacenters, so an EU region is required (a US host gets "Trading restricted in your region").
+Your key is a Render secret env var, visible only to you — Cosmos never sees it, same as local.
+
+The included **`Dockerfile`** runs the exact same bot on any host (Railway, Fly.io, a $4 VPS, a
+Raspberry Pi) — just set the same env vars. State (`positions.json` / `seen.json`) persists to
+`COSMOS_DATA_DIR` (a mounted disk) so restarts resume safely.
+
 ## How it works
 
 Each cycle (default 30s):
@@ -54,14 +74,9 @@ Pin and review dependencies. After install:
 npm audit
 ```
 
-The only runtime deps are `@polymarket/clob-client` and `ethers`.
-
-## Status / to verify
-
-The Cosmos-side logic (feed, sizing, dedupe, exits, relay) is complete. The Polymarket glue in
-`src/polymarket.mjs` is written against `@polymarket/clob-client` v4 — **run one small live order
-first** to confirm the three marked spots (create order / L2 headers / relay body) against your
-installed client version before trusting size.
+The only runtime deps are `@polymarket/clob-client-v2` (Polymarket's CLOB **V2** client) and
+`viem` (the signer it uses). The old `@polymarket/clob-client` signs an order version Polymarket's
+V2 exchange now rejects — do not downgrade.
 
 ## Config (`config.json`)
 
@@ -75,5 +90,9 @@ installed client version before trusting size.
 | `pollSeconds` | cycle interval |
 | `maxConcurrent` | max open positions |
 | `applyToManualTrades` | also run exits on your existing positions |
+
+**On a hosted / 24-7 deploy** (no `config.json`), set these as **env vars** instead — they take
+precedence: `COSMOS_TOKEN`, `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER`, and optionally
+`COSMOS_DATA_DIR` (persistent-disk path for state), `COSMOS_API`, `POLL_SECONDS`, `MAX_CONCURRENT`.
 
 Not financial advice. Trade at your own risk.

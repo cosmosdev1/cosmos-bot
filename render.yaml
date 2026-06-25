@@ -1,0 +1,32 @@
+# One-click 24/7 deploy on Render — your computer can be OFF and the bot keeps trading.
+#
+# IMPORTANT — region: Polymarket geoblocks US datacenters, so this MUST run from an allowed
+# jurisdiction. `frankfurt` (EU) is verified to work; do not change it to a US region or orders
+# will be rejected with "Trading restricted in your region".
+#
+# Your Polymarket private key is a `sync: false` secret you paste into YOUR OWN Render account at
+# deploy time. It lives only in your Render env — Cosmos never sees it, exactly like running locally.
+services:
+  - type: worker            # always-on background process (no public port) — the bot loop
+    name: cosmos-bot
+    runtime: node
+    region: frankfurt       # EU — Polymarket-allowed. US regions get geoblocked.
+    plan: starter           # workers have no free tier (~$7/mo); needed for 24/7
+    autoDeploy: false       # don't restart the bot on every upstream push — you update on your schedule
+    buildCommand: npm install
+    startCommand: node src/bot.mjs
+    envVars:
+      - key: COSMOS_TOKEN            # your Cosmos API token (csk_...), from try-cosmos.com/cosmos-api
+        sync: false
+      - key: POLYMARKET_PRIVATE_KEY  # your wallet key — stays in YOUR Render account, never sent to Cosmos
+        sync: false
+      - key: POLYMARKET_FUNDER       # your Polymarket proxy/funder address (0x...)
+        sync: false
+      - key: COSMOS_DATA_DIR         # persist positions/seen on the mounted disk (survives restarts)
+        value: /data
+      - key: COSMOS_API
+        value: https://try-cosmos.com
+    disk:
+      name: cosmos-bot-state
+      mountPath: /data
+      sizeGB: 1
