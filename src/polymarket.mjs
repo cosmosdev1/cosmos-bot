@@ -4,7 +4,8 @@
 // Written against @polymarket/clob-client v4 and the documented CLOB request shape. The three
 // marked spots (CREATE ORDER / L2 HEADERS / RELAY BODY) are the parts to validate with one small
 // live order, since client method names + the order body can vary across clob-client versions.
-import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
+import { ClobClient, Side, OrderType, createL2Headers } from "@polymarket/clob-client";
+import { orderToJson } from "@polymarket/clob-client/dist/utilities.js";
 import { Wallet } from "ethers";
 
 const CHAIN_ID = 137; // Polygon
@@ -88,13 +89,19 @@ export async function makePolymarket(config) {
         size,
       });
 
-      // (2) L2 HEADERS — the POLY_* auth headers Polymarket expects on POST /order.
-      const body = { order: signed, owner: creds.key, orderType: ot };
-      const headers = await client.createL2Headers({ method: "POST", requestPath: "/order", body: JSON.stringify(body) });
+      // (2) BODY + L2 HEADERS — the exact POST /order payload (orderToJson) and the POLY_*
+      // auth headers signed over that body. createL2Headers is a top-level helper (not a
+      // client method); the relay re-serializes `body` to the identical string we signed.
+      const payload = orderToJson(signed, creds.key, ot);
+      const headers = await createL2Headers(wallet, creds, {
+        method: "POST",
+        requestPath: "/order",
+        body: JSON.stringify(payload),
+      });
 
-      // (3) RELAY BODY — exactly what /api/v1/orders forwards to clob.polymarket.com.
+      // (3) RELAY BODY — exactly what /api/v1/orders forwards to clob.polymarket.com/order.
       return {
-        clob: { path: "/order", method: "POST", headers, body },
+        clob: { path: "/order", method: "POST", headers, body: payload },
         meta: { market: tokenId, side: side.toLowerCase(), size, price: priceCents },
       };
     },
