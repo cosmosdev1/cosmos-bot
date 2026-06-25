@@ -1,11 +1,7 @@
 // Polymarket integration. The wallet private key stays on THIS machine and only signs orders.
-// Signed orders are handed to the Cosmos relay (cosmos.relayOrder), which meters + forwards them.
-//
-// Written against @polymarket/clob-client v4 and the documented CLOB request shape. The three
-// marked spots (CREATE ORDER / L2 HEADERS / RELAY BODY) are the parts to validate with one small
-// live order, since client method names + the order body can vary across clob-client versions.
-import { ClobClient, Side, OrderType, createL2Headers } from "@polymarket/clob-client";
-import { orderToJson } from "@polymarket/clob-client/dist/utilities.js";
+// The bot posts each signed order DIRECTLY to Polymarket (so Polymarket sees the user's own
+// region), then reports it to Cosmos for $0.09 metering. Written against @polymarket/clob-client v5.
+import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
 import { Wallet } from "ethers";
 
 const CHAIN_ID = 137; // Polygon
@@ -70,40 +66,32 @@ export async function makePolymarket(config) {
       }
     },
 
-    // Build + sign an order locally; return the exact CLOB request for the relay to forward.
-    // Default order type is FAK (Fill-And-Kill): fill whatever liquidity is available at this
-    // price NOW and cancel the rest — never rests on the book. The bot passes a *marketable*
-    // price (above mid to buy / below mid to sell) so stops actually execute.
-    async buildSignedOrder({ tokenId, side, sizeShares, priceCents, orderType = "FAK" }) {
+    // Sign an order locally and POST it DIRECTLY to Polymarket (your IP/region — not a server's).
+    // FAK (Fill-And-Kill) = take whatever liquidity exists at this price NOW and cancel the rest;
+    // the bot passes a *marketable* price (above mid to buy / below mid to sell). Returns the
+    // result + the meta the bot reports to Cosmos for metering.
+    async placeOrder({ tokenId, side, sizeShares, priceCents, orderType = "FAK" }) {
       const price = Math.max(0.01, Math.min(0.99, priceCents / 100));
       const size = Math.max(1, Math.floor(sizeShares));
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
+      const meta = { market: tokenId, side: side.toLowerCase(), size, price: priceCents };
 
-      // (1) CREATE ORDER — build + sign (EIP-712) with the local wallet.
-      // Do NOT pass feeRateBps: the client fetches the market's required rate itself
-      // (GET /fee-rate). Passing 0 trips its mismatch guard when the market fee is non-zero.
+      // createOrder builds + signs (EIP-712) locally; no feeRateBps so the client resolves the
+      // market's required rate itself. postOrder sends it straight to clob.polymarket.com.
       const signed = await client.createOrder({
         tokenID: tokenId,
         price,
         side: side === "SELL" ? Side.SELL : Side.BUY,
         size,
       });
-
-      // (2) BODY + L2 HEADERS — the exact POST /order payload (orderToJson) and the POLY_*
-      // auth headers signed over that body. createL2Headers is a top-level helper (not a
-      // client method); the relay re-serializes `body` to the identical string we signed.
-      const payload = orderToJson(signed, creds.key, ot);
-      const headers = await createL2Headers(wallet, creds, {
-        method: "POST",
-        requestPath: "/order",
-        body: JSON.stringify(payload),
-      });
-
-      // (3) RELAY BODY — exactly what /api/v1/orders forwards to clob.polymarket.com/order.
-      return {
-        clob: { path: "/order", method: "POST", headers, body: payload },
-        meta: { market: tokenId, side: side.toLowerCase(), size, price: priceCents },
-      };
+      try {
+        const resp = await client.postOrder(signed, ot);
+        if (resp && resp.error) return { ok: false, status: 400, body: { polymarket: resp }, meta };
+        return { ok: true, status: 200, body: { polymarket: resp }, meta };
+      } catch (e) {
+        const data = e?.response?.data ?? { error: e?.message ?? "post failed" };
+        return { ok: false, status: e?.response?.status ?? 502, body: { polymarket: data }, meta };
+      }
     },
 
     // The wallet's current Polymarket holdings (for "apply to manual trades").

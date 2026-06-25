@@ -33,33 +33,17 @@ export function makeCosmos(config) {
       return d; // { action, reason, current_cents, pnl_pct, whale_exit_pct }
     },
 
-    // Post the locally-signed order DIRECTLY to Polymarket (uses YOUR IP/region, so it is not
-    // geoblocked the way a server relay would be), then meter $0.09 through Cosmos. The order
-    // fully succeeds or fails at Polymarket; metering only records orders that were placed.
-    // Returns status 402 once the daily spend limit is reached (so the bot pauses entries).
-    async relayOrder({ clob, meta }) {
-      let pmRes, pmBody;
+    // Report a placed order to Cosmos: records the $0.09 fee and returns whether the daily
+    // spend limit has been reached (paused). The order itself is posted directly to Polymarket
+    // by the bot — Cosmos never touches keys or funds.
+    async meter(meta) {
       try {
-        pmRes = await fetch(`https://clob.polymarket.com${clob.path}`, {
-          method: clob.method || "POST",
-          headers: { "Content-Type": "application/json", ...(clob.headers || {}) },
-          body: clob.body != null ? JSON.stringify(clob.body) : undefined,
-        });
-        pmBody = await pmRes.json().catch(() => ({}));
-      } catch (e) {
-        return { ok: false, status: 502, body: { error: `Could not reach Polymarket: ${e.message}` } };
-      }
-      if (!pmRes.ok) return { ok: false, status: pmRes.status, body: { polymarket: pmBody } };
-
-      // Placed — record the fee + read the daily-limit status (best-effort; the order stands).
-      let meter = {};
-      try {
-        const m = await fetch(`${base}/api/v1/orders`, { method: "POST", headers, body: JSON.stringify({ meta }) });
-        meter = await m.json().catch(() => ({}));
+        const res = await fetch(`${base}/api/v1/orders`, { method: "POST", headers, body: JSON.stringify({ meta }) });
+        const d = await res.json().catch(() => ({}));
+        return { ok: res.ok, paused: Boolean(d.paused), spent_today: d.spent_today, daily_limit: d.daily_limit };
       } catch {
-        /* order already placed; metering catches up on the next order */
+        return { ok: false, paused: false };
       }
-      return { ok: true, status: meter.paused ? 402 : 200, body: { polymarket: pmBody, ...meter } };
     },
   };
 }

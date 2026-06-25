@@ -16,7 +16,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@polymarket/clob-client": "^4.13.0",
+    "@polymarket/clob-client": "^5.8.1",
     "ethers": "^5.7.2"
   }
 }

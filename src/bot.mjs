@@ -74,8 +74,9 @@ async function decideExit(cosmos, pm, settings, pos) {
 async function marketableSell(cosmos, pm, pos) {
   const mid = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
   const sellPrice = Math.max(1, mid - SELL_BUFFER);
-  const order = await pm.buildSignedOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
-  return { mid, ...(await cosmos.relayOrder(order)) };
+  const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
+  if (r.ok) { try { await cosmos.meter(r.meta); } catch { /* order placed; meter best-effort */ } }
+  return { mid, ...r };
 }
 
 async function holdingsMap(pm) {
@@ -154,11 +155,12 @@ async function cycle(cosmos, pm) {
 
       const buyPrice = Math.min(98, s.max_entry_price, mid + BUY_BUFFER); // marketable, capped
       const shares = sharesFor(sizeUsd, buyPrice);
-      const order = await pm.buildSignedOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
-      const r = await cosmos.relayOrder(order);
+      const r = await pm.placeOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
       if (!r.ok) { warn("entry failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; }
 
-      // Order placed at Polymarket — record it (even if the daily limit is now reached).
+      // Order placed at Polymarket — meter the $0.09 + record the position.
+      let paused = false;
+      try { const m = await cosmos.meter(r.meta); paused = Boolean(m?.paused); } catch { /* meter best-effort */ }
       remaining -= sizeUsd;
       deployed += sizeUsd;
       positions[s.condition_id] = {
@@ -168,7 +170,7 @@ async function cycle(cosmos, pm) {
       };
       store.save(positions);
       log(`BUY  ${s.outcome} @ ~${mid}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
-      if (r.status === 402) { warn("daily spend limit reached — pausing entries."); break; }
+      if (paused) { warn("daily spend limit reached — pausing entries."); break; }
     }
     if (sizedOut) log(`${sizedOut} new markets skipped: per-trade size below the $1 minimum (raise your size in the dashboard)`);
   }
