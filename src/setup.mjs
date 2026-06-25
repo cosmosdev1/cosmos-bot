@@ -1,51 +1,58 @@
-// Interactive setup: collects the Cosmos token + Polymarket keys + per-trade size, verifies the
-// token against Cosmos, and writes config.json. Run: npm run setup
-import { writeFileSync, existsSync, readFileSync } from "node:fs";
+// One-shot setup: reads the Cosmos token from the install command (COSMOS_TOKEN),
+// verifies it, asks ONLY for the Polymarket keys (which stay on this machine), and
+// writes config.json. Everything else uses sensible defaults you can tweak later
+// in config.json. Run automatically by the installer, or: npm run setup
+import { writeFileSync, existsSync, readFileSync, createReadStream } from "node:fs";
 import { createInterface } from "node:readline/promises";
-import { stdin as input, stdout as output } from "node:process";
 
-const rl = createInterface({ input, output });
+// Prompt from the real terminal even when the installer was piped (curl | sh).
+let input = process.stdin;
+if (!process.stdin.isTTY) {
+  try { input = createReadStream("/dev/tty"); } catch { /* fall back to stdin */ }
+}
+const rl = createInterface({ input, output: process.stdout });
 const ask = async (q, def) => {
   const a = (await rl.question(def ? `${q} [${def}]: ` : `${q}: `)).trim();
   return a || def || "";
 };
 
-console.log("\n  Cosmos bot — setup\n  ------------------\n");
 const existing = existsSync("./config.json") ? JSON.parse(readFileSync("./config.json", "utf8")) : {};
-const api = await ask("Cosmos API URL", existing.cosmosApi || "https://try-cosmos.com");
-const cosmosToken = await ask("Your Cosmos API token (csk_...)", existing.cosmosToken);
+const api = (process.env.COSMOS_API || existing.cosmosApi || "https://try-cosmos.com").replace(/\/$/, "");
+
+console.log("\n  Cosmos bot — setup\n");
+
+// Token: from the install command, or ask once if it wasn't passed.
+let cosmosToken = process.env.COSMOS_TOKEN || existing.cosmosToken;
+if (!cosmosToken) cosmosToken = await ask("  Paste your Cosmos API token (csk_...)");
 
 process.stdout.write("  Verifying token... ");
 try {
-  const res = await fetch(`${api.replace(/\/$/, "")}/api/v1/account`, { headers: { Authorization: `Bearer ${cosmosToken}` } });
+  const res = await fetch(`${api}/api/v1/account`, { headers: { Authorization: `Bearer ${cosmosToken}` } });
   const d = await res.json();
   if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`);
   if (!d.bot_access) throw new Error("this plan does not include bot/API trading. Upgrade in the dashboard.");
   console.log(`ok · plan: ${d.tier}.`);
 } catch (e) {
-  console.log(`\n  Token check failed: ${e.message}\n`);
+  console.log(`\n  Token check failed: ${e.message}\n  Create a token at ${api}/cosmos-api and run setup again.\n`);
   rl.close();
   process.exit(1);
 }
 
-console.log("\n  Polymarket keys (used locally to sign orders — they never leave this machine):");
+console.log("\n  Now your Polymarket keys. They are used ONLY on this machine to sign orders");
+console.log("  and are never sent to Cosmos.\n");
 const privateKey = await ask("  Wallet private key (0x...)", existing.polymarket?.privateKey);
-const funderAddress = await ask("  Funder / proxy address (0x...)", existing.polymarket?.funderAddress);
-
-const perTradePct = Number(await ask("\n  Per-trade size, % of balance", String(existing.perTradePct ?? 5))) || 5;
-const pollSeconds = Number(await ask("  Poll interval (seconds)", String(existing.pollSeconds ?? 30))) || 30;
-const maxConcurrent = Number(await ask("  Max concurrent positions", String(existing.maxConcurrent ?? 10))) || 10;
-const applyAns = (await ask("  Also manage your EXISTING Polymarket positions? (y/N)", existing.applyToManualTrades ? "y" : "n")).toLowerCase();
+const funderAddress = await ask("  Polymarket address / proxy (0x...)", existing.polymarket?.funderAddress);
 
 const config = {
   cosmosApi: api,
   cosmosToken,
   polymarket: { privateKey, funderAddress },
-  perTradePct,
-  pollSeconds,
-  maxConcurrent,
-  applyToManualTrades: applyAns.startsWith("y"),
+  // Sensible defaults — edit config.json any time to change these.
+  perTradePct: existing.perTradePct ?? 5,
+  pollSeconds: existing.pollSeconds ?? 30,
+  maxConcurrent: existing.maxConcurrent ?? 10,
+  applyToManualTrades: existing.applyToManualTrades ?? false,
 };
 writeFileSync("./config.json", JSON.stringify(config, null, 2), { mode: 0o600 }); // owner-only (protects the key)
-console.log("\n  Saved config.json (owner-only). Start the bot with:  npm start\n");
 rl.close();
+console.log("\n  All set. Starting the bot...  (stop with Ctrl+C · restart any time with: npm start)\n");
