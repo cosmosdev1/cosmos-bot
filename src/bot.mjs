@@ -157,7 +157,11 @@ async function cycle(cosmos, pm) {
       if (mid > s.max_entry_price) { markSeen(s.condition_id); continue; } // ran past the insider entry — a decision
 
       const buyPrice = Math.min(98, s.max_entry_price, mid + BUY_BUFFER); // marketable, capped
-      const shares = sharesFor(sizeUsd, buyPrice);
+      // Shares must clear Polymarket's ~$1 minimum order value: a single share at a high price
+      // (90c+) is under $1, so floor(sizeUsd/price) can produce an invalid sub-$1 order.
+      const shares = Math.max(Math.ceil(100 / buyPrice), sharesFor(sizeUsd, buyPrice));
+      const orderUsd = (shares * buyPrice) / 100; // actual cost (>= ~$1)
+      if (orderUsd > remaining) continue; // the $1-min bump exceeds balance — retry when funds free
       const r = await pm.placeOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
       markSeen(s.condition_id); // order attempted — one shot per market (buy once)
       if (!r.ok) { warn("entry failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; }
@@ -166,11 +170,11 @@ async function cycle(cosmos, pm) {
       // the next reconcile syncs the real avg fill from holdings).
       let paused = false;
       try { const m = await cosmos.meter(r.meta); paused = Boolean(m?.paused); } catch { /* meter best-effort */ }
-      remaining -= sizeUsd;
-      deployed += sizeUsd;
+      remaining -= orderUsd;
+      deployed += orderUsd;
       positions[s.condition_id] = {
         condition_id: s.condition_id, token_id: tokenId, outcome: s.outcome, source: s.source,
-        entry_cents: buyPrice, size_usd: sizeUsd, size_shares: shares, entry_whales: s.entry_whales || [],
+        entry_cents: buyPrice, size_usd: orderUsd, size_shares: shares, entry_whales: s.entry_whales || [],
         market_question: s.market_question, opened_at: new Date().toISOString(),
       };
       store.save(positions);
