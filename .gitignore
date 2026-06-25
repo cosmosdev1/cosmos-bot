@@ -3,3 +3,4 @@ config.json
 positions.json
 *.log
 .DS_Store
+seen.json
