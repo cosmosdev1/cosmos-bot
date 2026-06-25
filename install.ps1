@@ -1,7 +1,7 @@
 # Cosmos bot installer (Windows PowerShell).
 # Set $Repo to your cosmos-bot repo, then:  irm https://.../install.ps1 | iex
 $ErrorActionPreference = "Stop"
-$Repo = "https://github.com/<your-org>/cosmos-bot.git"
+$Repo = "https://github.com/cosmosdev1/cosmos-bot.git"
 $dir = Join-Path $HOME "cosmos-bot"
 
 Write-Host "`n  Installing the Cosmos bot to $dir`n"

@@ -2,7 +2,7 @@
 # Cosmos bot installer (macOS / Linux).
 # Set REPO to your cosmos-bot repo, then:  curl -fsSL https://.../install.sh | sh
 set -e
-REPO="https://github.com/<your-org>/cosmos-bot.git"
+REPO="https://github.com/cosmosdev1/cosmos-bot.git"
 DIR="$HOME/cosmos-bot"
 
 printf "\n  Installing the Cosmos bot to %s\n\n" "$DIR"

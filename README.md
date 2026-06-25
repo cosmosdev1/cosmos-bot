@@ -10,7 +10,7 @@ your private key, so it ships and is reviewed on its own.
 ## Install
 
 ```sh
-git clone https://github.com/<your-org>/cosmos-bot.git
+git clone https://github.com/cosmosdev1/cosmos-bot.git
 cd cosmos-bot
 npm install
 npm run setup      # enter your Cosmos token + Polymarket keys + per-trade %
