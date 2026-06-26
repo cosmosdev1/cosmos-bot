@@ -230,7 +230,7 @@ async function main() {
   const acct = await cosmos.account();
   if (!acct.bot_access) { console.error("This plan does not include bot/API trading. Upgrade in the dashboard."); process.exit(1); }
   const pm = await makePolymarket(config);
-  log(`connected · plan ${acct.tier} · wallet ${pm.address.slice(0, 6)}… · funder ${pm.funder.slice(0, 6)}…`);
+  log(`connected · plan ${acct.tier} · wallet ${pm.address.slice(0, 6)}… · funder ${pm.funder.slice(0, 6)}…${pm.builderFee ? " · builder fee ON" : ""}`);
 
   // eslint-disable-next-line no-constant-condition
   while (true) {

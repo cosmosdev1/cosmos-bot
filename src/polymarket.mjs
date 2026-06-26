@@ -11,6 +11,17 @@ const CLOB_HOST = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
 const GAMMA = "https://gamma-api.polymarket.com";
 
+// Cosmos's Polymarket BUILDER CODE (bytes32). When set (non-zero), every order the bot signs
+// carries it, so Polymarket takes Cosmos's builder fee out of the fill — the user simply earns a
+// little less, with no separate bill, and Cosmos stays fully non-custodial (the code is just a
+// field inside the user's own locally-signed order). Empty = OFF (no fee attached, behaves as
+// before). Set this after registering at polymarket.com/settings?tab=builder; builder codes are
+// public, so it's fine to ship in the (public) bot. Env override: COSMOS_BUILDER_CODE.
+const ZERO32 = "0x" + "0".repeat(64);
+const DEFAULT_BUILDER_CODE = ""; // <- paste Cosmos's bytes32 builder code here to turn the fee ON
+const BUILDER_CODE = (process.env.COSMOS_BUILDER_CODE || DEFAULT_BUILDER_CODE).trim();
+const builderOn = /^0x[0-9a-fA-F]{64}$/.test(BUILDER_CODE) && BUILDER_CODE !== ZERO32;
+
 export async function makePolymarket(config) {
   // viem signer (CLOB V2 is viem-based). Signing is local — no RPC needed.
   const account = privateKeyToAccount(config.polymarket.privateKey);
@@ -22,20 +33,25 @@ export async function makePolymarket(config) {
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
   const creds = await pre.createOrDeriveApiKey();
   // Full client: L1 + L2 + POLY_PROXY signing for the Polymarket proxy wallet (funder).
-  const client = new ClobClient({
+  // When a builder code is configured, builderConfig makes the client auto-stamp it onto every
+  // order (the SDK applies it at order-build time), so Polymarket collects Cosmos's builder fee.
+  const clientOpts = {
     host: CLOB_HOST,
     chain: Chain.POLYGON,
     signer: walletClient,
     creds,
     signatureType: SignatureTypeV2.POLY_PROXY,
     funderAddress: funder,
-  });
+  };
+  if (builderOn) clientOpts.builderConfig = { builderCode: BUILDER_CODE };
+  const client = new ClobClient(clientOpts);
 
   const tokenCache = new Map();
 
   return {
     address,
     funder,
+    builderFee: builderOn, // whether a builder fee is being attached to orders
 
     // USDC balance, for position sizing.
     async getBalanceUsd() {
