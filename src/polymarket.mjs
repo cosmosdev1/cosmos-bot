@@ -18,7 +18,7 @@ const GAMMA = "https://gamma-api.polymarket.com";
 // before). Set this after registering at polymarket.com/settings?tab=builder; builder codes are
 // public, so it's fine to ship in the (public) bot. Env override: COSMOS_BUILDER_CODE.
 const ZERO32 = "0x" + "0".repeat(64);
-const DEFAULT_BUILDER_CODE = "0x4ddc9c090a1adb966274f26284e0e0f686b6828ec71299a1dc310ebea4bb8166"; // Cosmos's Polymarket builder code (aviv profile; public, safe to ship)
+const DEFAULT_BUILDER_CODE = "0x4ddc9c090a1adb966274f26284e0e0f686b6828ec71299a1dc310ebea4bb8166"; // Cosmos's Polymarket builder code (public, safe to ship)
 const BUILDER_CODE = (process.env.COSMOS_BUILDER_CODE || DEFAULT_BUILDER_CODE).trim();
 const builderOn = /^0x[0-9a-fA-F]{64}$/.test(BUILDER_CODE) && BUILDER_CODE !== ZERO32;
 
