@@ -57,6 +57,15 @@ function sizeForSignal(z, s, balance, deployed) {
   return usd;
 }
 
+// Human-readable active size, logged each cycle so you can SEE in the Render logs that a dashboard
+// save reached THIS token (the bot re-reads /api/v1/account every cycle, no caching).
+function sizeLabel(z) {
+  if (!z || !z.mode) return "size: default";
+  if (z.mode === "fixed") return `size: $${Number(z.fixedUsd) || 0}/trade`;
+  if (z.mode === "tiered") { const t = z.tierPct || {}; return `size: tiered g${t.gold ?? 0}/p${t.platinum ?? 0}/b${t.bronze ?? 0}/f${t.free ?? 0}%`; }
+  return `size: ${Number(z.pct) || 0}% of balance`;
+}
+
 const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
 const SELL_BUFFER = 5; // marketable sell: offer a few cents below mid so stops actually fill
 const HARD_STOP_FRAC = 0.5; // advice unreachable -> still exit if price has halved
@@ -136,7 +145,7 @@ async function cycle(cosmos, pm) {
 
   const balance = await pm.getBalanceUsd();
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
-  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · $${balance.toFixed(2)}`);
+  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · $${balance.toFixed(2)} · ${sizeLabel(settings.sizing)}`);
 
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   for (const cid of Object.keys(positions)) {
