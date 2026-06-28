@@ -39,6 +39,10 @@ const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 
+// Hard floor per trade: Polymarket's ~$1 minimum order. Any computed size below this is bumped up
+// to $1 (e.g. 3% of a $10 balance = $0.30 still trades at $1), as long as there's room.
+const MIN_TRADE_USD = 1;
+
 // Retry a marketable FAK order on a transient kill. A Fill-And-Kill that finds no liquidity is
 // REJECTED (ok:false) with nothing filled - and the book usually refreshes within a few hundred ms,
 // so a single kill must never become a missed entry or a missed stop (mirrors the crypto_bot rule).
@@ -209,8 +213,8 @@ async function cycle(cosmos, pm) {
       const exposureRoom = sizing.maxExposurePct
         ? Math.max(0, (balance * Number(sizing.maxExposurePct)) / 100 - deployed)
         : Infinity;
-      if (sizeUsd < 1 && exposureRoom >= 1) sizeUsd = 1;
-      if (sizeUsd < 1 || sizeUsd > remaining) continue; // no room right now — transient, retry (no burn)
+      if (sizeUsd < MIN_TRADE_USD && exposureRoom >= MIN_TRADE_USD) sizeUsd = MIN_TRADE_USD; // hard $1 floor
+      if (sizeUsd < MIN_TRADE_USD || sizeUsd > remaining) continue; // no room right now — transient, retry (no burn)
 
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
       if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; } // transient — retry
