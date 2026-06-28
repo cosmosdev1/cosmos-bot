@@ -73,6 +73,14 @@ function localExit(settings, entryCents, curCents) {
 }
 
 async function decideExit(cosmos, pm, settings, pos) {
+  const cur = await pm.getPriceCents(pos.token_id);
+
+  // HARD RULE (always on — overrides TP/SL/AI): once a position reaches the edge of the book it has
+  // essentially resolved, so SELL it. 99c+ = resolved YES, lock the win before resolution/illiquidity;
+  // 1c- = resolved NO, salvage what's left instead of riding it to zero.
+  if (cur != null && cur >= 99) return { action: "TAKE_PROFIT", reason: "reached 99c - locking the win" };
+  if (cur != null && cur <= 1) return { action: "STOP_LOSS", reason: "reached 1c - salvaging" };
+
   // "Cosmos AI" mode -> ask the server brain. If it's unreachable (e.g. rate-limited), still apply
   // a local hard stop so a crashing position exits rather than riding down.
   if (settings.tp_mode === "ai" || settings.sl_mode === "ai") {
@@ -80,13 +88,11 @@ async function decideExit(cosmos, pm, settings, pos) {
       return await cosmos.advice(pos);
     } catch (e) {
       warn("advice:", e.message);
-      const cur = await pm.getPriceCents(pos.token_id);
-      if (cur && cur <= pos.entry_cents * HARD_STOP_FRAC) return { action: "STOP_LOSS", reason: "local hard stop (advice unavailable)" };
+      if (cur != null && cur <= pos.entry_cents * HARD_STOP_FRAC) return { action: "STOP_LOSS", reason: "local hard stop (advice unavailable)" };
       return { action: "HOLD" };
     }
   }
-  const cur = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
-  return localExit(settings, pos.entry_cents, cur);
+  return localExit(settings, pos.entry_cents, cur ?? pos.entry_cents);
 }
 
 // Place a marketable Fill-And-Kill SELL for the shares we actually hold.
