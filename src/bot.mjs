@@ -163,7 +163,6 @@ async function cycle(cosmos, pm) {
     store.saveSeen(seen);
     log(`watching ${Object.keys(seen).length} markets · will buy only newly-added ones`);
   } else {
-    let sizedOut = 0; // markets skipped because the per-trade size was below the $1 min
     // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
     const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? 5, tierPct: {}, conviction: false, maxPerTradeUsd: null, maxExposurePct: null };
     let remaining = balance;
@@ -178,9 +177,16 @@ async function cycle(cosmos, pm) {
       if (seen[s.condition_id] || positions[s.condition_id] || held.has(s.condition_id)) continue; // already evaluated / held
       if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break; // full — leave for when a slot frees
 
-      const sizeUsd = sizeForSignal(sizing, s, balance, deployed);
-      if (sizeUsd > remaining) continue; // out of balance now — retry when balance/slots free
-      if (sizeUsd < 1) { sizedOut++; markSeen(s.condition_id); continue; } // too small — a decision
+      let sizeUsd = sizeForSignal(sizing, s, balance, deployed);
+      // Floor to Polymarket's ~$1 minimum order so SMALL balances still trade instead of being
+      // skipped (the share math below already guarantees >= ~$1 of shares). Do NOT floor — and do
+      // NOT burn the market via markSeen — when there's simply no room right now (out of balance, or
+      // the exposure cap is maxed): those are TRANSIENT, so a later size/balance change retries it.
+      const exposureRoom = sizing.maxExposurePct
+        ? Math.max(0, (balance * Number(sizing.maxExposurePct)) / 100 - deployed)
+        : Infinity;
+      if (sizeUsd < 1 && exposureRoom >= 1) sizeUsd = 1;
+      if (sizeUsd < 1 || sizeUsd > remaining) continue; // no room right now — transient, retry (no burn)
 
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
       if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; } // transient — retry
@@ -214,7 +220,6 @@ async function cycle(cosmos, pm) {
       log(`BUY  ${s.outcome} @ ~${buyPrice}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
       if (paused) { warn("daily spend limit reached — pausing entries."); break; }
     }
-    if (sizedOut) log(`${sizedOut} new markets skipped: per-trade size below the $1 minimum (raise your size in the dashboard)`);
   }
 
   // --- MANUAL TRADES (apply the same exits to your existing positions, if enabled). ---
