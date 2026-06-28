@@ -39,6 +39,21 @@ const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 
+// Retry a marketable FAK order on a transient kill. A Fill-And-Kill that finds no liquidity is
+// REJECTED (ok:false) with nothing filled - and the book usually refreshes within a few hundred ms,
+// so a single kill must never become a missed entry or a missed stop (mirrors the crypto_bot rule).
+// We retry ONLY while ok:false (a complete kill, nothing filled), so a partial/full fill never
+// re-fires and can't over-trade.
+async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
+  let r;
+  for (let i = 0; i < attempts; i++) {
+    r = await pm.placeOrder(args);
+    if (r.ok) return r;
+    if (i < attempts - 1) await sleep(cooldownMs);
+  }
+  return r; // last failure
+}
+
 // Per-trade USD from the dashboard sizing config (synced from /api/v1/account each cycle).
 //   pct -> % of balance · fixed -> $ · tiered -> % by the signal's tier.
 // Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
@@ -108,7 +123,7 @@ async function decideExit(cosmos, pm, settings, pos) {
 async function marketableSell(cosmos, pm, pos) {
   const mid = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
   const sellPrice = Math.max(1, mid - SELL_BUFFER);
-  const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
+  const r = await placeWithRetry(pm, { tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
   if (r.ok) { try { await cosmos.meter(r.meta); } catch { /* order placed; meter best-effort */ } }
   return { mid, ...r };
 }
@@ -210,9 +225,9 @@ async function cycle(cosmos, pm) {
       const shares = Math.max(Math.ceil(100 / buyPrice), sharesFor(sizeUsd, buyPrice));
       const orderUsd = (shares * buyPrice) / 100; // actual cost (>= ~$1)
       if (orderUsd > remaining) continue; // the $1-min bump exceeds balance — retry when funds free
-      const r = await pm.placeOrder({ tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
-      markSeen(s.condition_id); // order attempted — one shot per market (buy once)
-      if (!r.ok) { warn("entry failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; }
+      const r = await placeWithRetry(pm, { tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
+      if (!r.ok) { warn("entry failed after retries:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; } // leave UNSEEN -> retry next cycle (don't burn on a transient kill)
+      markSeen(s.condition_id); // filled/placed — one shot per market (buy once)
 
       // Order placed at Polymarket — meter the $0.09 + record the position (entry = the price we bid;
       // the next reconcile syncs the real avg fill from holdings).
