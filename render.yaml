@@ -12,7 +12,8 @@ services:
     runtime: node
     region: frankfurt       # EU — Polymarket-allowed. US regions get geoblocked.
     plan: starter           # workers have no free tier (~$7/mo); needed for 24/7
-    autoDeploy: false       # don't restart the bot on every upstream push — you update on your schedule
+    autoDeploy: true        # auto-sync: Render redeploys your bot on every push to the Cosmos bot repo,
+                            #            so fixes + improvements reach you automatically, no manual redeploy.
     buildCommand: npm install
     startCommand: node src/bot.mjs
     envVars:
