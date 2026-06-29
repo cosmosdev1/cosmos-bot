@@ -63,6 +63,20 @@ export async function makePolymarket(config) {
       }
     },
 
+    // Polymarket geoblock status for THIS server's egress IP (docs: GET /api/geoblock ->
+    // { blocked, ip, country, region }). When blocked, every order is rejected with a 403, so we
+    // check it up front and surface it clearly instead of blindly firing orders into a wall.
+    async geoblock() {
+      try {
+        const res = await fetch("https://polymarket.com/api/geoblock");
+        if (!res.ok) return { ok: false, status: res.status };
+        const d = await res.json();
+        return { ok: true, blocked: Boolean(d?.blocked), ip: d?.ip ?? null, country: d?.country ?? null, region: d?.region ?? null };
+      } catch (e) {
+        return { ok: false, error: e?.message };
+      }
+    },
+
     // condition_id + outcome -> CLOB token id (needed to place an order).
     async resolveToken(conditionId, outcome) {
       const key = `${conditionId}:${outcome}`.toLowerCase();

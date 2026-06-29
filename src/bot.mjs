@@ -271,6 +271,17 @@ async function main() {
   const pm = await makePolymarket(config);
   log(`connected · plan ${acct.tier} · wallet ${pm.address.slice(0, 6)}… · funder ${pm.funder.slice(0, 6)}…${pm.builderFee ? " · builder fee ON" : ""}`);
 
+  // Geoblock check (Polymarket docs): if this server's IP is blocked, every order is rejected with
+  // a 403. Surface it loudly up front so it's not a silent wall of failed entries.
+  const geo = await pm.geoblock();
+  if (geo.ok && geo.blocked) {
+    warn(`GEOBLOCKED: Polymarket is blocking this server's IP (${geo.ip} · ${geo.country}${geo.region ? "/" + geo.region : ""}). Orders WILL be rejected (403). This datacenter/region is on Polymarket's blocklist - run from a sanctioned location (Polymarket KYC/KYB co-location in eu-west-2).`);
+  } else if (geo.ok) {
+    log(`geoblock: clear (${geo.country ?? "?"}${geo.region ? "/" + geo.region : ""})`);
+  } else {
+    warn("geoblock check failed:", geo.status ?? geo.error);
+  }
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
