@@ -6,7 +6,8 @@ FROM node:20-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY entrypoint.sh ./entrypoint.sh
-RUN chmod +x ./entrypoint.sh
+# Strip any CR (Windows line endings) so bash doesn't choke on \r, then make it executable.
+RUN sed -i 's/\r$//' ./entrypoint.sh && chmod +x ./entrypoint.sh
 ENV COSMOS_DATA_DIR=/data
 ENV COSMOS_BOT_REPO=https://github.com/cosmosdev1/cosmos-bot.git
 VOLUME /data
