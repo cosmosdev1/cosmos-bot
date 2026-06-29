@@ -245,7 +245,7 @@ async function cycle(cosmos, pm) {
         market_question: s.market_question, opened_at: new Date().toISOString(),
       };
       store.save(positions);
-      log(`BUY  ${s.outcome} @ ~${buyPrice}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
+      log(`BUY  [${s.source}] ${s.outcome} @ ~${buyPrice}c · $${sizeUsd.toFixed(2)} · ${(s.market_question || "").slice(0, 48)}`);
       if (paused) { warn("daily spend limit reached — pausing entries."); break; }
     }
   }
