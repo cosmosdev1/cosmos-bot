@@ -1,6 +1,6 @@
 {
   "name": "cosmos-bot",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "type": "module",
   "description": "Cosmos API trading bot — trades Cosmos insider signals through your own Polymarket keys. Your key never leaves your machine.",
