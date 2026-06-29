@@ -59,20 +59,23 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
 }
 
 // Per-trade USD from the dashboard sizing config (synced from /api/v1/account each cycle).
-//   pct -> % of balance · fixed -> $ · tiered -> % by the signal's tier.
+//   pct -> % of portfolio · fixed -> $ · tiered -> % by the signal's tier.
+// Percentages are taken off the whole PORTFOLIO (free cash + the cost basis of open positions), not
+// just free cash, so position sizes stay stable as money gets deployed.
 // Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
 function sizeForSignal(z, s, balance, deployed) {
+  const portfolio = balance + deployed; // cash + open positions
   let usd;
   if (z.mode === "fixed") usd = Number(z.fixedUsd) || 0;
   else if (z.mode === "tiered") {
     const tp = z.tierPct || {};
-    usd = (balance * (Number(tp[s.lock_tier] ?? tp.free ?? 0) || 0)) / 100;
+    usd = (portfolio * (Number(tp[s.lock_tier] ?? tp.free ?? 0) || 0)) / 100;
   } else {
-    usd = (balance * (Number(z.pct) || 0)) / 100;
+    usd = (portfolio * (Number(z.pct) || 0)) / 100;
   }
   if (z.conviction && s.score) usd *= 0.5 + Number(s.score) / 10; // score 0..10 -> 0.5x..1.5x
   if (z.maxPerTradeUsd) usd = Math.min(usd, Number(z.maxPerTradeUsd));
-  if (z.maxExposurePct) usd = Math.min(usd, Math.max(0, (balance * Number(z.maxExposurePct)) / 100 - deployed));
+  if (z.maxExposurePct) usd = Math.min(usd, Math.max(0, (portfolio * Number(z.maxExposurePct)) / 100 - deployed));
   return usd;
 }
 
@@ -82,7 +85,7 @@ function sizeLabel(z) {
   if (!z || !z.mode) return "size: default";
   if (z.mode === "fixed") return `size: $${Number(z.fixedUsd) || 0}/trade`;
   if (z.mode === "tiered") { const t = z.tierPct || {}; return `size: tiered g${t.gold ?? 0}/p${t.platinum ?? 0}/b${t.bronze ?? 0}/f${t.free ?? 0}%`; }
-  return `size: ${Number(z.pct) || 0}% of balance`;
+  return `size: ${Number(z.pct) || 0}% of portfolio`;
 }
 
 const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
@@ -211,7 +214,7 @@ async function cycle(cosmos, pm) {
       // NOT burn the market via markSeen — when there's simply no room right now (out of balance, or
       // the exposure cap is maxed): those are TRANSIENT, so a later size/balance change retries it.
       const exposureRoom = sizing.maxExposurePct
-        ? Math.max(0, (balance * Number(sizing.maxExposurePct)) / 100 - deployed)
+        ? Math.max(0, ((balance + deployed) * Number(sizing.maxExposurePct)) / 100 - deployed)
         : Infinity;
       if (sizeUsd < MIN_TRADE_USD && exposureRoom >= MIN_TRADE_USD) sizeUsd = MIN_TRADE_USD; // hard $1 floor
       if (sizeUsd < MIN_TRADE_USD || sizeUsd > remaining) continue; // no room right now — transient, retry (no burn)
