@@ -230,7 +230,14 @@ async function cycle(cosmos, pm) {
       const orderUsd = (shares * buyPrice) / 100; // actual cost (>= ~$1)
       if (orderUsd > remaining) continue; // the $1-min bump exceeds balance — retry when funds free
       const r = await placeWithRetry(pm, { tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
-      if (!r.ok) { warn("entry failed after retries:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400)); continue; } // leave UNSEEN -> retry next cycle (don't burn on a transient kill)
+      if (!r.ok) {
+        warn("entry failed after retries:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400));
+        // A 4xx means the ORDER itself was rejected (illiquid / "no match" FAK kill / bad params) -
+        // it won't fill on a retry, so give up on this market instead of hammering it every cycle.
+        // A 5xx / network blip is transient -> leave UNSEEN so it retries once the API clears.
+        if (typeof r.status === "number" && r.status >= 400 && r.status < 500) markSeen(s.condition_id);
+        continue;
+      }
       markSeen(s.condition_id); // filled/placed — one shot per market (buy once)
 
       // Order placed at Polymarket — meter the $0.09 + record the position (entry = the price we bid;
