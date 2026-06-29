@@ -23,22 +23,29 @@ Requires **Node.js 18+** (https://nodejs.org). One-line installers are in `insta
 ## Run it 24/7 (computer can be off)
 
 The bot is a long-running process, so closing your computer stops it. To trade around the clock,
-run it on an always-on box **you control** — your key still never reaches Cosmos. Simplest is a
-one-click deploy to **Render**:
+run it on an always-on server **you control** — your key still never reaches Cosmos.
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/cosmosdev1/cosmos-bot)
+**Important — region:** Polymarket blocks order placement from many countries (the US, UK, Germany,
+France, Italy, the Netherlands, and ~30 more). The bot posts orders from wherever it runs, so the
+**server must sit in a Polymarket-allowed country** or every trade is rejected with a 403
+"Trading restricted in your region". A cheap VPS in **Sweden, Ireland, or Spain** works; **avoid US
+and Germany** (so Render/Heroku default regions and Render's Frankfurt do NOT work).
 
-1. Click the button and sign in to Render.
-2. When prompted, paste 3 secrets: `COSMOS_TOKEN`, `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER`.
-3. Deploy. It runs 24/7 (~$7/mo, billed to **your** Render account).
+Easiest path (all in a browser, ~$5/mo, billed to **your** account):
 
-The blueprint (`render.yaml`) pins **region: Frankfurt** on purpose — Polymarket geoblocks US
-datacenters, so an EU region is required (a US host gets "Trading restricted in your region").
-Your key is a Render secret env var, visible only to you — Cosmos never sees it, same as local.
+1. Make a small VPS (e.g. **Vultr**) and pick a location in an **allowed country — Stockholm**.
+2. Paste **`deploy-vps.sh`** into the server's "Startup Script" box, filling in your three values
+   (`COSMOS_TOKEN`, `POLYMARKET_PRIVATE_KEY`, `POLYMARKET_FUNDER`). Your key goes only onto your own
+   server — Cosmos never sees it.
+3. Deploy. The script installs Docker, runs the bot 24/7 with auto-restart, and persists state.
 
-The included **`Dockerfile`** runs the exact same bot on any host (Railway, Fly.io, a $4 VPS, a
-Raspberry Pi) — just set the same env vars. State (`positions.json` / `seen.json`) persists to
-`COSMOS_DATA_DIR` (a mounted disk) so restarts resume safely.
+On boot the bot prints its geoblock status; you want **`geoblock: clear (SE)`**. If you see
+`GEOBLOCKED`, the server landed in a blocked country — rebuild it in Stockholm.
+
+The included **`Dockerfile`** runs the exact same bot on any host (a $5 VPS, Fly.io's Stockholm
+region, a Raspberry Pi) — just set the same env vars and keep it in an allowed country. State
+(`positions.json` / `seen.json`) persists to `COSMOS_DATA_DIR` (a mounted disk) so restarts resume
+safely.
 
 ## How it works
 
