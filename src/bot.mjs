@@ -92,38 +92,51 @@ const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at m
 const SELL_BUFFER = 5; // marketable sell: offer a few cents below mid so stops actually fill
 const HARD_STOP_FRAC = 0.5; // advice unreachable -> still exit if price has halved
 
-// Local TP/SL evaluation (fixed price / percent) against the live price.
-function localExit(settings, entryCents, curCents) {
-  if (!curCents) return { action: "HOLD" };
+// Local TP and SL, evaluated INDEPENDENTLY (a manual SL must still work when TP is on "ai", and vice
+// versa). Each returns a verdict or null.
+function localTp(settings, entryCents, curCents) {
+  if (!curCents) return null;
   const gainPct = ((curCents - entryCents) / entryCents) * 100;
   if (settings.tp_mode === "fixed" && settings.tp_value && curCents >= settings.tp_value) return { action: "TAKE_PROFIT", reason: `>= ${settings.tp_value}c` };
   if (settings.tp_mode === "percent" && settings.tp_value && gainPct >= settings.tp_value) return { action: "TAKE_PROFIT", reason: `+${gainPct.toFixed(0)}%` };
+  return null;
+}
+function localSl(settings, entryCents, curCents) {
+  if (!curCents) return null;
+  const gainPct = ((curCents - entryCents) / entryCents) * 100;
   if (settings.sl_mode === "fixed" && settings.sl_value && curCents <= settings.sl_value) return { action: "STOP_LOSS", reason: `<= ${settings.sl_value}c` };
   if (settings.sl_mode === "percent" && settings.sl_value && gainPct <= -settings.sl_value) return { action: "STOP_LOSS", reason: `${gainPct.toFixed(0)}%` };
-  return { action: "HOLD" };
+  return null;
 }
 
 async function decideExit(cosmos, pm, settings, pos) {
   const cur = await pm.getPriceCents(pos.token_id);
 
-  // HARD RULE (always on — overrides TP/SL/AI): once a position reaches the edge of the book it has
-  // essentially resolved, so SELL it. 99c+ = resolved YES, lock the win before resolution/illiquidity;
-  // 1c- = resolved NO, salvage what's left instead of riding it to zero.
+  // HARD RULE (always on): once a position reaches the edge of the book it has essentially resolved.
   if (cur != null && cur >= 99) return { action: "TAKE_PROFIT", reason: "reached 99c - locking the win" };
   if (cur != null && cur <= 1) return { action: "STOP_LOSS", reason: "reached 1c - salvaging" };
 
-  // "Cosmos AI" mode -> ask the server brain. If it's unreachable (e.g. rate-limited), still apply
-  // a local hard stop so a crashing position exits rather than riding down.
+  // Evaluate the TAKE-PROFIT side and the STOP-LOSS side SEPARATELY. Each side is either "ai" (server
+  // brain) or "fixed"/"percent" (local). The old code routed BOTH sides to the AI brain whenever
+  // EITHER was "ai", so a user's manual TP/SL on the other side was silently ignored — the core bug.
+  let ai = null;
   if (settings.tp_mode === "ai" || settings.sl_mode === "ai") {
-    try {
-      return await cosmos.advice(pos);
-    } catch (e) {
+    try { ai = await cosmos.advice(pos); }
+    catch (e) {
       warn("advice:", e.message);
       if (cur != null && cur <= pos.entry_cents * HARD_STOP_FRAC) return { action: "STOP_LOSS", reason: "local hard stop (advice unavailable)" };
-      return { action: "HOLD" };
     }
   }
-  return localExit(settings, pos.entry_cents, cur ?? pos.entry_cents);
+
+  // Take-profit side
+  if (settings.tp_mode === "ai") { if (ai?.action === "TAKE_PROFIT") return ai; }
+  else { const tp = localTp(settings, pos.entry_cents, cur); if (tp) return tp; }
+
+  // Stop-loss side
+  if (settings.sl_mode === "ai") { if (ai?.action === "STOP_LOSS") return ai; }
+  else { const sl = localSl(settings, pos.entry_cents, cur); if (sl) return sl; }
+
+  return { action: "HOLD" };
 }
 
 // Place a marketable Fill-And-Kill SELL for the shares we actually hold.
