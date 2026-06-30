@@ -179,8 +179,14 @@ async function cycle(cosmos, pm) {
   store.save(positions);
 
   const balance = await pm.getBalanceUsd();
+  // `deployed` = the REAL current value of EVERY open holding on the wallet (Polymarket /positions),
+  // NOT the local positions.json - which is ephemeral on Fly and wiped on each restart/auto-update.
+  // Sizing off (cash + deployed) keeps every % trade on the TRUE total portfolio instead of
+  // collapsing to leftover cash after a restart (the "only ~$2 orders" bug). Cash-only fallback if
+  // /positions fails. Logged below so you can SEE the basis the % is taken from.
+  let deployed = [...held.values()].reduce((a, h) => a + (Number(h.size_shares) || 0) * (Number(h.cur_cents) || 0) / 100, 0);
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
-  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · $${balance.toFixed(2)} · ${sizeLabel(settings.sizing)}`);
+  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${(balance + deployed).toFixed(2)} · ${sizeLabel(settings.sizing)}`);
 
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   for (const cid of Object.keys(positions)) {
@@ -209,8 +215,7 @@ async function cycle(cosmos, pm) {
   } else {
     // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
     const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? 5, tierPct: {}, conviction: false, maxPerTradeUsd: null, maxExposurePct: null };
-    let remaining = balance;
-    let deployed = Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
+    let remaining = balance; // `deployed` (true portfolio basis) is computed above from real holdings
     // Mark a market "evaluated" so it's never reconsidered. Called only after a real decision
     // (sized-out, price ran past entry, or an order was attempted) — NOT on transient failures
     // (token unresolved, no live price, out of balance), so a blip doesn't lose a good signal.
