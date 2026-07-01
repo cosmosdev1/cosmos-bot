@@ -63,15 +63,22 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
 // Percentages are taken off the whole PORTFOLIO (free cash + the cost basis of open positions), not
 // just free cash, so position sizes stay stable as money gets deployed.
 // Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
+const DEFAULT_PCT = 3; // never size at 0% - fall back to 3% of portfolio if a config value is missing/0
+
 function sizeForSignal(z, s, balance, deployed) {
-  const portfolio = balance + deployed; // cash + open positions
+  // Size off an explicit account-size override when the user set one, else the TRUE portfolio
+  // (cash + open positions). The override makes "3% of $200 = $6" hold no matter what the live reads do.
+  const portfolio = Number(z.accountSizeUsd) > 0 ? Number(z.accountSizeUsd) : balance + deployed;
   let usd;
   if (z.mode === "fixed") usd = Number(z.fixedUsd) || 0;
   else if (z.mode === "tiered") {
     const tp = z.tierPct || {};
-    usd = (portfolio * (Number(tp[s.lock_tier] ?? tp.free ?? 0) || 0)) / 100;
+    // `||` (not `??`) so a 0/undefined tier falls through: tier -> free -> the flat pct -> DEFAULT_PCT.
+    // NEVER resolve to 0% (which the $1 floor would turn into a tiny 2-3 share minimum order).
+    const pct = Number(tp[s.lock_tier]) || Number(tp.free) || Number(z.pct) || DEFAULT_PCT;
+    usd = (portfolio * pct) / 100;
   } else {
-    usd = (portfolio * (Number(z.pct) || 0)) / 100;
+    usd = (portfolio * (Number(z.pct) || DEFAULT_PCT)) / 100;
   }
   if (z.conviction && s.score) usd *= 0.5 + Number(s.score) / 10; // score 0..10 -> 0.5x..1.5x
   if (z.maxPerTradeUsd) usd = Math.min(usd, Number(z.maxPerTradeUsd));
@@ -83,9 +90,10 @@ function sizeForSignal(z, s, balance, deployed) {
 // save reached THIS token (the bot re-reads /api/v1/account every cycle, no caching).
 function sizeLabel(z) {
   if (!z || !z.mode) return "size: default";
+  const basis = Number(z.accountSizeUsd) > 0 ? ` of $${Number(z.accountSizeUsd)} (set)` : " of portfolio";
   if (z.mode === "fixed") return `size: $${Number(z.fixedUsd) || 0}/trade`;
-  if (z.mode === "tiered") { const t = z.tierPct || {}; return `size: tiered g${t.gold ?? 0}/p${t.platinum ?? 0}/b${t.bronze ?? 0}/f${t.free ?? 0}%`; }
-  return `size: ${Number(z.pct) || 0}% of portfolio`;
+  if (z.mode === "tiered") { const t = z.tierPct || {}; return `size: tiered g${t.gold ?? 0}/p${t.platinum ?? 0}/b${t.bronze ?? 0}/f${t.free ?? 0}%${basis}`; }
+  return `size: ${Number(z.pct) || DEFAULT_PCT}%${basis}`;
 }
 
 const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
@@ -187,16 +195,43 @@ async function cycle(cosmos, pm) {
   }
 
   const balance = await pm.getBalanceUsd();
-  // `deployed` = the REAL current value of EVERY open holding on the wallet (Polymarket /positions),
-  // so the % is taken off the TRUE portfolio (cash + positions), NOT just leftover cash. If /positions
-  // FAILED this cycle, fall back to the local store's cost basis instead of 0 - so a transient API
-  // blip can't collapse sizing back to cash (the "% from cash not balance" bug). Logged so you can
-  // SEE the basis; "(est...)" means the live holdings fetch failed and we used the store.
-  let deployed = holdingsOk
-    ? [...held.values()].reduce((a, h) => a + (Number(h.size_shares) || 0) * (Number(h.cur_cents) || 0) / 100, 0)
-    : Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
+  // `deployed` = the REAL current $ value of open holdings, so the % is taken off the TRUE portfolio
+  // (cash + positions), NOT just leftover cash. Take the MAX of the LIVE /positions value and the
+  // local store's cost basis, so neither an empty/failed /positions read NOR a stale store can
+  // collapse the portfolio to leftover cash (the "% from cash not balance" death spiral). Uses the
+  // live currentValue when available.
+  const liveDeployed = holdingsOk
+    ? [...held.values()].reduce((a, h) => a + (Number(h.cur_value) || (Number(h.size_shares) || 0) * (Number(h.cur_cents) || 0) / 100), 0)
+    : 0;
+  const storeDeployed = Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
+  const deployed = Math.max(liveDeployed, storeDeployed);
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
-  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${(balance + deployed).toFixed(2)}${holdingsOk ? "" : " (est: holdings fetch failed)"} · ${sizeLabel(settings.sizing)}`);
+  const basisNote = !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
+  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${(balance + deployed).toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
+
+  // Telemetry: report the live sizing basis + config so the admin can SEE why orders are sized as they
+  // are (cash vs portfolio vs override, and any funder misconfig). Fire-and-forget.
+  {
+    const z = settings.sizing || {};
+    const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, balance, deployed);
+    cosmos.reportHealth({
+      cash: Number(balance.toFixed(2)),
+      deployed: Number(deployed.toFixed(2)),
+      portfolio: Number((balance + deployed).toFixed(2)),
+      holdings_ok: holdingsOk,
+      positions_count: holdingsOk ? held.size : Object.keys(positions).length,
+      funder: pm.funder,
+      signer_eoa: pm.address,
+      funder_is_proxy: String(pm.funder).toLowerCase() !== String(pm.address).toLowerCase(),
+      sizing_mode: z.mode ?? null,
+      sizing_pct: z.pct ?? null,
+      tier_pct: z.tierPct ?? null,
+      account_size_usd: z.accountSizeUsd ?? null,
+      sample_size_usd: Number((sampleSizeUsd || 0).toFixed(2)),
+      open_count: Object.keys(positions).length,
+      feed_count: feed.count,
+    });
+  }
 
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   for (const cid of Object.keys(positions)) {
@@ -224,7 +259,7 @@ async function cycle(cosmos, pm) {
     log(`watching ${Object.keys(seen).length} markets · will buy only newly-added ones`);
   } else {
     // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
-    const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? 5, tierPct: {}, conviction: false, maxPerTradeUsd: null, maxExposurePct: null };
+    const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? DEFAULT_PCT, tierPct: { gold: 4, platinum: 4, bronze: 3, free: 3 }, conviction: false, maxPerTradeUsd: null, maxExposurePct: null, accountSizeUsd: null };
     let remaining = balance; // `deployed` (true portfolio basis) is computed above from real holdings
     // Mark a market "evaluated" so it's never reconsidered. Called only after a real decision
     // (sized-out, price ran past entry, or an order was attempted) — NOT on transient failures

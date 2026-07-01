@@ -3,13 +3,25 @@
 // region), then reports it to Cosmos for $0.09 metering. Written against @polymarket/clob-client-v2
 // (Polymarket's CLOB V2 client — the old clob-client signs an order version V2 now rejects).
 import { ClobClient, Side, OrderType, AssetType, Chain, SignatureTypeV2 } from "@polymarket/clob-client-v2";
-import { createWalletClient, http } from "viem";
+import { createWalletClient, createPublicClient, http } from "viem";
 import { polygon } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 
 const CLOB_HOST = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
 const GAMMA = "https://gamma-api.polymarket.com";
+
+// USDC on Polygon: bridged USDC.e (Polymarket's collateral) + native USDC. We read the funder's USDC
+// on-chain (authoritative, never stale, correct wallet) and only fall back to the CLOB's cached
+// balance if the on-chain read is ~0 - matching the whales-radar portfolio_sizer approach.
+const USDC_ADDRESSES = [
+  "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e (bridged) - Polymarket collateral
+  "0x3c499c542cEF5E3811e1192ce70d8cc03d5c3359", // native USDC
+];
+const ERC20_BALANCE_ABI = [{
+  name: "balanceOf", type: "function", stateMutability: "view",
+  inputs: [{ name: "account", type: "address" }], outputs: [{ name: "", type: "uint256" }],
+}];
 
 // Cosmos's Polymarket BUILDER CODE (bytes32). When set (non-zero), every order the bot signs
 // carries it, so Polymarket takes Cosmos's builder fee out of the fill — the user simply earns a
@@ -28,6 +40,8 @@ export async function makePolymarket(config) {
   const walletClient = createWalletClient({ account, chain: polygon, transport: http() });
   const address = account.address;
   const funder = config.polymarket.funderAddress || address;
+  const publicClient = createPublicClient({ chain: polygon, transport: http() });
+  let lastGoodBalance = null; // last non-zero cash read, so a transient RPC/API blip never sizes off $0
 
   // L1: derive (or create) the L2 API credentials from a wallet signature.
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
@@ -53,14 +67,31 @@ export async function makePolymarket(config) {
     funder,
     builderFee: builderOn, // whether a builder fee is being attached to orders
 
-    // USDC balance, for position sizing.
+    // Free USDC (cash) on the FUNDER/proxy wallet, for position sizing. On-chain balanceOf FIRST
+    // (authoritative, never stale, always the funder - not the signer-EOA-derived proxy the CLOB
+    // balance endpoint silently resolves to); fall back to the CLOB's cached collateral only if
+    // on-chain reads ~0; and cache the last non-zero value so a transient blip never sizes off $0.
+    // (Open positions are added by the caller as `deployed` for the TRUE portfolio.)
     async getBalanceUsd() {
+      // 1) on-chain, summed across both USDC contracts on the funder
+      try {
+        let onchain = 0;
+        for (const token of USDC_ADDRESSES) {
+          const raw = await publicClient
+            .readContract({ address: token, abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [funder] })
+            .catch(() => 0n);
+          onchain += Number(raw) / 1e6; // USDC = 6 decimals
+        }
+        if (onchain >= 0.01) { lastGoodBalance = onchain; return onchain; }
+      } catch { /* fall through to CLOB */ }
+      // 2) CLOB cached collateral (POLY_PROXY-resolved)
       try {
         const c = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-        return Number(c?.balance ?? 0) / 1e6; // USDC = 6 decimals
-      } catch {
-        return 0;
-      }
+        const clob = Number(c?.balance ?? 0) / 1e6;
+        if (clob >= 0.01) { lastGoodBalance = clob; return clob; }
+      } catch { /* fall through to last-good */ }
+      // 3) last known good - never collapse sizing to 0 on a transient failure
+      return lastGoodBalance ?? 0;
     },
 
     // Polymarket geoblock status for THIS server's egress IP (docs: GET /api/geoblock ->
@@ -136,7 +167,10 @@ export async function makePolymarket(config) {
     // caller can tell "no positions" apart from "couldn't check" and never collapse sizing to cash.
     async getMyPositions() {
       try {
-        const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=1`);
+        // sizeThreshold=0 (NOT 1) so our tiny 2-3 share positions aren't silently dropped, and NO
+        // `limit` param (Polymarket returns [] for unrecognized params). currentValue = the live $
+        // the caller sums into `deployed`.
+        const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=0`);
         if (!res.ok) return null;
         const arr = await res.json();
         if (!Array.isArray(arr)) return null;
@@ -148,6 +182,7 @@ export async function makePolymarket(config) {
             entry_cents: Math.round(Number(p.avgPrice ?? 0) * 100),
             cur_cents: Math.round(Number(p.curPrice ?? 0) * 100),
             size_shares: Number(p.size ?? 0),
+            cur_value: Number(p.currentValue ?? 0), // live $ value of this holding
           }))
           .filter((p) => p.condition_id && p.size_shares > 0);
       } catch {

@@ -45,5 +45,13 @@ export function makeCosmos(config) {
         return { ok: false, paused: false };
       }
     },
+
+    // Report the bot's live sizing basis (cash/deployed/portfolio + config) so the admin can SEE why
+    // orders are sized as they are. Fire-and-forget: never blocks or breaks a cycle.
+    async reportHealth(health) {
+      try {
+        await fetch(`${base}/api/v1/bot-health`, { method: "POST", headers, body: JSON.stringify(health) });
+      } catch { /* observability only - ignore */ }
+    },
   };
 }
