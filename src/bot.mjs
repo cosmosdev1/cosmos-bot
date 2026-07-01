@@ -216,6 +216,7 @@ async function cycle(cosmos, pm) {
     const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, balance, deployed);
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
     cosmos.reportHealth({
+      build: "bal-split-1",
       onchain_usd: bd.onchain == null ? null : Number(bd.onchain.toFixed(2)),
       clob_usd: bd.clob == null ? null : Number(bd.clob.toFixed(2)),
       cash: Number(balance.toFixed(2)),
