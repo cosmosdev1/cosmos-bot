@@ -206,14 +206,17 @@ async function cycle(cosmos, pm) {
     : 0;
   const storeDeployed = Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
   let deployed = Math.max(liveDeployed, storeDeployed); // `let`: it's incremented per buy below (line ~318)
-  // Portfolio basis for sizing = Polymarket's OWN authoritative /value total (cash + ALL open
-  // positions marked to market), which is far more reliable than summing /positions ourselves (a
-  // funder can have thousands of old resolved $0 positions). Never let it read BELOW what we can
-  // already see (cash + counted positions). Spending is still capped by `remaining` (cash) below.
+  // Portfolio = cash + open-positions value. Polymarket's /value is the authoritative total value of
+  // the user's OPEN POSITIONS only (per their docs "total value of a user's positions" - it does NOT
+  // include the USDC cash balance), and is far more reliable than summing /positions ourselves (a
+  // funder can have thousands of old resolved $0 positions across many pages). So: positions value =
+  // the larger of Polymarket's /value and our own counted holdings; portfolio = cash + that.
+  // Spending is still capped by `remaining` (cash) below.
   const pmValue = await pm.getPortfolioValue();
-  const portfolioValue = Math.max(Number(pmValue) || 0, balance + deployed);
+  const positionsValue = Math.max(Number(pmValue) || 0, deployed);
+  const portfolioValue = balance + positionsValue;
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
-  const basisNote = pmValue != null && Number(pmValue) >= balance + deployed ? " (polymarket value)" : !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
+  const basisNote = pmValue != null && Number(pmValue) >= deployed ? " (cash + polymarket positions)" : !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
   log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${portfolioValue.toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
 
   // Telemetry: report the live sizing basis + config so the admin can SEE why orders are sized as they
