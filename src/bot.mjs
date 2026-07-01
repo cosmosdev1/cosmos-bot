@@ -23,7 +23,7 @@ function loadConfig() {
       funderAddress: e.POLYMARKET_FUNDER || f.polymarket?.funderAddress || "",
     },
     pollSeconds: Number(e.POLL_SECONDS) || f.pollSeconds || 30,
-    maxConcurrent: Number(e.MAX_CONCURRENT) || f.maxConcurrent || 10,
+    maxConcurrent: Number(e.MAX_CONCURRENT) || f.maxConcurrent || 30, // hold up to 30 so the bot keeps buying new signals instead of stalling at 10 (env MAX_CONCURRENT to raise)
     applyToManualTrades: f.applyToManualTrades ?? e.APPLY_TO_MANUAL === "1",
     buyBacklogOnStart: f.buyBacklogOnStart === true || e.COSMOS_BUY_BACKLOG === "1",
   };
