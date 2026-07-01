@@ -26,17 +26,22 @@ start_bot
 
 while true; do
   sleep "$INTERVAL"
+  BEFORE=$(git rev-parse HEAD 2>/dev/null || echo none)
   if git fetch --depth 1 origin "$BRANCH" --quiet 2>/dev/null; then
-    LOCAL=$(git rev-parse HEAD 2>/dev/null || echo a)
-    REMOTE=$(git rev-parse "origin/$BRANCH" 2>/dev/null || echo b)
-    if [ "$LOCAL" != "$REMOTE" ]; then
-      echo "[launcher] update $LOCAL -> $REMOTE; restarting bot with the new code"
-      git reset --hard "origin/$BRANCH" --quiet || true
-      kill "$BOT_PID" 2>/dev/null || true
-      wait "$BOT_PID" 2>/dev/null || true
-      start_bot
-      continue
-    fi
+    # Reset to the FETCHED commit. Use FETCH_HEAD (which `git fetch` ALWAYS updates) rather than the
+    # origin/<branch> tracking ref - a shallow fetch does NOT reliably update origin/<branch>, which is
+    # the bug that left bots stuck on old code (the compare thought it was already current). Idempotent.
+    git reset --hard FETCH_HEAD --quiet 2>/dev/null || true
+  else
+    echo "[launcher] git fetch failed; will retry in ${INTERVAL}s"
+  fi
+  AFTER=$(git rev-parse HEAD 2>/dev/null || echo none)
+  if [ "$BEFORE" != "$AFTER" ]; then
+    echo "[launcher] updated $BEFORE -> $AFTER; restarting bot with the new code"
+    kill "$BOT_PID" 2>/dev/null || true
+    wait "$BOT_PID" 2>/dev/null || true
+    start_bot
+    continue
   fi
   # crash recovery: if the bot process died, bring it back
   if ! kill -0 "$BOT_PID" 2>/dev/null; then

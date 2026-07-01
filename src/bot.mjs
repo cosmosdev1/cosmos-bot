@@ -4,6 +4,7 @@
 // runs the exit logic (Cosmos AI / fixed / percent). State is RECONCILED against your real
 // Polymarket holdings each cycle, so positions.json never drifts from reality.
 import { existsSync, readFileSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { makeCosmos } from "./cosmos.mjs";
 import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
@@ -351,6 +352,27 @@ async function cycle(cosmos, pm) {
   }
 }
 
+// Self-update watchdog: INDEPENDENTLY of the launcher, every ~10 min check the repo for a newer
+// commit; if found, pull it and exit so the launcher relaunches the bot on the new code. This makes a
+// repo push reach EVERY bot with zero user action, even where the launcher's own git timer is flaky
+// (the bug that stranded bots on old code) - the bot pulls the code itself, then any restart runs it.
+const SELF_UPDATE_MS = (Number(process.env.COSMOS_SELFUPDATE_SECONDS) || 600) * 1000;
+let lastUpdateCheck = Date.now();
+function maybeSelfUpdate() {
+  if (Date.now() - lastUpdateCheck < SELF_UPDATE_MS) return;
+  lastUpdateCheck = Date.now();
+  try {
+    execSync("git fetch --depth 1 origin main", { stdio: "ignore", timeout: 20000 });
+    const local = execSync("git rev-parse HEAD", { timeout: 5000 }).toString().trim();
+    const remote = execSync("git rev-parse FETCH_HEAD", { timeout: 5000 }).toString().trim();
+    if (local && remote && local !== remote) {
+      log(`self-update ${local.slice(0, 7)} -> ${remote.slice(0, 7)}; pulling + restarting`);
+      execSync("git reset --hard FETCH_HEAD", { stdio: "ignore", timeout: 20000 });
+      process.exit(0); // the launcher relaunches the bot on the freshly-pulled code
+    }
+  } catch { /* git unavailable (local dev) or a transient failure - ignore, retry next window */ }
+}
+
 async function main() {
   log("Cosmos bot starting…");
   const cosmos = makeCosmos(config);
@@ -372,6 +394,7 @@ async function main() {
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
+    maybeSelfUpdate(); // pull + relaunch on a new commit (throttled to every SELF_UPDATE_MS)
     try {
       await cycle(cosmos, pm);
     } catch (e) {
