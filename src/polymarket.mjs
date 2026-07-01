@@ -43,6 +43,7 @@ export async function makePolymarket(config) {
   const publicClient = createPublicClient({ chain: polygon, transport: http() });
   let lastGoodBalance = null; // last non-zero cash read, so a transient RPC/API blip never sizes off $0
   let lastBalanceBreakdown = { onchain: null, clob: null }; // for telemetry: WHERE the cash actually is
+  let lastGoodValue = null; // last good Polymarket /value total (authoritative portfolio value)
 
   // L1: derive (or create) the L2 API credentials from a wallet signature.
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
@@ -100,6 +101,22 @@ export async function makePolymarket(config) {
       return lastGoodBalance ?? 0; // never collapse sizing to 0 on a transient failure
     },
     balanceBreakdown: () => lastBalanceBreakdown,
+
+    // Polymarket's OWN authoritative total portfolio value for the funder (cash + all open positions
+    // marked to market + redeemable), via the data-api /value endpoint. This is far more reliable than
+    // summing /positions ourselves (a funder can have thousands of old resolved $0 positions across
+    // many pages). Returns the number, or the last-good value on a transient failure, or null.
+    async getPortfolioValue() {
+      try {
+        const r = await fetch(`${DATA_API}/value?user=${encodeURIComponent(funder)}`);
+        if (r.ok) {
+          const arr = await r.json();
+          const v = Array.isArray(arr) ? Number(arr[0]?.value) : Number(arr?.value);
+          if (Number.isFinite(v) && v >= 0.01) { lastGoodValue = v; return v; }
+        }
+      } catch { /* fall through to last-good */ }
+      return lastGoodValue;
+    },
 
     // Polymarket geoblock status for THIS server's egress IP (docs: GET /api/geoblock ->
     // { blocked, ip, country, region }). When blocked, every order is rejected with a 403, so we

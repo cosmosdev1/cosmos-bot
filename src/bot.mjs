@@ -65,10 +65,11 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
 // Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
 const DEFAULT_PCT = 3; // never size at 0% - fall back to 3% of portfolio if a config value is missing/0
 
-function sizeForSignal(z, s, balance, deployed) {
-  // Size off an explicit account-size override when the user set one, else the TRUE portfolio
-  // (cash + open positions). The override makes "3% of $200 = $6" hold no matter what the live reads do.
-  const portfolio = Number(z.accountSizeUsd) > 0 ? Number(z.accountSizeUsd) : balance + deployed;
+function sizeForSignal(z, s, portfolio, deployed) {
+  // Size off an explicit account-size override when the user set one, else the TRUE portfolio VALUE
+  // passed in (Polymarket's authoritative total = cash + open positions). The override makes
+  // "3% of $200 = $6" hold no matter what the live reads do.
+  const basis = Number(z.accountSizeUsd) > 0 ? Number(z.accountSizeUsd) : portfolio;
   let usd;
   if (z.mode === "fixed") usd = Number(z.fixedUsd) || 0;
   else if (z.mode === "tiered") {
@@ -76,13 +77,13 @@ function sizeForSignal(z, s, balance, deployed) {
     // `||` (not `??`) so a 0/undefined tier falls through: tier -> free -> the flat pct -> DEFAULT_PCT.
     // NEVER resolve to 0% (which the $1 floor would turn into a tiny 2-3 share minimum order).
     const pct = Number(tp[s.lock_tier]) || Number(tp.free) || Number(z.pct) || DEFAULT_PCT;
-    usd = (portfolio * pct) / 100;
+    usd = (basis * pct) / 100;
   } else {
-    usd = (portfolio * (Number(z.pct) || DEFAULT_PCT)) / 100;
+    usd = (basis * (Number(z.pct) || DEFAULT_PCT)) / 100;
   }
   if (z.conviction && s.score) usd *= 0.5 + Number(s.score) / 10; // score 0..10 -> 0.5x..1.5x
   if (z.maxPerTradeUsd) usd = Math.min(usd, Number(z.maxPerTradeUsd));
-  if (z.maxExposurePct) usd = Math.min(usd, Math.max(0, (portfolio * Number(z.maxExposurePct)) / 100 - deployed));
+  if (z.maxExposurePct) usd = Math.min(usd, Math.max(0, (basis * Number(z.maxExposurePct)) / 100 - deployed));
   return usd;
 }
 
@@ -205,23 +206,30 @@ async function cycle(cosmos, pm) {
     : 0;
   const storeDeployed = Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
   let deployed = Math.max(liveDeployed, storeDeployed); // `let`: it's incremented per buy below (line ~318)
+  // Portfolio basis for sizing = Polymarket's OWN authoritative /value total (cash + ALL open
+  // positions marked to market), which is far more reliable than summing /positions ourselves (a
+  // funder can have thousands of old resolved $0 positions). Never let it read BELOW what we can
+  // already see (cash + counted positions). Spending is still capped by `remaining` (cash) below.
+  const pmValue = await pm.getPortfolioValue();
+  const portfolioValue = Math.max(Number(pmValue) || 0, balance + deployed);
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
-  const basisNote = !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
-  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${(balance + deployed).toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
+  const basisNote = pmValue != null && Number(pmValue) >= balance + deployed ? " (polymarket value)" : !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
+  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${portfolioValue.toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
 
   // Telemetry: report the live sizing basis + config so the admin can SEE why orders are sized as they
   // are (cash vs portfolio vs override, and any funder misconfig). Fire-and-forget.
   {
     const z = settings.sizing || {};
-    const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, balance, deployed);
+    const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, portfolioValue, deployed);
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
     cosmos.reportHealth({
-      build: "bal-split-1",
+      build: "pm-value-1",
       onchain_usd: bd.onchain == null ? null : Number(bd.onchain.toFixed(2)),
       clob_usd: bd.clob == null ? null : Number(bd.clob.toFixed(2)),
+      pm_value: pmValue == null ? null : Number(Number(pmValue).toFixed(2)),
       cash: Number(balance.toFixed(2)),
       deployed: Number(deployed.toFixed(2)),
-      portfolio: Number((balance + deployed).toFixed(2)),
+      portfolio: Number(portfolioValue.toFixed(2)),
       holdings_ok: holdingsOk,
       positions_count: holdingsOk ? held.size : Object.keys(positions).length,
       funder: pm.funder,
@@ -275,13 +283,13 @@ async function cycle(cosmos, pm) {
       if (seen[s.condition_id] || positions[s.condition_id] || held.has(s.condition_id)) continue; // already evaluated / held
       if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break; // full — leave for when a slot frees
 
-      let sizeUsd = sizeForSignal(sizing, s, balance, deployed);
+      let sizeUsd = sizeForSignal(sizing, s, portfolioValue, deployed);
       // Floor to Polymarket's ~$1 minimum order so SMALL balances still trade instead of being
       // skipped (the share math below already guarantees >= ~$1 of shares). Do NOT floor — and do
       // NOT burn the market via markSeen — when there's simply no room right now (out of balance, or
       // the exposure cap is maxed): those are TRANSIENT, so a later size/balance change retries it.
       const exposureRoom = sizing.maxExposurePct
-        ? Math.max(0, ((balance + deployed) * Number(sizing.maxExposurePct)) / 100 - deployed)
+        ? Math.max(0, (portfolioValue * Number(sizing.maxExposurePct)) / 100 - deployed)
         : Infinity;
       if (sizeUsd < MIN_TRADE_USD && exposureRoom >= MIN_TRADE_USD) sizeUsd = MIN_TRADE_USD; // hard $1 floor
       if (sizeUsd < MIN_TRADE_USD || sizeUsd > remaining) continue; // no room right now — transient, retry (no burn)
