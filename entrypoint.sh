@@ -7,7 +7,7 @@ set -u
 REPO="${COSMOS_BOT_REPO:-https://github.com/cosmosdev1/cosmos-bot.git}"
 BRANCH="${COSMOS_BOT_REF:-main}"
 SRC=/app/repo
-INTERVAL="${COSMOS_UPDATE_SECONDS:-3600}"   # check for updates hourly by default
+INTERVAL="${COSMOS_UPDATE_SECONDS:-600}"    # check for updates every 10 min so a repo push reaches every bot fast
 
 if [ ! -d "$SRC/.git" ]; then
   git clone --depth 1 --branch "$BRANCH" "$REPO" "$SRC"
