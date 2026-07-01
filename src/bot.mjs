@@ -204,7 +204,7 @@ async function cycle(cosmos, pm) {
     ? [...held.values()].reduce((a, h) => a + (Number(h.cur_value) || (Number(h.size_shares) || 0) * (Number(h.cur_cents) || 0) / 100), 0)
     : 0;
   const storeDeployed = Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
-  const deployed = Math.max(liveDeployed, storeDeployed);
+  let deployed = Math.max(liveDeployed, storeDeployed); // `let`: it's incremented per buy below (line ~318)
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
   const basisNote = !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
   log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${(balance + deployed).toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
