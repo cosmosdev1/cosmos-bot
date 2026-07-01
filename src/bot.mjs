@@ -41,7 +41,7 @@ const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 
 // Hard floor per trade: Polymarket's ~$1 minimum order. Any computed size below this is bumped up
 // to $1 (e.g. 3% of a $10 balance = $0.30 still trades at $1), as long as there's room.
-const MIN_TRADE_USD = 1;
+const MIN_TRADE_USD = 2;
 
 // Retry a marketable FAK order on a transient kill. A Fill-And-Kill that finds no liquidity is
 // REJECTED (ok:false) with nothing filled - and the book usually refreshes within a few hundred ms,
@@ -291,7 +291,7 @@ async function cycle(cosmos, pm) {
       const exposureRoom = sizing.maxExposurePct
         ? Math.max(0, (portfolioValue * Number(sizing.maxExposurePct)) / 100 - deployed)
         : Infinity;
-      if (sizeUsd < MIN_TRADE_USD && exposureRoom >= MIN_TRADE_USD) sizeUsd = MIN_TRADE_USD; // hard $1 floor
+      if (sizeUsd < MIN_TRADE_USD && exposureRoom >= MIN_TRADE_USD) sizeUsd = MIN_TRADE_USD; // hard $2 floor
       if (sizeUsd < MIN_TRADE_USD || sizeUsd > remaining) continue; // no room right now — transient, retry (no burn)
 
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
