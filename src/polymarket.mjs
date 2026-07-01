@@ -42,6 +42,7 @@ export async function makePolymarket(config) {
   const funder = config.polymarket.funderAddress || address;
   const publicClient = createPublicClient({ chain: polygon, transport: http() });
   let lastGoodBalance = null; // last non-zero cash read, so a transient RPC/API blip never sizes off $0
+  let lastBalanceBreakdown = { onchain: null, clob: null }; // for telemetry: WHERE the cash actually is
 
   // L1: derive (or create) the L2 API credentials from a wallet signature.
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
@@ -73,26 +74,32 @@ export async function makePolymarket(config) {
     // on-chain reads ~0; and cache the last non-zero value so a transient blip never sizes off $0.
     // (Open positions are added by the caller as `deployed` for the TRUE portfolio.)
     async getBalanceUsd() {
-      // 1) on-chain, summed across both USDC contracts on the funder
+      // Read BOTH the on-chain USDC on the funder AND the CLOB deposited collateral, and size off the
+      // LARGER - a user's cash can sit EITHER on-chain in the proxy OR deposited in the CLOB exchange,
+      // so we must use whichever actually holds it. Record the split (balanceBreakdown) for telemetry;
+      // cache last-known-good so a transient blip never sizes off $0.
+      let onchain = null;
       try {
-        let onchain = 0;
+        let sum = 0;
         for (const token of USDC_ADDRESSES) {
           const raw = await publicClient
             .readContract({ address: token, abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [funder] })
             .catch(() => 0n);
-          onchain += Number(raw) / 1e6; // USDC = 6 decimals
+          sum += Number(raw) / 1e6; // USDC = 6 decimals
         }
-        if (onchain >= 0.01) { lastGoodBalance = onchain; return onchain; }
-      } catch { /* fall through to CLOB */ }
-      // 2) CLOB cached collateral (POLY_PROXY-resolved)
+        onchain = sum;
+      } catch { onchain = null; }
+      let clob = null;
       try {
         const c = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-        const clob = Number(c?.balance ?? 0) / 1e6;
-        if (clob >= 0.01) { lastGoodBalance = clob; return clob; }
-      } catch { /* fall through to last-good */ }
-      // 3) last known good - never collapse sizing to 0 on a transient failure
-      return lastGoodBalance ?? 0;
+        clob = Number(c?.balance ?? 0) / 1e6;
+      } catch { clob = null; }
+      lastBalanceBreakdown = { onchain, clob };
+      const best = Math.max(onchain ?? 0, clob ?? 0);
+      if (best >= 0.01) { lastGoodBalance = best; return best; }
+      return lastGoodBalance ?? 0; // never collapse sizing to 0 on a transient failure
     },
+    balanceBreakdown: () => lastBalanceBreakdown,
 
     // Polymarket geoblock status for THIS server's egress IP (docs: GET /api/geoblock ->
     // { blocked, ip, country, region }). When blocked, every order is rejected with a 403, so we
