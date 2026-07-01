@@ -149,8 +149,10 @@ async function marketableSell(cosmos, pm, pos) {
 }
 
 async function holdingsMap(pm) {
+  const arr = await pm.getMyPositions();
+  if (arr == null) return null; // the /positions fetch failed - signal "unknown", NOT "no positions"
   const m = new Map();
-  for (const p of await pm.getMyPositions()) m.set(p.condition_id, p);
+  for (const p of arr) m.set(p.condition_id, p);
   return m;
 }
 
@@ -168,25 +170,33 @@ async function cycle(cosmos, pm) {
 
   // --- RECONCILE: make positions.json match the real wallet (handles unfilled/partial/sold). ---
   const positions = store.load();
-  const held = await holdingsMap(pm);
-  for (const cid of Object.keys(positions)) {
-    const h = held.get(cid);
-    if (!h || h.size_shares < 1) { delete positions[cid]; continue; } // never filled or already sold
-    positions[cid].size_shares = h.size_shares; // sync to actual holding
-    if (h.entry_cents > 0) positions[cid].entry_cents = h.entry_cents; // sync the REAL avg fill price
-    if (!positions[cid].token_id) positions[cid].token_id = h.token_id;
+  const heldRaw = await holdingsMap(pm); // null = the /positions fetch FAILED (not "no positions")
+  const holdingsOk = heldRaw != null;
+  const held = heldRaw ?? new Map();
+  // Only reconcile-delete when we actually got the wallet holdings. If the fetch failed, KEEP the
+  // tracked positions - deleting them would drop their exits AND collapse `deployed` to 0 (cash sizing).
+  if (holdingsOk) {
+    for (const cid of Object.keys(positions)) {
+      const h = held.get(cid);
+      if (!h || h.size_shares < 1) { delete positions[cid]; continue; } // never filled or already sold
+      positions[cid].size_shares = h.size_shares; // sync to actual holding
+      if (h.entry_cents > 0) positions[cid].entry_cents = h.entry_cents; // sync the REAL avg fill price
+      if (!positions[cid].token_id) positions[cid].token_id = h.token_id;
+    }
+    store.save(positions);
   }
-  store.save(positions);
 
   const balance = await pm.getBalanceUsd();
   // `deployed` = the REAL current value of EVERY open holding on the wallet (Polymarket /positions),
-  // NOT the local positions.json - which is ephemeral on Fly and wiped on each restart/auto-update.
-  // Sizing off (cash + deployed) keeps every % trade on the TRUE total portfolio instead of
-  // collapsing to leftover cash after a restart (the "only ~$2 orders" bug). Cash-only fallback if
-  // /positions fails. Logged below so you can SEE the basis the % is taken from.
-  let deployed = [...held.values()].reduce((a, h) => a + (Number(h.size_shares) || 0) * (Number(h.cur_cents) || 0) / 100, 0);
+  // so the % is taken off the TRUE portfolio (cash + positions), NOT just leftover cash. If /positions
+  // FAILED this cycle, fall back to the local store's cost basis instead of 0 - so a transient API
+  // blip can't collapse sizing back to cash (the "% from cash not balance" bug). Logged so you can
+  // SEE the basis; "(est...)" means the live holdings fetch failed and we used the store.
+  let deployed = holdingsOk
+    ? [...held.values()].reduce((a, h) => a + (Number(h.size_shares) || 0) * (Number(h.cur_cents) || 0) / 100, 0)
+    : Object.values(positions).reduce((a, p) => a + (Number(p.size_usd) || 0), 0);
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
-  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${(balance + deployed).toFixed(2)} · ${sizeLabel(settings.sizing)}`);
+  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${(balance + deployed).toFixed(2)}${holdingsOk ? "" : " (est: holdings fetch failed)"} · ${sizeLabel(settings.sizing)}`);
 
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   for (const cid of Object.keys(positions)) {

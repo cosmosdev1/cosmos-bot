@@ -132,11 +132,14 @@ export async function makePolymarket(config) {
     },
 
     // The wallet's current Polymarket holdings (for reconcile + "apply to manual trades").
+    // Returns the array of holdings on success (possibly []), or NULL if the fetch FAILED - so the
+    // caller can tell "no positions" apart from "couldn't check" and never collapse sizing to cash.
     async getMyPositions() {
       try {
         const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=1`);
+        if (!res.ok) return null;
         const arr = await res.json();
-        if (!Array.isArray(arr)) return [];
+        if (!Array.isArray(arr)) return null;
         return arr
           .map((p) => ({
             condition_id: p.conditionId,
@@ -148,7 +151,7 @@ export async function makePolymarket(config) {
           }))
           .filter((p) => p.condition_id && p.size_shares > 0);
       } catch {
-        return [];
+        return null;
       }
     },
   };
