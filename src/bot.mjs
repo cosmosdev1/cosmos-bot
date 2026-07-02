@@ -149,13 +149,39 @@ async function decideExit(cosmos, pm, settings, pos) {
   return { action: "HOLD" };
 }
 
-// Place a marketable Fill-And-Kill SELL for the shares we actually hold.
-async function marketableSell(cosmos, pm, pos) {
+// Place a marketable Fill-And-Kill SELL that is GUARANTEED to cross the book whenever a bid exists.
+// The old code sold at a fixed mid - 5c and RE-TRIED at that same stale price, so a thin/wide book
+// near the 1c/99c edges (exactly where the fallback stop/take-profit fires) could kill every attempt
+// and the position never sold - the "missed" bug. Now we price against the LIVE best bid, re-read on
+// every attempt (the book moves), and sell 1c UNDER it so the order still crosses if the top bid is
+// pulled between read and post. A STOP_LOSS / salvage will dump all the way to 1c (accept ANY bid) so
+// a losing/worthless position always exits; a TAKE_PROFIT keeps a floor (~10c under mid) so we never
+// hand a near-resolved winner to a lowball bid - if nothing clears the floor we HOLD and it resolves
+// in our favour anyway. The caller re-runs this every cycle until reconcile confirms the holding is
+// actually gone, so a momentary empty book is retried until it fills.
+async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
   const mid = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
-  const sellPrice = Math.max(1, mid - SELL_BUFFER);
-  const r = await placeWithRetry(pm, { tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
-  if (r.ok) { try { await cosmos.meter(r.meta); } catch { /* order placed; meter best-effort */ } }
-  return { mid, ...r };
+  const salvage = action !== "TAKE_PROFIT"; // stop-loss / edge-salvage may dump; take-profit may not
+  const floor = salvage ? 1 : Math.max(1, mid - 10);
+  let last = { ok: false, status: 0, body: {} };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const bid = await pm.getBestBidCents(pos.token_id);
+    let sellPrice;
+    if (bid != null && bid >= floor) {
+      sellPrice = Math.max(floor, bid - 1); // cross the resting best bid -> guaranteed fill
+    } else if (bid == null) {
+      sellPrice = Math.max(floor, mid - SELL_BUFFER - attempt * 3); // no readable book -> escalate down
+    } else {
+      // There IS a bid but it's below our take-profit floor: don't dump a winner. Hold; it resolves.
+      return { mid, held: true, ok: false, status: 0, body: { skipped: "bid below TP floor" } };
+    }
+    sellPrice = Math.max(1, Math.min(99, Math.round(sellPrice)));
+    const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
+    if (r.ok) { try { await cosmos.meter(r.meta); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
+    last = r;
+    if (attempt < 4) await sleep(200);
+  }
+  return { mid, ...last };
 }
 
 async function holdingsMap(pm) {
@@ -254,9 +280,10 @@ async function cycle(cosmos, pm) {
     const pos = positions[cid];
     const v = await decideExit(cosmos, pm, settings, pos);
     if (!v || v.action === "HOLD") continue;
-    const r = await marketableSell(cosmos, pm, pos);
-    if (r.ok) log(`${v.action} ${pos.outcome} @ ~${r.mid}c · ${v.reason || ""}`);
-    else warn("exit failed:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400));
+    const r = await marketableSell(cosmos, pm, pos, v.action);
+    if (r.ok) log(`${v.action} ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${v.reason || ""}`);
+    else if (r.held) log(`${v.action} ${pos.outcome} held - no bid above floor, will resolve · ${v.reason || ""}`);
+    else warn("exit failed (will retry next cycle):", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400));
     // Don't delete here — next cycle's reconcile removes it once the holding is actually gone.
     // FAK never rests, so re-attempting next cycle can't stack duplicate orders.
   }
@@ -346,8 +373,8 @@ async function cycle(cosmos, pm) {
       const pos = { condition_id: m.condition_id, token_id: m.token_id, outcome: m.outcome, entry_cents: m.entry_cents, size_shares: m.size_shares, entry_whales: [] };
       const v = await decideExit(cosmos, pm, settings, pos);
       if (!v || v.action === "HOLD") continue;
-      const r = await marketableSell(cosmos, pm, pos);
-      if (r.ok) log(`(manual) ${v.action} ${m.outcome} @ ~${r.mid}c · ${v.reason || ""}`);
+      const r = await marketableSell(cosmos, pm, pos, v.action);
+      if (r.ok) log(`(manual) ${v.action} ${m.outcome} @ ~${r.sellPrice ?? r.mid}c · ${v.reason || ""}`);
     }
   }
 }

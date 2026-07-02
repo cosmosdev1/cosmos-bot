@@ -163,6 +163,27 @@ export async function makePolymarket(config) {
       }
     },
 
+    // The LIVE best bid in cents - the highest price a buyer is currently resting. This is the price
+    // a SELL is GUARANTEED to cross (a FAK sell priced at/under the best bid takes that resting bid
+    // and fills). Selling off the mid alone misses when the book is thin/wide near the 1c/99c edges;
+    // reading the real bid is what makes a stop actually fill. Returns null if there is NO bid at all
+    // (nothing to sell into) or the book can't be read.
+    async getBestBidCents(tokenId) {
+      try {
+        const book = await client.getOrderBook(tokenId);
+        const bids = book?.bids || book?.buys || [];
+        let best = 0;
+        for (const b of bids) {
+          const price = Number(b?.price ?? b?.[0] ?? 0);
+          const size = Number(b?.size ?? b?.[1] ?? 0);
+          if (price > best && size > 0) best = price;
+        }
+        return best > 0 ? Math.round(best * 100) : null;
+      } catch {
+        return null;
+      }
+    },
+
     // Sign an order locally and POST it DIRECTLY to Polymarket (your IP/region — not a server's).
     // FAK (Fill-And-Kill) = take whatever liquidity exists at this price NOW and cancel the rest;
     // the bot passes a *marketable* price (above mid to buy / below mid to sell). createAndPostOrder
