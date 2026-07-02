@@ -33,6 +33,19 @@ export function makeCosmos(config) {
       return d; // { action, reason, current_cents, pnl_pct, whale_exit_pct }
     },
 
+    // The strategy-owned exit verdict for an in-play SPORTS position (source "sports"). The user's
+    // TP/SL settings don't apply to these - the server runs the fixed strategy exits (50% at
+    // entry*1.6, full salvage at minute 85+ when not winning, rest to resolution).
+    async sportsExit(pos, curCents) {
+      const q = new URLSearchParams({
+        cid: pos.condition_id,
+        cur: String(curCents ?? 0),
+        entry: String(pos.entry_cents ?? 0),
+        half: pos.half_sold ? "1" : "0",
+      });
+      return getJSON(`/api/v1/sports-exit?${q}`); // { action, reason }
+    },
+
     // Report a placed order to Cosmos: records the $0.09 fee and returns whether the daily
     // spend limit has been reached (paused). The order itself is posted directly to Polymarket
     // by the bot — Cosmos never touches keys or funds.

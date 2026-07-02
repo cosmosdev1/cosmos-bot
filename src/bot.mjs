@@ -184,6 +184,43 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
   return { mid, ...last };
 }
 
+// Strategy exit for one in-play SPORTS position. Asks the server (which tracks the live game) and
+// executes: SELL_HALF = the one-time 50% take-profit at entry*1.6; SELL_ALL = the minute-85 salvage
+// when the favorite isn't winning (dump to any bid - the share is heading to $0 on a draw/loss).
+async function sportsExitStep(cosmos, pm, positions, pos) {
+  const cur = await pm.getPriceCents(pos.token_id);
+  let d = null;
+  try { d = await cosmos.sportsExit(pos, cur ?? 0); }
+  catch (e) { warn("sports-exit:", e.message); return; }
+  if (!d || d.action === "HOLD") return;
+
+  if (d.action === "SELL_HALF") {
+    const half = Math.floor(pos.size_shares / 2);
+    // Polymarket's ~$1 order minimum: if half the shares can't clear it, bank the whole win instead.
+    if (half < 1 || (cur != null && half * cur < 110)) {
+      const r = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT");
+      if (r.ok) { log(`SPORTS TP (full - too small to split) ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${d.reason || ""}`); }
+      return; // reconcile removes it once the holding is gone
+    }
+    const r = await marketableSell(cosmos, pm, { ...pos, size_shares: half }, "TAKE_PROFIT");
+    if (r.ok) {
+      pos.half_sold = true;
+      pos.size_shares -= half; // reconcile re-syncs to the true holding next cycle anyway
+      store.save(positions);
+      log(`SPORTS TP sold ${half} shares @ ~${r.sellPrice ?? r.mid}c, holding ${pos.size_shares} to resolution · ${d.reason || ""}`);
+    } else if (!r.held) {
+      warn("sports half-sell failed (will retry next cycle):", r.status);
+    }
+    return;
+  }
+
+  if (d.action === "SELL_ALL") {
+    const r = await marketableSell(cosmos, pm, pos, "STOP_LOSS"); // salvage: accept any bid
+    if (r.ok) log(`SPORTS SALVAGE ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${d.reason || ""}`);
+    else warn("sports salvage failed (will retry next cycle):", r.status);
+  }
+}
+
 async function holdingsMap(pm) {
   const arr = await pm.getMyPositions();
   if (arr == null) return null; // the /positions fetch failed - signal "unknown", NOT "no positions"
@@ -278,6 +315,10 @@ async function cycle(cosmos, pm) {
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   for (const cid of Object.keys(positions)) {
     const pos = positions[cid];
+    // In-play SPORTS positions follow the server-run strategy exits (50% at entry*1.6, full
+    // salvage at minute 85+ when the favorite isn't winning, rest to resolution) - NOT the
+    // user's TP/SL settings.
+    if (pos.source === "sports") { await sportsExitStep(cosmos, pm, positions, pos); continue; }
     const v = await decideExit(cosmos, pm, settings, pos);
     if (!v || v.action === "HOLD") continue;
     const r = await marketableSell(cosmos, pm, pos, v.action);
