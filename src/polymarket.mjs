@@ -3,9 +3,16 @@
 // region), then reports it to Cosmos for $0.09 metering. Written against @polymarket/clob-client-v2
 // (Polymarket's CLOB V2 client — the old clob-client signs an order version V2 now rejects).
 import { ClobClient, Side, OrderType, AssetType, Chain, SignatureTypeV2 } from "@polymarket/clob-client-v2";
-import { createWalletClient, createPublicClient, http } from "viem";
+import { createWalletClient, createPublicClient, http, fallback } from "viem";
 import { polygon } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
+
+// Polygon RPCs for the on-chain USDC read. viem's default for the polygon chain (polygon-rpc.com)
+// now returns 401 Unauthorized (it went key-only), which silently killed the on-chain balance leg
+// on EVERY bot - so cash could read $0 for users whose USDC sits in the proxy wallet. Use proven
+// free public RPCs with automatic failover; COSMOS_RPC_URL (comma-separated) overrides.
+const RPC_URLS = (process.env.COSMOS_RPC_URL || "https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
 const CLOB_HOST = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
@@ -40,10 +47,11 @@ export async function makePolymarket(config) {
   const walletClient = createWalletClient({ account, chain: polygon, transport: http() });
   const address = account.address;
   const funder = config.polymarket.funderAddress || address;
-  const publicClient = createPublicClient({ chain: polygon, transport: http() });
+  const publicClient = createPublicClient({ chain: polygon, transport: fallback(RPC_URLS.map((u) => http(u))) });
   let lastGoodBalance = null; // last non-zero cash read, so a transient RPC/API blip never sizes off $0
   let lastBalanceBreakdown = { onchain: null, clob: null }; // for telemetry: WHERE the cash actually is
   let lastGoodValue = null; // last good Polymarket /value total (authoritative portfolio value)
+  let lastClobRefresh = 0; // last time we forced the CLOB to recompute its cached balance
 
   // L1: derive (or create) the L2 API credentials from a wallet signature.
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
@@ -94,6 +102,19 @@ export async function makePolymarket(config) {
       try {
         const c = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
         clob = Number(c?.balance ?? 0) / 1e6;
+        // The CLOB's balance endpoint serves a CACHED number that can sit at a stale $0 (or an old
+        // value) until an explicit refresh - and since Polymarket's newer deposits credit the CLOB
+        // ledger rather than parking USDC in the proxy wallet, a stale $0 here means "user HAS cash,
+        // bot sees none, never trades". When it reads ~0, force a server-side recompute (at most
+        // once per 5 min) and read again.
+        if (clob <= 0.01 && Date.now() - lastClobRefresh > 300_000) {
+          lastClobRefresh = Date.now();
+          try {
+            await client.updateBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+            const c2 = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+            clob = Number(c2?.balance ?? 0) / 1e6;
+          } catch { /* keep the first read */ }
+        }
       } catch { clob = null; }
       lastBalanceBreakdown = { onchain, clob };
       const best = Math.max(onchain ?? 0, clob ?? 0);

@@ -282,6 +282,11 @@ async function cycle(cosmos, pm) {
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
   const basisNote = pmValue != null && Number(pmValue) >= deployed ? " (cash + polymarket positions)" : !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
   log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${portfolioValue.toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
+  // Self-diagnosis: cash ~$0 means NO buys are possible - say WHY in the log the user actually reads.
+  if (balance < 1) {
+    const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
+    warn(`cash under $1 - the bot cannot place buys. Balance reads: on-chain $${bd.onchain == null ? "?" : bd.onchain.toFixed(2)} · Polymarket $${bd.clob == null ? "?" : bd.clob.toFixed(2)} (wallet ${pm.funder}). If your Polymarket account DOES show cash, your funder address may be wrong - it must be your Polymarket deposit/profile address.`);
+  }
 
   // Telemetry: report the live sizing basis + config so the admin can SEE why orders are sized as they
   // are (cash vs portfolio vs override, and any funder misconfig). Fire-and-forget.
