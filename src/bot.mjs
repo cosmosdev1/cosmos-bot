@@ -122,8 +122,19 @@ function localSl(settings, entryCents, curCents) {
 async function decideExit(cosmos, pm, settings, pos) {
   const cur = await pm.getPriceCents(pos.token_id);
 
-  // HARD RULE (always on): once a position reaches the edge of the book it has essentially resolved.
+  // HARD RULES (always on) - judged on the BEST BID (the price a sell actually FILLS at), not the
+  // midpoint. At the edges the midpoint structurally can't reach the old triggers (a winner at bid
+  // 97/ask 100 shows mid 98.5, a loser with dead bids shows mid 2-5 while nothing rests below), so
+  // the 99c/1c rules silently never fired - THE "fallback didn't sell" bug. Bid-based triggers are
+  // fillable by definition. Salvage fires at <=3c bid: selling a dying position at 2-3c beats
+  // riding it to zero (resolved WINNERS need no sale at all - Polymarket auto-redeems them at $1).
   if (cur != null && cur >= 99) return { action: "TAKE_PROFIT", reason: "reached 99c - locking the win" };
+  if ((cur == null || cur >= 90 || cur <= 8)) {
+    const bid = await pm.getBestBidCents(pos.token_id).catch(() => null);
+    if (bid != null && bid >= 99) return { action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
+    if (bid != null && bid <= 3 && (cur == null || cur <= 8)) return { action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
+    if (bid == null && cur == null) return { action: "HOLD", reason: "book gone - resolution pays out automatically" };
+  }
   if (cur != null && cur <= 1) return { action: "STOP_LOSS", reason: "reached 1c - salvaging" };
 
   // Evaluate the TAKE-PROFIT side and the STOP-LOSS side SEPARATELY. Each side is either "ai" (server
