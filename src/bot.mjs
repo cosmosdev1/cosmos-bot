@@ -177,7 +177,7 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
     }
     sellPrice = Math.max(1, Math.min(99, Math.round(sellPrice)));
     const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
-    if (r.ok) { try { await cosmos.meter(r.meta); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
+    if (r.ok) { try { await cosmos.meter({ ...r.meta, source: pos.source ?? null }); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
     last = r;
     if (attempt < 4) await sleep(200);
   }
@@ -400,7 +400,7 @@ async function cycle(cosmos, pm) {
       // Order placed at Polymarket — meter the $0.09 + record the position (entry = the price we bid;
       // the next reconcile syncs the real avg fill from holdings).
       let paused = false;
-      try { const m = await cosmos.meter(r.meta); paused = Boolean(m?.paused); } catch { /* meter best-effort */ }
+      try { const m = await cosmos.meter({ ...r.meta, source: s.source ?? null }); paused = Boolean(m?.paused); } catch { /* meter best-effort */ }
       remaining -= orderUsd;
       deployed += orderUsd;
       positions[s.condition_id] = {
