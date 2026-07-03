@@ -285,7 +285,7 @@ async function cycle(cosmos, pm) {
   // Self-diagnosis: cash ~$0 means NO buys are possible - say WHY in the log the user actually reads.
   if (balance < 1) {
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
-    warn(`cash under $1 - the bot cannot place buys. Balance reads: on-chain $${bd.onchain == null ? "?" : bd.onchain.toFixed(2)} · Polymarket $${bd.clob == null ? "?" : bd.clob.toFixed(2)} (wallet ${pm.funder}). If your Polymarket account DOES show cash, your funder address may be wrong - it must be your Polymarket deposit/profile address.`);
+    warn(`cash under $1 - the bot cannot place buys. Balance reads: on-chain $${bd.onchain == null ? "?" : bd.onchain.toFixed(2)} · Polymarket $${bd.clob == null ? "?" : bd.clob.toFixed(2)} (wallet ${pm.funder}, account type ${pm.sigTypeName ?? "?"}). If your Polymarket account DOES show cash, your funder address may be wrong - it must be your Polymarket deposit/profile address.`);
   }
 
   // Telemetry: report the live sizing basis + config so the admin can SEE why orders are sized as they
@@ -295,7 +295,9 @@ async function cycle(cosmos, pm) {
     const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, portfolioValue, deployed);
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
     cosmos.reportHealth({
-      build: "pm-value-1",
+      build: "sig-detect-1",
+      sig_type: pm.sigTypeName ?? null,
+      wallet_kind: pm.walletKind ?? null,
       onchain_usd: bd.onchain == null ? null : Number(bd.onchain.toFixed(2)),
       clob_usd: bd.clob == null ? null : Number(bd.clob.toFixed(2)),
       pm_value: pmValue == null ? null : Number(Number(pmValue).toFixed(2)),

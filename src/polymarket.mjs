@@ -56,25 +56,71 @@ export async function makePolymarket(config) {
   // L1: derive (or create) the L2 API credentials from a wallet signature.
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
   const creds = await pre.createOrDeriveApiKey();
-  // Full client: L1 + L2 + POLY_PROXY signing for the Polymarket proxy wallet (funder).
+
+  // ---- AUTO-DETECT the Polymarket account's SIGNATURE TYPE. ----
+  // Polymarket has FOUR account kinds, and hardcoding POLY_PROXY (the original email/Magic wallets)
+  // silently broke every newer account: the CLOB derives the trading account from signer +
+  // signature_type, so the wrong type resolves a DIFFERENT (empty) account - balance reads $0 and
+  // orders can't spend the user's real cash, even though the app shows money. Verified on-chain:
+  //   - legacy email accounts  -> 45-byte EIP-1167 minimal proxy  -> POLY_PROXY (1)
+  //   - browser-wallet accounts-> Gnosis Safe proxy               -> POLY_GNOSIS_SAFE (2)
+  //   - NEW Polymarket wallets -> EIP-1967 smart wallet           -> POLY_1271 (3)
+  //   - direct EOA trading     -> funder == signer                -> EOA (0)
+  // Strategy: classify the funder's bytecode, then PROBE the CLOB balance under each candidate type
+  // (read-only) - a non-zero balance is positive proof the type resolves the user's real account.
+  // If every probe reads 0 (genuinely empty account), trust the bytecode classification.
+  const mkClient = (sigType) => {
+    const o = { host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient, creds, signatureType: sigType, funderAddress: funder };
+    if (builderOn) o.builderConfig = { builderCode: BUILDER_CODE };
+    return new ClobClient(o);
+  };
+  const probeClob = async (sigType) => {
+    try {
+      const r = await mkClient(sigType).getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+      return Number(r?.balance ?? 0) / 1e6;
+    } catch { return null; }
+  };
+  const SIG_NAMES = { 0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE", 3: "POLY_1271" };
+  let sigType = SignatureTypeV2.POLY_PROXY;
+  let walletKind = "unknown";
+  try {
+    if (funder.toLowerCase() === address.toLowerCase()) {
+      sigType = SignatureTypeV2.EOA; walletKind = "eoa";
+    } else {
+      const getCode = publicClient.getCode ?? publicClient.getBytecode; // viem renamed getBytecode -> getCode
+      const code = (await getCode.call(publicClient, { address: funder }).catch(() => null)) ?? "0x";
+      let candidates;
+      if (code.includes("360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")) {
+        walletKind = "smart-wallet-1967"; candidates = [SignatureTypeV2.POLY_1271, SignatureTypeV2.POLY_GNOSIS_SAFE, SignatureTypeV2.POLY_PROXY];
+      } else if (code.includes("5af43d82803e903d91602b57fd5bf3")) {
+        walletKind = "magic-proxy-1167"; candidates = [SignatureTypeV2.POLY_PROXY, SignatureTypeV2.POLY_GNOSIS_SAFE, SignatureTypeV2.POLY_1271];
+      } else if (code === "0x") {
+        walletKind = "no-contract"; candidates = [SignatureTypeV2.POLY_PROXY, SignatureTypeV2.POLY_GNOSIS_SAFE, SignatureTypeV2.POLY_1271];
+      } else {
+        walletKind = "safe-or-other"; candidates = [SignatureTypeV2.POLY_GNOSIS_SAFE, SignatureTypeV2.POLY_1271, SignatureTypeV2.POLY_PROXY];
+      }
+      sigType = candidates[0]; // bytecode-implied default
+      for (const t of candidates) {
+        const bal = await probeClob(t);
+        if (bal != null && bal >= 0.01) { sigType = t; break; } // the user's own cash confirms the type
+      }
+    }
+  } catch { /* detection must never block startup - default stays POLY_PROXY */ }
+  console.log(`[polymarket] account type: ${SIG_NAMES[sigType]} (wallet: ${walletKind})`);
+
+  // Full client: L1 + L2 + the DETECTED signature type for the funder account.
   // When a builder code is configured, builderConfig makes the client auto-stamp it onto every
   // order (the SDK applies it at order-build time), so Polymarket collects Cosmos's builder fee.
-  const clientOpts = {
-    host: CLOB_HOST,
-    chain: Chain.POLYGON,
-    signer: walletClient,
-    creds,
-    signatureType: SignatureTypeV2.POLY_PROXY,
-    funderAddress: funder,
-  };
-  if (builderOn) clientOpts.builderConfig = { builderCode: BUILDER_CODE };
-  const client = new ClobClient(clientOpts);
+  const client = mkClient(sigType);
 
   const tokenCache = new Map();
 
   return {
     address,
     funder,
+    sigType, // the DETECTED Polymarket signature type (0 EOA / 1 proxy / 2 safe / 3 smart wallet)
+    sigTypeName: SIG_NAMES[sigType],
+    walletKind, // what the funder's bytecode says it is
     builderFee: builderOn, // whether a builder fee is being attached to orders
 
     // Free USDC (cash) on the FUNDER/proxy wallet, for position sizing. On-chain balanceOf FIRST
