@@ -128,10 +128,11 @@ async function decideExit(cosmos, pm, settings, pos) {
   // the 99c/1c rules silently never fired - THE "fallback didn't sell" bug. Bid-based triggers are
   // fillable by definition. Salvage fires at <=3c bid: selling a dying position at 2-3c beats
   // riding it to zero (resolved WINNERS need no sale at all - Polymarket auto-redeems them at $1).
-  if (cur != null && cur >= 99) return { action: "TAKE_PROFIT", reason: "reached 99c - locking the win" };
+  if (cur != null && cur >= 98) return { action: "TAKE_PROFIT", reason: "reached 98c - locking the win" };
   if ((cur == null || cur >= 90 || cur <= 8)) {
     const bid = await pm.getBestBidCents(pos.token_id).catch(() => null);
-    if (bid != null && bid >= 99) return { action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
+    // SELL even at 98c: a filled 98c sale NOW beats waiting on resolution timing - lock it.
+    if (bid != null && bid >= 98) return { action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
     if (bid != null && bid <= 3 && (cur == null || cur <= 8)) return { action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
     if (bid == null && cur == null) return { action: "HOLD", reason: "book gone - resolution pays out automatically" };
   }
