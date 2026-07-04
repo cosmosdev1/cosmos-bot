@@ -129,24 +129,30 @@ function localSl(settings, entryCents, curCents) {
   return null;
 }
 
-async function decideExit(cosmos, pm, settings, pos) {
+// EDGE EXIT (the always-on fallback) - ONE function, evaluated FIRST for EVERY position type
+// (regular, SPORTS, manual): sports previously bypassed these entirely (server strategy only), so
+// a 98c sports winner or a 2c sports loser was never sold when the server said HOLD or errored.
+// Zones per the admin spec: TAKE_PROFIT at >=97c, salvage STOP at <=3c - judged on BOTH the
+// midpoint AND the best bid (the price a sell actually fills at), because at the edges a thin/wide
+// book makes the two diverge (bid 97/ask 100 -> mid 98.5; bid 3/ask 15 -> mid 9). The bid is read
+// whenever the mid is null or anywhere NEAR an edge (<=12c / >=90c) - the old <=8c gate let
+// wide-book losers dodge the salvage read. Returns a verdict + the mid (so callers don't re-fetch),
+// or verdict:null when no edge rule applies. Re-evaluated every cycle until reconcile confirms the
+// holding is gone, so a killed FAK retries forever by construction.
+async function edgeExit(pm, pos) {
   const cur = await pm.getPriceCents(pos.token_id);
+  let bid = null;
+  if (cur == null || cur >= 90 || cur <= 12) bid = await pm.getBestBidCents(pos.token_id).catch(() => null);
+  if (cur != null && cur >= 97) return { cur, action: "TAKE_PROFIT", reason: `reached ${cur}c - locking the win` };
+  if (bid != null && bid >= 97) return { cur, action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
+  if (cur != null && cur <= 3) return { cur, action: "STOP_LOSS", reason: `reached ${cur}c - salvaging before zero` };
+  if (bid != null && bid <= 3 && (cur == null || cur <= 10)) return { cur, action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
+  if (cur == null && bid == null) return { cur, action: "HOLD", reason: "book gone - resolution pays out automatically" };
+  return { cur, action: null };
+}
 
-  // HARD RULES (always on) - judged on the BEST BID (the price a sell actually FILLS at), not the
-  // midpoint. At the edges the midpoint structurally can't reach the old triggers (a winner at bid
-  // 97/ask 100 shows mid 98.5, a loser with dead bids shows mid 2-5 while nothing rests below), so
-  // the 99c/1c rules silently never fired - THE "fallback didn't sell" bug. Bid-based triggers are
-  // fillable by definition. Salvage fires at <=3c bid: selling a dying position at 2-3c beats
-  // riding it to zero (resolved WINNERS need no sale at all - Polymarket auto-redeems them at $1).
-  if (cur != null && cur >= 98) return { action: "TAKE_PROFIT", reason: "reached 98c - locking the win" };
-  if ((cur == null || cur >= 90 || cur <= 8)) {
-    const bid = await pm.getBestBidCents(pos.token_id).catch(() => null);
-    // SELL even at 98c: a filled 98c sale NOW beats waiting on resolution timing - lock it.
-    if (bid != null && bid >= 98) return { action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
-    if (bid != null && bid <= 3 && (cur == null || cur <= 8)) return { action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
-    if (bid == null && cur == null) return { action: "HOLD", reason: "book gone - resolution pays out automatically" };
-  }
-  if (cur != null && cur <= 1) return { action: "STOP_LOSS", reason: "reached 1c - salvaging" };
+async function decideExit(cosmos, pm, settings, pos, curFromEdge) {
+  const cur = curFromEdge !== undefined ? curFromEdge : await pm.getPriceCents(pos.token_id);
 
   // Evaluate the TAKE-PROFIT side and the STOP-LOSS side SEPARATELY. Each side is either "ai" (server
   // brain) or "fixed"/"percent" (local). The old code routed BOTH sides to the AI brain whenever
@@ -344,11 +350,18 @@ async function cycle(cosmos, pm) {
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   for (const cid of Object.keys(positions)) {
     const pos = positions[cid];
-    // In-play SPORTS positions follow the server-run strategy exits (50% at entry*1.6, full
-    // salvage at minute 85+ when the favorite isn't winning, rest to resolution) - NOT the
-    // user's TP/SL settings.
-    if (pos.source === "sports") { await sportsExitStep(cosmos, pm, positions, pos); continue; }
-    const v = await decideExit(cosmos, pm, settings, pos);
+    // EDGE RULES FIRST, for EVERY position type - sports included. Sports used to skip straight
+    // to the server strategy, so the 97c+ lock-in and <=3c salvage never fired on them.
+    const edge = await edgeExit(pm, pos);
+    if (edge.action === "HOLD") continue; // book gone - resolution auto-redeems
+    let v = edge.action ? edge : null;
+    if (!v) {
+      // In-play SPORTS positions follow the server-run strategy exits (50% at entry*1.6, full
+      // salvage at minute 85+ when the favorite isn't winning, rest to resolution) - NOT the
+      // user's TP/SL settings.
+      if (pos.source === "sports") { await sportsExitStep(cosmos, pm, positions, pos); continue; }
+      v = await decideExit(cosmos, pm, settings, pos, edge.cur);
+    }
     if (!v || v.action === "HOLD") continue;
     const r = await marketableSell(cosmos, pm, pos, v.action);
     if (r.ok) log(`${v.action} ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${v.reason || ""}`);
@@ -461,7 +474,10 @@ async function cycle(cosmos, pm) {
     for (const m of held.values()) {
       if (positions[m.condition_id]) continue; // a bot position — already handled
       const pos = { condition_id: m.condition_id, token_id: m.token_id, outcome: m.outcome, entry_cents: m.entry_cents, size_shares: m.size_shares, entry_whales: [] };
-      const v = await decideExit(cosmos, pm, settings, pos);
+      // Same order as bot positions: the always-on edge rules first, then the user's TP/SL.
+      const edge = await edgeExit(pm, pos);
+      if (edge.action === "HOLD") continue;
+      const v = edge.action ? edge : await decideExit(cosmos, pm, settings, pos, edge.cur);
       if (!v || v.action === "HOLD") continue;
       const r = await marketableSell(cosmos, pm, pos, v.action);
       if (r.ok) log(`(manual) ${v.action} ${m.outcome} @ ~${r.sellPrice ?? r.mid}c · ${v.reason || ""}`);
