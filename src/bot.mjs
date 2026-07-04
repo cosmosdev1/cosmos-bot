@@ -98,6 +98,16 @@ function sizeLabel(z) {
   return `size: ${Number(z.pct) || DEFAULT_PCT}%${basis}`;
 }
 
+// Log a skipped-entry reason ONCE per market per reason (these checks re-run every cycle while
+// the signal waits un-burned; without the dedupe they'd flood the log every 30s).
+const skipLogged = new Set();
+function logSkipOnce(cid, kind, msg) {
+  const k = cid + "|" + kind;
+  if (skipLogged.has(k)) return;
+  skipLogged.add(k);
+  log(msg);
+}
+
 const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
 const SELL_BUFFER = 5; // marketable sell: offer a few cents below mid so stops actually fill
 const HARD_STOP_FRAC = 0.5; // advice unreachable -> still exit if price has halved
@@ -391,6 +401,26 @@ async function cycle(cosmos, pm) {
       const mid = await pm.getPriceCents(tokenId);
       if (mid == null) { warn("no live price:", (s.market_question || "").slice(0, 50)); continue; } // don't enter at a stale price — retry
       if (mid > s.max_entry_price) { markSeen(s.condition_id); continue; } // ran past the insider entry — a decision
+
+      // GLOBAL 5c EXECUTION FLOOR — never place a buy when the live price is under 5c, for ANY
+      // source. Sub-5c means the market has all but decided against this side; copying it is
+      // catching a falling knife no matter what the signal said. Not markSeen: if it recovers
+      // above 5c (and passes the gap rule below) it's buyable again. buyPrice >= mid here (mid
+      // <= max_entry was checked above), so gating mid gates the execution price itself.
+      if (mid < 5) { logSkipOnce(s.condition_id, "floor", `skip (price ${mid}c under the 5c floor) ${(s.market_question || "").slice(0, 48)}`); continue; }
+
+      // SIGNAL-PRICE GAP RULE — a deferred buy (e.g. cash freed up long after the alert) must not
+      // chase a signal whose price has SLID since the alert: alerted at 20c, now 12c means the
+      // market is voting AGAINST the thesis - buying the dip is how bad signals get doubled into.
+      // Only buy within 10% below the alert price (>= 90% of price_cents; above it the max_entry
+      // cap already governs). Not markSeen: a recovery back into the band re-arms the buy.
+      // Sports is exempt - that strategy deliberately buys the in-play discount and the server
+      // enforces its own 25-50c band.
+      const sigPrice = Number(s.price_cents) || 0;
+      if (s.source !== "sports" && sigPrice > 0 && mid < sigPrice * 0.9) {
+        logSkipOnce(s.condition_id, "gap", `skip (price ${mid}c is >10% under the ${sigPrice}c alert) ${(s.market_question || "").slice(0, 48)}`);
+        continue;
+      }
 
       const buyPrice = Math.min(98, s.max_entry_price, mid + BUY_BUFFER); // marketable, capped
       // Shares must clear Polymarket's ~$1 minimum order value: a single share at a high price
