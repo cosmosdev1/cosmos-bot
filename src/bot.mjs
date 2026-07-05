@@ -176,8 +176,12 @@ async function edgeExit(pm, pos) {
   const cur = await pm.getPriceCents(pos.token_id);
   let bid = null;
   if (cur == null || cur >= 90 || cur <= 12) bid = await pm.getBestBidCents(pos.token_id).catch(() => null);
-  if (cur != null && cur >= 97) return { cur, action: "TAKE_PROFIT", reason: `reached ${cur}c - locking the win` };
-  if (bid != null && bid >= 97) return { cur, action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
+  // QUANT (crypto/stocks math engine) positions hold out for 99c - each extra cent on a
+  // near-certain bet is real yield, and an unfilled 99c costs nothing (resolution pays 100).
+  // Everything else locks from 97c. Env: QUANT_TP_CENTS.
+  const tpC = pos.source === "quant" ? HZ("QUANT_TP_CENTS", 99) : 97;
+  if (cur != null && cur >= tpC) return { cur, action: "TAKE_PROFIT", reason: `reached ${cur}c - locking the win` };
+  if (bid != null && bid >= tpC) return { cur, action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
   if (cur != null && cur <= 3) return { cur, action: "STOP_LOSS", reason: `reached ${cur}c - salvaging before zero` };
   if (bid != null && bid <= 3 && (cur == null || cur <= 10)) return { cur, action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
   if (cur == null && bid == null) return { cur, action: "HOLD", reason: "book gone - resolution pays out automatically" };
@@ -223,7 +227,10 @@ async function decideExit(cosmos, pm, settings, pos, curFromEdge) {
 async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
   const mid = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
   const salvage = action !== "TAKE_PROFIT"; // stop-loss / edge-salvage may dump; take-profit may not
-  const floor = salvage ? 1 : Math.max(1, mid - 10);
+  // Quant take-profits never sell under 99c (per admin spec: the 98.5-99 band; integer ticks make
+  // that a fixed 99c ask). A killed FAK just retries - every cycle, forever - and if 99c never
+  // fills, resolution redeems at 100c, so holding out costs nothing.
+  const floor = salvage ? 1 : pos.source === "quant" ? HZ("QUANT_TP_CENTS", 99) : Math.max(1, mid - 10);
   let last = { ok: false, status: 0, body: {} };
   for (let attempt = 0; attempt < 5; attempt++) {
     const bid = await pm.getBestBidCents(pos.token_id);
