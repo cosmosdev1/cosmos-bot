@@ -269,7 +269,14 @@ export async function makePolymarket(config) {
     // builds + signs the V2 order and posts it in one call, auto-resolving tickSize + negRisk.
     async placeOrder({ tokenId, side, sizeShares, priceCents, orderType = "FAK" }) {
       const price = Math.max(0.01, Math.min(0.99, priceCents / 100));
-      const size = Math.max(1, Math.floor(sizeShares));
+      // Polymarket shares are fractional (6 decimals). Use the REAL size, floored to 2 decimals so a
+      // SELL never exceeds the wallet balance; never round a sub-1-share holding UP to 1 (that caused
+      // "sell 1.0 but only hold 0.48"). A size that rounds to 0 is un-sellable dust -> report it so
+      // the caller stops retrying (it settles on its own at resolution).
+      const size = Math.floor(sizeShares * 100) / 100;
+      if (!(size > 0)) {
+        return { ok: false, status: 400, body: { polymarket: { error: "size below sellable minimum (dust)" } }, meta: { market: tokenId, side: side.toLowerCase(), size: 0, price: priceCents } };
+      }
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
       const meta = { market: tokenId, side: side.toLowerCase(), size, price: priceCents };
       try {

@@ -343,6 +343,10 @@ async function cycle(cosmos, pm) {
       for (const h of held.values()) {
         if (positions[h.condition_id]) continue;
         if (!h.token_id || !global.__botTokens.has(String(h.token_id))) continue;
+        // A holding under 1 share is worth under $1 (a share pays at most $1), which is below
+        // Polymarket's ~$1 minimum order, so it can NEVER be sold. Don't re-adopt un-exitable dust -
+        // it just creates an exit that fails every cycle. It settles automatically at resolution.
+        if (!(h.size_shares >= 1)) continue;
         positions[h.condition_id] = {
           condition_id: h.condition_id, token_id: h.token_id, outcome: h.outcome, source: "adopted",
           entry_cents: h.entry_cents || h.cur_cents || 50, size_usd: Math.round(h.cur_value * 100) / 100,
