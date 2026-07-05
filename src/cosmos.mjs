@@ -16,6 +16,10 @@ export function makeCosmos(config) {
     // The pre-filtered feed (already limited to your plan + settings).
     signals: () => getJSON("/api/v1/signals"),
 
+    // Every CLOB token id this user's bot has ever BOUGHT (from Cosmos's order records) - used to
+    // re-adopt wallet holdings the bot lost track of. Never includes manual (non-bot) buys.
+    botMarkets: () => getJSON("/api/v1/bot-markets"), // { tokens: string[] }
+
     // The Cosmos AI exit verdict for one open position.
     async advice(pos) {
       const res = await fetch(`${base}/api/v1/positions/advice`, {

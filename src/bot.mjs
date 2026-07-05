@@ -316,6 +316,35 @@ async function cycle(cosmos, pm) {
       positions[cid].size_shares = h.size_shares; // sync to actual holding
       if (h.entry_cents > 0) positions[cid].entry_cents = h.entry_cents; // sync the REAL avg fill price
       if (!positions[cid].token_id) positions[cid].token_id = h.token_id;
+      if (!positions[cid].end_date && h.end_date) positions[cid].end_date = h.end_date; // holdings now carry it
+    }
+
+    // RE-ADOPTION: wallet holdings the bot BOUGHT but lost track of (the old single-page holdings
+    // read hid live positions behind 100+ resolved rows, and reconcile then deleted them). Cosmos
+    // knows every token this bot ever bought (bot_orders) - a held bot-bought token not in
+    // positions.json is re-adopted so exits (TP/SL, edge rules, horizon stop) manage it again.
+    // Manual holdings are never in that set, so they are never touched. Refreshed every ~10 min.
+    if (!global.__botTokens || Date.now() - global.__botTokensAt > 600_000) {
+      try {
+        const bm = await cosmos.botMarkets();
+        global.__botTokens = new Set(bm.tokens || []);
+        global.__botTokensAt = Date.now();
+      } catch { /* endpoint not deployed yet or transient - retry next window */ }
+    }
+    if (global.__botTokens) {
+      let adopted = 0;
+      for (const h of held.values()) {
+        if (positions[h.condition_id]) continue;
+        if (!h.token_id || !global.__botTokens.has(String(h.token_id))) continue;
+        positions[h.condition_id] = {
+          condition_id: h.condition_id, token_id: h.token_id, outcome: h.outcome, source: "adopted",
+          entry_cents: h.entry_cents || h.cur_cents || 50, size_usd: Math.round(h.cur_value * 100) / 100,
+          size_shares: h.size_shares, entry_whales: [], market_question: h.title || "",
+          end_date: h.end_date ?? undefined, opened_at: new Date().toISOString(),
+        };
+        adopted++;
+      }
+      if (adopted) log(`re-adopted ${adopted} bot-bought position(s) that had fallen out of tracking`);
     }
     store.save(positions);
   }
@@ -356,7 +385,7 @@ async function cycle(cosmos, pm) {
     const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, portfolioValue, deployed);
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
     cosmos.reportHealth({
-      build: "sig-detect-1",
+      build: "horizon-2", // bump on behavior changes so the admin can SEE who runs which code
       sig_type: pm.sigTypeName ?? null,
       wallet_kind: pm.walletKind ?? null,
       onchain_usd: bd.onchain == null ? null : Number(bd.onchain.toFixed(2)),

@@ -291,24 +291,35 @@ export async function makePolymarket(config) {
     // caller can tell "no positions" apart from "couldn't check" and never collapse sizing to cash.
     async getMyPositions() {
       try {
-        // sizeThreshold=0 (NOT 1) so our tiny 2-3 share positions aren't silently dropped, and NO
-        // `limit` param (Polymarket returns [] for unrecognized params). currentValue = the live $
-        // the caller sums into `deployed`.
-        const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=0`);
-        if (!res.ok) return null;
-        const arr = await res.json();
-        if (!Array.isArray(arr)) return null;
-        return arr
-          .map((p) => ({
-            condition_id: p.conditionId,
-            token_id: p.asset,
-            outcome: p.outcome,
-            entry_cents: Math.round(Number(p.avgPrice ?? 0) * 100),
-            cur_cents: Math.round(Number(p.curPrice ?? 0) * 100),
-            size_shares: Number(p.size ?? 0),
-            cur_value: Number(p.currentValue ?? 0), // live $ value of this holding
-          }))
-          .filter((p) => p.condition_id && p.size_shares > 0);
+        // PAGINATED + value-sorted. The old single unsorted page of 100 was a real bug: a wallet
+        // with 100+ resolved historical rows (old candles etc.) filled the whole page, every LIVE
+        // position became invisible, and reconcile deleted them from tracking - so exits (incl.
+        // the horizon stop) silently never ran. sortBy=CURRENT puts live value first; resolved
+        // rows (redeemable - auto-claimed at $1, nothing to manage) are skipped.
+        const out = [];
+        for (let pg = 0; pg < 4; pg++) {
+          const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=0&sortBy=CURRENT&sortDirection=DESC&limit=500&offset=${pg * 500}`);
+          if (!res.ok) return pg === 0 ? null : out;
+          const arr = await res.json();
+          if (!Array.isArray(arr)) return pg === 0 ? null : out;
+          for (const p of arr) {
+            if (p.redeemable) continue; // resolved - Polymarket redeems winners automatically
+            const row = {
+              condition_id: p.conditionId,
+              token_id: p.asset,
+              outcome: p.outcome,
+              entry_cents: Math.round(Number(p.avgPrice ?? 0) * 100),
+              cur_cents: Math.round(Number(p.curPrice ?? 0) * 100),
+              size_shares: Number(p.size ?? 0),
+              cur_value: Number(p.currentValue ?? 0), // live $ value of this holding
+              title: String(p.title ?? ""),
+              end_date: p.endDate ?? null,
+            };
+            if (row.condition_id && row.size_shares > 0) out.push(row);
+          }
+          if (arr.length < 500) break;
+        }
+        return out;
       } catch {
         return null;
       }
