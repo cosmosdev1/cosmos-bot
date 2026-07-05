@@ -14,6 +14,8 @@ if [ ! -d "$SRC/.git" ]; then
 fi
 cd "$SRC"
 
+export COSMOS_LAUNCHER=1  # tells the bot a restarter is present, so its self-update may exit
+
 BOT_PID=""
 start_bot() {
   npm install --omit=dev --no-audit --no-fund --silent || true

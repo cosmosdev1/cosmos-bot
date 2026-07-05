@@ -14,4 +14,15 @@ npm install --silent
 
 # Configure (uses COSMOS_TOKEN, asks only for your Polymarket key), then start trading.
 node src/setup.mjs
-[ -f ./config.json ] && node src/bot.mjs
+# Restart loop: the bot exits cleanly after a self-update; pull + relaunch so local installs
+# stay current instead of dying on every code push (the launcher contract).
+export COSMOS_LAUNCHER=1
+if [ -f ./config.json ]; then
+  while true; do
+    node src/bot.mjs
+    sleep 3
+    git pull --quiet 2>/dev/null || true
+    npm install --silent 2>/dev/null || true
+    echo "[launcher] restarting bot..."
+  done
+fi
