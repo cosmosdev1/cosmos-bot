@@ -64,7 +64,7 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
 // Percentages are taken off the whole PORTFOLIO (free cash + the cost basis of open positions), not
 // just free cash, so position sizes stay stable as money gets deployed.
 // Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
-const DEFAULT_PCT = 3; // never size at 0% - fall back to 3% of portfolio if a config value is missing/0
+const DEFAULT_PCT = 6; // default per-trade size; fall back to 6% of portfolio if a config value is missing/0
 
 function sizeForSignal(z, s, portfolio, deployed) {
   // Size off an explicit account-size override when the user set one, else the TRUE portfolio VALUE
@@ -467,7 +467,7 @@ async function cycle(cosmos, pm) {
     log(`watching ${Object.keys(seen).length} markets · will buy only newly-added ones`);
   } else {
     // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
-    const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? DEFAULT_PCT, tierPct: { gold: 4, platinum: 4, bronze: 3, free: 3 }, conviction: false, maxPerTradeUsd: null, maxExposurePct: null, accountSizeUsd: null };
+    const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? DEFAULT_PCT, tierPct: { gold: 6, platinum: 6, bronze: 6, free: 6 }, conviction: false, maxPerTradeUsd: null, maxExposurePct: null, accountSizeUsd: null };
     let remaining = balance; // `deployed` (true portfolio basis) is computed above from real holdings
     // Mark a market "evaluated" so it's never reconsidered. Called only after a real decision
     // (sized-out, price ran past entry, or an order was attempted) — NOT on transient failures
