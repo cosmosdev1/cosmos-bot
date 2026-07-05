@@ -199,6 +199,18 @@ export async function makePolymarket(config) {
       }
     },
 
+    // Market end date (ISO) for a condition id - the horizon stop's capital-lock input.
+    async getMarketEndDate(conditionId) {
+      try {
+        const res = await fetch(`${GAMMA}/markets?condition_ids=${encodeURIComponent(conditionId)}`);
+        const arr = await res.json();
+        const m = Array.isArray(arr) ? arr[0] : null;
+        return m?.endDate ?? null;
+      } catch {
+        return null;
+      }
+    },
+
     // condition_id + outcome -> CLOB token id (needed to place an order).
     async resolveToken(conditionId, outcome) {
       const key = `${conditionId}:${outcome}`.toLowerCase();

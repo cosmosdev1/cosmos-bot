@@ -98,6 +98,39 @@ function sizeLabel(z) {
   return `size: ${Number(z.pct) || DEFAULT_PCT}%${basis}`;
 }
 
+// ---- HORIZON STOP: liquidate dead-money positions so capital stays liquid. ----
+// Fleet audit (2026-07-05): ~50% of deployed capital sat in positions resolving 30-930 days out,
+// most slightly under water - earning nothing. Three rules (each env-tunable, HORIZON_STOP=0
+// disables all). Applies ONLY to bot-opened positions, never the user's own manual holdings.
+//   A. NO on a deadline market ("will X happen by <date>?") pays only AT the deadline - no early
+//      resolution exists. Locked > HORIZON_NO_DAYS (14) -> sell.
+//   B. Fixed scheduled events (FDV-after-launch, Fed meetings, Nobel, next-PM, season markets)
+//      can't resolve early on EITHER side. Locked > HORIZON_SCHEDULED_DAYS (30) -> sell.
+//   C. Anything > HORIZON_FAR_DAYS (90) out that is NOT currently winning (cur <= entry + 2c) ->
+//      sell; a far YES that's actually moving up keeps its event-option value and is held.
+const HZ = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) && v > 0 ? v : d; };
+const isDeadlineQ = (q) => {
+  const s = String(q || "").toLowerCase();
+  if (/(remain|stay|through|survive|maintain)/.test(s)) return false; // persistence phrasing flips the sides
+  return /\b(by|before|until)\b.{0,40}(20\d\d|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|\bin (20\d\d|q[1-4])\b/.test(s);
+};
+const isScheduledQ = (q) =>
+  /(fdv above|one day after launch|nobel|next prime minister|fed (decision|meeting)|after the .{0,20}meeting|20\d\d-\d\d season|rate (cut|hike)s? .{0,20}in 20\d\d|week of)/i.test(String(q || ""));
+function horizonVerdict(pos, curCents) {
+  if (process.env.HORIZON_STOP === "0") return null;
+  if (!pos.end_date || pos.end_date === "none") return null;
+  const days = (new Date(pos.end_date).getTime() - Date.now()) / 86400000;
+  if (!Number.isFinite(days)) return null;
+  const q = pos.market_question;
+  if (String(pos.outcome).trim().toLowerCase() === "no" && isDeadlineQ(q) && days > HZ("HORIZON_NO_DAYS", 14))
+    return `far NO pays only at the deadline (${Math.round(days)}d away) - freeing the capital`;
+  if (isScheduledQ(q) && days > HZ("HORIZON_SCHEDULED_DAYS", 30))
+    return `scheduled event ${Math.round(days)}d away - nothing can resolve it sooner`;
+  if (days > HZ("HORIZON_FAR_DAYS", 90) && (curCents == null || curCents <= (pos.entry_cents ?? 0) + 2))
+    return `${Math.round(days)}d to resolution and not winning - dead money`;
+  return null;
+}
+
 // Log a skipped-entry reason ONCE per market per reason (these checks re-run every cycle while
 // the signal waits un-burned; without the dedupe they'd flood the log every 30s).
 const skipLogged = new Set();
@@ -348,13 +381,26 @@ async function cycle(cosmos, pm) {
   }
 
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
+  let endDateLookups = 0; // cap the per-cycle gamma lookups for the horizon stop
   for (const cid of Object.keys(positions)) {
     const pos = positions[cid];
+    // Lazy end-date lookup (max a few per cycle) so the horizon stop knows each position's
+    // capital-lock. Cached forever in positions.json; "none" = gamma had no date (skip rules).
+    if (pos.end_date === undefined && endDateLookups < 5) {
+      endDateLookups++;
+      pos.end_date = (await pm.getMarketEndDate(pos.condition_id).catch(() => null)) ?? "none";
+      store.save(positions);
+    }
     // EDGE RULES FIRST, for EVERY position type - sports included. Sports used to skip straight
     // to the server strategy, so the 97c+ lock-in and <=3c salvage never fired on them.
     const edge = await edgeExit(pm, pos);
     if (edge.action === "HOLD") continue; // book gone - resolution auto-redeems
     let v = edge.action ? edge : null;
+    // HORIZON STOP: dead-money positions get sold no matter what the TP/SL settings say.
+    if (!v) {
+      const hz = horizonVerdict(pos, edge.cur);
+      if (hz) v = { action: "STOP_LOSS", reason: `HORIZON: ${hz}` };
+    }
     if (!v) {
       // In-play SPORTS positions follow the server-run strategy exits (50% at entry*1.6, full
       // salvage at minute 85+ when the favorite isn't winning, rest to resolution) - NOT the
