@@ -44,6 +44,16 @@ const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 // to $1 (e.g. 3% of a $10 balance = $0.30 still trades at $1), as long as there's room.
 const MIN_TRADE_USD = 2;
 
+// Cosmos-RUN engine sources (server-curated, time-sensitive strategy entries - quant strikes,
+// weather ladders, in-play sports). These are never "stale backlog": their caps and expiries
+// self-limit, and the server retires a signal the moment its edge is gone. They are therefore
+// exempt from the first-run baseline and from the permanent burn rules below.
+const ENGINE_SOURCES = new Set((process.env.COSMOS_ENGINE_SOURCES || "quant,weather,sports").split(",").map((s) => s.trim()).filter(Boolean));
+// A real-but-thin engine market can FAK-kill with a 4xx a few times before filling; give it a
+// bounded number of attempts (across cycles) before burning it. Non-engine sources burn on first 4xx.
+const ENTRY_4XX_LIMIT = Number(process.env.ENTRY_4XX_LIMIT) || 3;
+const entryFails = new Map(); // condition_id -> 4xx count (in-memory; a restart re-arms, caps/expiry bound the risk)
+
 // Retry a marketable FAK order on a transient kill. A Fill-And-Kill that finds no liquidity is
 // REJECTED (ok:false) with nothing filled - and the book usually refreshes within a few hundred ms,
 // so a single kill must never become a missed entry or a missed stop (mirrors the crypto_bot rule).
@@ -401,7 +411,7 @@ async function cycle(cosmos, pm) {
     const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, portfolioValue, deployed);
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
     cosmos.reportHealth({
-      build: "horizon-2", // bump on behavior changes so the admin can SEE who runs which code
+      build: "engine-arm-1", // bump on behavior changes so the admin can SEE who runs which code
       sig_type: pm.sigTypeName ?? null,
       wallet_kind: pm.walletKind ?? null,
       onchain_usd: bd.onchain == null ? null : Number(bd.onchain.toFixed(2)),
@@ -465,15 +475,25 @@ async function cycle(cosmos, pm) {
   // --- ENTRIES: buy a market at most ONCE, only when it is newly added to the feed. ---
   const seen = store.loadSeen();
   const cutoff = Date.now() - 30 * 86400000; // prune evaluated markets older than 30 days
-  for (const [cid, t] of Object.entries(seen)) if (new Date(t).getTime() < cutoff) delete seen[cid];
+  for (const [cid, t] of Object.entries(seen)) { if (cid === "__init") continue; if (new Date(t).getTime() < cutoff) delete seen[cid]; }
   const nowIso = new Date().toISOString();
 
   if (Object.keys(seen).length === 0 && !BUY_BACKLOG) {
-    // First run: record the current markets but do NOT buy the backlog — only act on
+    // First run: record the current NON-ENGINE markets but do NOT buy the backlog — only act on
     // markets added from now on. (Use COSMOS_BUY_BACKLOG=1 to buy the current feed.)
-    for (const s of feed.signals) if (s.condition_id) seen[s.condition_id] = nowIso;
+    // ENGINE items (quant/weather/sports) are NOT baselined: they are live server-curated strategy
+    // entries, not a stale backlog — baselining them meant every fresh boot/redeploy silently burned
+    // every live engine signal (the "bot never buys the engines" bug). They stay buyable next cycle.
+    // `__init` marks that the baseline ran, so an engines-only feed can't re-trigger it forever.
+    seen.__init = nowIso;
+    for (const s of feed.signals) if (s.condition_id && !ENGINE_SOURCES.has(s.source)) seen[s.condition_id] = nowIso;
     store.saveSeen(seen);
-    log(`watching ${Object.keys(seen).length} markets · will buy only newly-added ones`);
+    log(`watching ${Object.keys(seen).length - 1} markets · will buy only newly-added ones (engine signals stay live)`);
+  } else if (!holdingsOk) {
+    // The wallet holdings fetch FAILED this cycle: we cannot know what we already hold, so a buy
+    // here could double an existing position (a fresh boot has an empty positions.json too - the
+    // reconcile's `held` set is the only real guard). Exits already ran; entries wait a cycle.
+    warn("holdings fetch failed - skipping entries this cycle (cannot verify what we already hold)");
   } else {
     // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
     const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? DEFAULT_PCT, tierPct: { gold: 6, platinum: 6, bronze: 6, free: 6 }, conviction: false, maxPerTradeUsd: null, maxExposurePct: null, accountSizeUsd: null };
@@ -504,7 +524,15 @@ async function cycle(cosmos, pm) {
 
       const mid = await pm.getPriceCents(tokenId);
       if (mid == null) { warn("no live price:", (s.market_question || "").slice(0, 50)); continue; } // don't enter at a stale price — retry
-      if (mid > s.max_entry_price) { markSeen(s.condition_id); continue; } // ran past the insider entry — a decision
+      if (mid > s.max_entry_price) {
+        // Ran past the entry cap. For ENGINE sources this is NOT a permanent decision: their markets
+        // move fast (hourly strikes, in-play bands) and the price often comes BACK inside the cap -
+        // burning on first sight was why engine signals never got bought. The server retires the
+        // signal when the edge is truly gone, so re-arming each cycle is safe. Raw sources keep the
+        // permanent burn (a missed insider entry stays missed).
+        if (ENGINE_SOURCES.has(s.source)) { logSkipOnce(s.condition_id, "cap", `skip (price ${mid}c over the ${s.max_entry_price}c cap) ${(s.market_question || "").slice(0, 48)}`); continue; }
+        markSeen(s.condition_id); continue;
+      }
 
       // GLOBAL 5c EXECUTION FLOOR — never place a buy when the live price is under 5c, for ANY
       // source. Sub-5c means the market has all but decided against this side; copying it is
@@ -518,10 +546,12 @@ async function cycle(cosmos, pm) {
       // market is voting AGAINST the thesis - buying the dip is how bad signals get doubled into.
       // Only buy within 10% below the alert price (>= 90% of price_cents; above it the max_entry
       // cap already governs). Not markSeen: a recovery back into the band re-arms the buy.
-      // Sports is exempt - that strategy deliberately buys the in-play discount and the server
-      // enforces its own 25-50c band.
+      // ALL engine sources are exempt - those strategies price their own entries server-side
+      // (sports buys the in-play discount band; quant/weather refresh entry_cents every cron tick,
+      // so "slid below the alert" just means the server will re-quote it - the max_entry cap and
+      // the 5c floor still guard execution).
       const sigPrice = Number(s.price_cents) || 0;
-      if (s.source !== "sports" && sigPrice > 0 && mid < sigPrice * 0.9) {
+      if (!ENGINE_SOURCES.has(s.source) && sigPrice > 0 && mid < sigPrice * 0.9) {
         logSkipOnce(s.condition_id, "gap", `skip (price ${mid}c is >10% under the ${sigPrice}c alert) ${(s.market_question || "").slice(0, 48)}`);
         continue;
       }
@@ -535,10 +565,15 @@ async function cycle(cosmos, pm) {
       const r = await placeWithRetry(pm, { tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
       if (!r.ok) {
         warn("entry failed after retries:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400));
-        // A 4xx means the ORDER itself was rejected (illiquid / "no match" FAK kill / bad params) -
-        // it won't fill on a retry, so give up on this market instead of hammering it every cycle.
-        // A 5xx / network blip is transient -> leave UNSEEN so it retries once the API clears.
-        if (typeof r.status === "number" && r.status >= 400 && r.status < 500) markSeen(s.condition_id);
+        // A 4xx means the ORDER itself was rejected (illiquid / "no match" FAK kill / bad params).
+        // Raw sources give up immediately (won't fill on a retry). ENGINE markets are often real but
+        // momentarily thin (fresh hourly strikes) - allow ENTRY_4XX_LIMIT attempts across cycles
+        // before burning. A 5xx / network blip is transient -> leave UNSEEN so it retries.
+        if (typeof r.status === "number" && r.status >= 400 && r.status < 500) {
+          const fails = (entryFails.get(s.condition_id) ?? 0) + 1;
+          entryFails.set(s.condition_id, fails);
+          if (!ENGINE_SOURCES.has(s.source) || fails >= ENTRY_4XX_LIMIT) markSeen(s.condition_id);
+        }
         continue;
       }
       markSeen(s.condition_id); // filled/placed — one shot per market (buy once)

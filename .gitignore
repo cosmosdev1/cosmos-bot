@@ -4,3 +4,5 @@ positions.json
 *.log
 .DS_Store
 seen.json
+# app-specific (holds YOUR fly app name + volume mount) - each install generates its own
+fly.toml
