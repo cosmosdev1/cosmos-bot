@@ -50,6 +50,26 @@ export function makeCosmos(config) {
       return getJSON(`/api/v1/sports-exit?${q}`); // { action, reason }
     },
 
+    // Model re-price for a HELD quant (crypto) position (source "quant"). The server reprices the
+    // position with the SAME model that drove entry and returns { ok, modelP, tauMin }. The
+    // model-stop RULE (thresholds, shadow/live) lives in the bot; this just fetches the fresh modelP.
+    // Returns null on any error so the caller simply holds (never force-sells on a server hiccup).
+    async quantExit(pos) {
+      try {
+        const s = new URLSearchParams({
+          q: pos.market_question ?? "",
+          end: pos.end_date ?? "",
+          side: pos.outcome ?? "",
+        });
+        const res = await fetch(`${base}/api/v1/quant-exit?${s}`, { headers });
+        const d = await res.json().catch(() => ({}));
+        if (!res.ok) return null;
+        return d; // { ok, modelP, tauMin, asset, strike, family }
+      } catch {
+        return null;
+      }
+    },
+
     // Report a placed order to Cosmos: records the $0.09 fee and returns whether the daily
     // spend limit has been reached (paused). The order itself is posted directly to Polymarket
     // by the bot — Cosmos never touches keys or funds.

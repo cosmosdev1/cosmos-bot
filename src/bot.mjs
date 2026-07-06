@@ -5,6 +5,7 @@
 // Polymarket holdings each cycle, so positions.json never drifts from reality.
 import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
+import { pathToFileURL } from "node:url";
 import { makeCosmos } from "./cosmos.mjs";
 import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
@@ -202,6 +203,51 @@ async function edgeExit(pm, pos) {
   if (bid != null && bid <= 3 && (cur == null || cur <= 10)) return { cur, action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
   if (cur == null && bid == null) return { cur, action: "HOLD", reason: "book gone - resolution pays out automatically" };
   return { cur, action: null };
+}
+
+// --- MODEL-BASED STOP for quant (crypto) positions. -------------------------------------------
+// Re-price a HELD quant position with the SAME model that drove entry (server /api/v1/quant-exit ->
+// fresh modelP) and SELL only if ALL of: the model win-prob for the held side is broken (< 0.30), the
+// book still OVERPAYS vs the updated fair value (best bid >= round(modelP*100) + 8pp), and we're not in
+// the unreliable near-expiry region (>= 15 min to expiry). All three thresholds are env-tunable and
+// conservative. Defaults to SHADOW mode (log-only, NEVER sells) until a human sets QUANT_STOP_MODE=live.
+const quantStopMode = () => (process.env.QUANT_STOP_MODE || "shadow").toLowerCase(); // "shadow" | "live" | "off"
+const QSTOP_P = () => HZ("QUANT_STOP_P", 0.30);              // model win-prob below this = thesis broken
+const QSTOP_EDGE_PP = () => HZ("QUANT_STOP_EDGE_PP", 8);     // book bid must overpay fair value by >= this (pp)
+const QSTOP_MIN_TAU = () => HZ("QUANT_STOP_MIN_TAU_MIN", 15); // don't act inside this many minutes to expiry
+
+// Pure, testable decision: given the fresh reprice (modelP, tauMin), the live best bid (cents) and the
+// thresholds, does the model-stop FIRE? All three conditions must hold.
+export function quantStopFires({ modelP, tauMin, bidCents }, { stopP, edgePp, minTau }) {
+  if (!(tauMin >= minTau)) return false;          // near-expiry: modelP unreliable -> never act
+  if (!(modelP < stopP)) return false;            // thesis still intact -> hold
+  if (bidCents == null) return false;             // no readable bid -> can't confirm the book overpays
+  return bidCents >= Math.round(modelP * 100) + edgePp; // book still overpays vs updated fair value
+}
+
+// Model-stop for ONE held quant position. Returns a STOP_LOSS verdict only in "live" mode when the rule
+// fires (so the existing sell path executes); in "shadow" it logs the would-sell line and returns null
+// (no sell); "off" is a no-op. Returns null for anything not a quant position or the server can't reprice.
+export async function quantModelStop(cosmos, pm, pos) {
+  const mode = quantStopMode();
+  if (mode === "off") return null;
+  if (pos.source !== "quant") return null;
+
+  const r = await cosmos.quantExit(pos);
+  if (!r?.ok) return null;
+
+  const bidCents = await pm.getBestBidCents(pos.token_id).catch(() => null);
+  const cfg = { stopP: QSTOP_P(), edgePp: QSTOP_EDGE_PP(), minTau: QSTOP_MIN_TAU() };
+  if (!quantStopFires({ modelP: r.modelP, tauMin: r.tauMin, bidCents }, cfg)) return null;
+
+  if (mode === "live") {
+    return { action: "STOP_LOSS", reason: `model ${(r.modelP * 100) | 0}% < ${Math.round(cfg.stopP * 100)}, bid ${bidCents}c` };
+  }
+  // SHADOW (default): observe-only. Log a clear line and DO NOT sell.
+  const mkt = (pos.market_question || pos.condition_id || "").slice(0, 48);
+  const recover = ((Number(pos.size_shares) || 0) * bidCents) / 100;
+  log(`[quant-stop SHADOW] would sell ${mkt} · modelP=${r.modelP.toFixed(2)} bid=${bidCents}c entry=${pos.entry_cents}c recover≈$${recover.toFixed(2)}`);
+  return null;
 }
 
 async function decideExit(cosmos, pm, settings, pos, curFromEdge) {
@@ -452,6 +498,19 @@ async function cycle(cosmos, pm) {
       pos.end_date = (await pm.getMarketEndDate(pos.condition_id).catch(() => null)) ?? "none";
       store.save(positions);
     }
+    // MODEL-BASED STOP (quant positions only): reprice with the SAME model that drove entry. A FIRED
+    // live stop takes precedence over the generic edge salvage below. In shadow mode (the default) this
+    // only logs and returns null, so the flow falls through UNCHANGED. QUANT_STOP_MODE=off skips it.
+    if (pos.source === "quant") {
+      const qstop = await quantModelStop(cosmos, pm, pos);
+      if (qstop) {
+        const r = await marketableSell(cosmos, pm, pos, qstop.action);
+        if (r.ok) log(`${qstop.action} ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${qstop.reason || ""}`);
+        else if (r.held) log(`${qstop.action} ${pos.outcome} held - no bid above floor · ${qstop.reason || ""}`);
+        else warn("quant-stop exit failed (will retry next cycle):", r.status);
+        continue; // next cycle's reconcile removes it once the holding is gone
+      }
+    }
     // EDGE RULES FIRST, for EVERY position type - sports included. Sports used to skip straight
     // to the server strategy, so the 97c+ lock-in and <=3c salvage never fired on them.
     const edge = await edgeExit(pm, pos);
@@ -675,4 +734,6 @@ async function main() {
     await sleep((config.pollSeconds ?? 30) * 1000);
   }
 }
-main();
+// Run the loop only when executed directly (node src/bot.mjs) - NOT when imported (e.g. a unit test
+// importing the pure exit rule), so importing this module never boots the trading loop.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) main();
