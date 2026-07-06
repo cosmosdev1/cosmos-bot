@@ -74,7 +74,7 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
 // Percentages are taken off the whole PORTFOLIO (free cash + the cost basis of open positions), not
 // just free cash, so position sizes stay stable as money gets deployed.
 // Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
-const DEFAULT_PCT = 6; // default per-trade size; fall back to 6% of portfolio if a config value is missing/0
+const DEFAULT_PCT = 5; // fallback per-trade size when no % is configured (product policy 2026-07)
 
 function sizeForSignal(z, s, portfolio, deployed) {
   // Size off an explicit account-size override when the user set one, else the TRUE portfolio VALUE
@@ -82,17 +82,20 @@ function sizeForSignal(z, s, portfolio, deployed) {
   // "3% of $200 = $6" hold no matter what the live reads do.
   const basis = Number(z.accountSizeUsd) > 0 ? Number(z.accountSizeUsd) : portfolio;
   let usd;
-  if (z.mode === "fixed") usd = Number(z.fixedUsd) || 0;
-  else if (z.mode === "tiered") {
-    const tp = z.tierPct || {};
-    // `||` (not `??`) so a 0/undefined tier falls through: tier -> free -> the flat pct -> DEFAULT_PCT.
-    // NEVER resolve to 0% (which the $1 floor would turn into a tiny 2-3 share minimum order).
-    const pct = Number(tp[s.lock_tier]) || Number(tp.free) || Number(z.pct) || DEFAULT_PCT;
-    usd = (basis * pct) / 100;
+  if (z.mode === "fixed") {
+    usd = Number(z.fixedUsd) || 0;
   } else {
-    usd = (basis * (Number(z.pct) || DEFAULT_PCT)) / 100;
+    // FLAT percentage of the WHOLE portfolio: the SAME size for every trade, independent of the
+    // signal's tier or score (product policy 2026-07 - NO conviction scaling, NO per-signal-tier
+    // variance). The percentage is the platinum/gold value the user set (tiered mode) or their
+    // single pct (pct mode); fall back to DEFAULT_PCT (5%) if none set. `||` (not `??`) so a
+    // 0/undefined value falls through - NEVER resolve to 0% (the $1 floor would emit a dust order).
+    const tp = z.tierPct || {};
+    const pct = z.mode === "tiered"
+      ? (Number(tp.platinum) || Number(tp.gold) || Number(z.pct) || DEFAULT_PCT)
+      : (Number(z.pct) || Number(tp.platinum) || Number(tp.gold) || DEFAULT_PCT);
+    usd = (basis * pct) / 100;
   }
-  if (z.conviction && s.score) usd *= 0.5 + Number(s.score) / 10; // score 0..10 -> 0.5x..1.5x
   if (z.maxPerTradeUsd) usd = Math.min(usd, Number(z.maxPerTradeUsd));
   if (z.maxExposurePct) usd = Math.min(usd, Math.max(0, (basis * Number(z.maxExposurePct)) / 100 - deployed));
   return usd;
@@ -104,8 +107,11 @@ function sizeLabel(z) {
   if (!z || !z.mode) return "size: default";
   const basis = Number(z.accountSizeUsd) > 0 ? ` of $${Number(z.accountSizeUsd)} (set)` : " of portfolio";
   if (z.mode === "fixed") return `size: $${Number(z.fixedUsd) || 0}/trade`;
-  if (z.mode === "tiered") { const t = z.tierPct || {}; return `size: tiered g${t.gold ?? 0}/p${t.platinum ?? 0}/b${t.bronze ?? 0}/f${t.free ?? 0}%${basis}`; }
-  return `size: ${Number(z.pct) || DEFAULT_PCT}%${basis}`;
+  const tp = z.tierPct || {};
+  const pct = z.mode === "tiered"
+    ? (Number(tp.platinum) || Number(tp.gold) || Number(z.pct) || DEFAULT_PCT)
+    : (Number(z.pct) || Number(tp.platinum) || Number(tp.gold) || DEFAULT_PCT);
+  return `size: ${pct}% flat${basis}`;
 }
 
 // ---- HORIZON STOP: liquidate dead-money positions so capital stays liquid. ----
