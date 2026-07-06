@@ -382,7 +382,12 @@ async function cycle(cosmos, pm) {
   const portfolioValue = balance + positionsValue;
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
   const basisNote = pmValue != null && Number(pmValue) >= deployed ? " (cash + polymarket positions)" : !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
-  log(`cycle · ${feed.count} signals · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${portfolioValue.toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
+  // Per-source feed breakdown, so the log SHOWS what the server is serving (e.g. "wallets 55 ·
+  // quant 3") - the one line that answers "why is it buying X and not Y".
+  const bySrc = {};
+  for (const s of feed.signals ?? []) bySrc[s.source ?? "?"] = (bySrc[s.source ?? "?"] ?? 0) + 1;
+  const srcNote = Object.entries(bySrc).map(([k, v]) => `${k} ${v}`).join(" · ") || "empty";
+  log(`cycle · ${feed.count} signals [${srcNote}] · ${Object.keys(positions).length} open · cash $${balance.toFixed(2)} · portfolio $${portfolioValue.toFixed(2)}${basisNote} · ${sizeLabel(settings.sizing)}`);
   // Self-diagnosis: cash ~$0 means NO buys are possible - say WHY in the log the user actually reads.
   if (balance < 1) {
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
