@@ -196,7 +196,7 @@ async function edgeExit(pm, pos) {
   // QUANT (crypto/stocks math engine) positions hold out for 99c - each extra cent on a
   // near-certain bet is real yield, and an unfilled 99c costs nothing (resolution pays 100).
   // Everything else locks from 97c. Env: QUANT_TP_CENTS.
-  const tpC = pos.source === "quant" ? HZ("QUANT_TP_CENTS", 99) : 97;
+  const tpC = pos.source === "quant" ? HZ("QUANT_TP_CENTS", 99) : pos.source === "weather" ? HZ("WEATHER_TP_CENTS", 98) : 97;
   if (cur != null && cur >= tpC) return { cur, action: "TAKE_PROFIT", reason: `reached ${cur}c - locking the win` };
   if (bid != null && bid >= tpC) return { cur, action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
   if (cur != null && cur <= 3) return { cur, action: "STOP_LOSS", reason: `reached ${cur}c - salvaging before zero` };
@@ -537,6 +537,10 @@ async function cycle(cosmos, pm) {
     const edge = await edgeExit(pm, pos);
     if (edge.action === "HOLD") continue; // book gone - resolution auto-redeems
     let v = edge.action ? edge : null;
+    // WEATHER: edge rules ONLY - the 98c take-profit or the <=3c salvage. NEVER AI advice, the
+    // -50% fallback, a manual SL, or the horizon stop. A near-certain bracket bet just holds to
+    // its same-day resolution unless it hits one of those two edges.
+    if (pos.source === "weather" && !v) continue;
     // HORIZON STOP: dead-money positions get sold no matter what the TP/SL settings say.
     if (!v) {
       const hz = horizonVerdict(pos, edge.cur);
