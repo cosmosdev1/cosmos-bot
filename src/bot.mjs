@@ -76,6 +76,8 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
 // just free cash, so position sizes stay stable as money gets deployed.
 // Optional: scale by score, a $ cap per trade, and a total-exposure ceiling.
 const DEFAULT_PCT = 5; // fallback per-trade size when no % is configured (product policy 2026-07)
+// Weather YES (rule B) is the risky side (88.6% WR vs 100% for the NO certainties): size it smaller.
+const WEATHER_YES_FRACTION = Number(process.env.WEATHER_YES_FRACTION) || 0.75;
 
 function sizeForSignal(z, s, portfolio, deployed) {
   // Size off an explicit account-size override when the user set one, else the TRUE portfolio VALUE
@@ -97,6 +99,9 @@ function sizeForSignal(z, s, portfolio, deployed) {
       : (Number(z.pct) || Number(tp.platinum) || Number(tp.gold) || DEFAULT_PCT);
     usd = (basis * pct) / 100;
   }
+  // Weather YES (rule B) trades ride at 3/4 of the normal budget - smaller stake on the side that
+  // can actually lose (the NO certainties keep full size). Applies to both pct and fixed modes.
+  if (s && s.source === "weather" && /^yes$/i.test(String(s.outcome || ""))) usd *= WEATHER_YES_FRACTION;
   if (z.maxPerTradeUsd) usd = Math.min(usd, Number(z.maxPerTradeUsd));
   if (z.maxExposurePct) usd = Math.min(usd, Math.max(0, (basis * Number(z.maxExposurePct)) / 100 - deployed));
   return usd;
