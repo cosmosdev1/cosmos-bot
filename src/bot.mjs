@@ -163,6 +163,40 @@ function logSkipOnce(cid, kind, msg) {
   log(msg);
 }
 
+// Fill-time crypto spot for the quant sanity check (Binance 5m close, ~20s cache so a burst of quant
+// signals in one cycle shares one fetch). Closes the cron-interval staleness race: a signal emitted
+// when spot was below the strike must NOT fill after spot crossed above (that bought NO at a loss).
+const _spotCache = new Map();
+async function freshSpot(pair) {
+  const c = _spotCache.get(pair);
+  if (c && Date.now() - c.at < 20_000) return c.S;
+  try {
+    const r = await fetch(`https://data-api.binance.vision/api/v3/klines?symbol=${pair}&interval=5m&limit=1`, { signal: AbortSignal.timeout(6000) });
+    if (!r.ok) return null;
+    const k = await r.json();
+    const S = Array.isArray(k) && k[0] ? Number(k[0][4]) : null;
+    if (S) _spotCache.set(pair, { S, at: Date.now() });
+    return S;
+  } catch { return null; }
+}
+// Quant "above $K" ladder signals only: verify FRESH spot is still on the thesis side of the strike.
+// NO thesis = finish BELOW K (need spot < K-buf); YES = above (need spot > K+buf). Returns true
+// (allow) when it can't tell (non-crypto, unparseable, or spot unavailable) so other guards govern.
+async function quantSpotOk(s) {
+  const q = String(s.market_question || "");
+  if (!/\babove\b/i.test(q)) return true; // touch/hit markets use different (already-hit) logic
+  const pair = /bitcoin|\bbtc\b/i.test(q) ? "BTCUSDT" : /ethereum|\beth\b/i.test(q) ? "ETHUSDT" : null;
+  if (!pair) return true;
+  const mk = q.match(/above\s+\$?([\d,]+(?:\.\d+)?)/i);
+  if (!mk) return true;
+  const K = Number(mk[1].replace(/,/g, ""));
+  if (!Number.isFinite(K) || K <= 0) return true;
+  const S = await freshSpot(pair);
+  if (!S) return true;
+  const buf = K * (Number(process.env.QUANT_SPOT_BUFFER_BPS || 10) / 10000); // default 0.10% flip-zone buffer
+  return /^no$/i.test(String(s.outcome)) ? S <= K - buf : S >= K + buf;
+}
+
 const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
 const SELL_BUFFER = 5; // marketable sell: offer a few cents below mid so stops actually fill
 const HARD_STOP_FRAC = 0.5; // advice unreachable -> still exit if price has halved
@@ -613,6 +647,15 @@ async function cycle(cosmos, pm) {
         : Infinity;
       if (sizeUsd < MIN_TRADE_USD && exposureRoom >= MIN_TRADE_USD) sizeUsd = MIN_TRADE_USD; // hard $2 floor
       if (sizeUsd < MIN_TRADE_USD || sizeUsd > remaining) continue; // no room right now — transient, retry (no burn)
+
+      // FILL-TIME SPOT CHECK (quant ladders): the server refreshes signals every cron tick, but spot
+      // can cross the strike in the gap before the next refresh retires a now-stale ticket. Re-check
+      // fresh spot here so we never fill a directional bet whose thesis already broke. Transient - no
+      // burn: if spot comes back to the thesis side and the signal is still live, it re-arms.
+      if (s.source === "quant" && !(await quantSpotOk(s))) {
+        logSkipOnce(s.condition_id, "spot", `skip quant: fresh spot on wrong side of strike · ${(s.market_question || "").slice(0, 48)}`);
+        continue;
+      }
 
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
       if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; } // transient — retry
