@@ -37,6 +37,26 @@ export function makeCosmos(config) {
       return d; // { action, reason, current_cents, pnl_pct, whale_exit_pct }
     },
 
+    // BATCH exit verdicts: ALL open positions in ONE POST -> Map(condition_id -> verdict). Replaces the
+    // per-position fan-out that 429'd the shared per-token rate limiter (and a 429 force-sold at -50%).
+    async adviceBatch(positions) {
+      if (!positions || !positions.length) return new Map();
+      const res = await fetch(`${base}/api/v1/positions/advice`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          positions: positions.map((p) => ({
+            condition_id: p.condition_id, outcome: p.outcome, entry_cents: p.entry_cents, whales: p.entry_whales || [],
+          })),
+        }),
+      });
+      const d = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(d.error || `advice-batch -> ${res.status}`);
+      const map = new Map();
+      for (const v of d.verdicts || []) if (v && v.condition_id) map.set(v.condition_id, v);
+      return map;
+    },
+
     // The strategy-owned exit verdict for an in-play SPORTS position (source "sports"). The user's
     // TP/SL settings don't apply to these - the server runs the fixed strategy exit: sell 60% once
     // the live price reaches 85c (SELL_PARTIAL), hold the remaining 40% to resolution. `partial`

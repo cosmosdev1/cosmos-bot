@@ -199,7 +199,6 @@ async function quantSpotOk(s) {
 
 const BUY_BUFFER = 3; //  marketable buy: bid a few cents above mid (capped at max_entry)
 const SELL_BUFFER = 5; // marketable sell: offer a few cents below mid so stops actually fill
-const HARD_STOP_FRAC = 0.5; // advice unreachable -> still exit if price has halved
 
 // Local TP and SL, evaluated INDEPENDENTLY (a manual SL must still work when TP is on "ai", and vice
 // versa). Each returns a verdict or null.
@@ -289,20 +288,25 @@ export async function quantModelStop(cosmos, pm, pos) {
   return null;
 }
 
-async function decideExit(cosmos, pm, settings, pos, curFromEdge) {
+// One BATCH advice call for a set of positions -> Map(condition_id -> verdict), replacing the old
+// per-position fan-out (which 429'd the shared limiter). Only when a TP/SL side is "Cosmos AI".
+// Fail-safe: any error -> empty map, so every side HOLDs (a rate-limit never forces a sell).
+async function batchAdvice(cosmos, settings, posArr) {
+  if (!(settings.tp_mode === "ai" || settings.sl_mode === "ai")) return new Map();
+  const arr = (posArr || []).filter((p) => p && p.condition_id && p.entry_cents);
+  if (!arr.length) return new Map();
+  try { return await cosmos.adviceBatch(arr); }
+  catch (e) { warn("advice-batch unreachable (holding):", e.message); return new Map(); }
+}
+
+async function decideExit(cosmos, pm, settings, pos, curFromEdge, aiVerdict) {
   const cur = curFromEdge !== undefined ? curFromEdge : await pm.getPriceCents(pos.token_id);
 
   // Evaluate the TAKE-PROFIT side and the STOP-LOSS side SEPARATELY. Each side is either "ai" (server
-  // brain) or "fixed"/"percent" (local). The old code routed BOTH sides to the AI brain whenever
-  // EITHER was "ai", so a user's manual TP/SL on the other side was silently ignored — the core bug.
-  let ai = null;
-  if (settings.tp_mode === "ai" || settings.sl_mode === "ai") {
-    try { ai = await cosmos.advice(pos); }
-    catch (e) {
-      warn("advice:", e.message);
-      if (cur != null && cur <= pos.entry_cents * HARD_STOP_FRAC) return { action: "STOP_LOSS", reason: "local hard stop (advice unavailable)" };
-    }
-  }
+  // brain) or "fixed"/"percent" (local). The "Cosmos AI" verdict is PRECOMPUTED once per cycle by a
+  // single batch call (aiVerdict) - we never make a per-position advice call here anymore (that fan-out
+  // 429'd the shared limiter, and a 429 used to force a -50% sell). Missing verdict -> that side HOLDs.
+  const ai = aiVerdict ?? null;
 
   // Take-profit side
   if (settings.tp_mode === "ai") { if (ai?.action === "TAKE_PROFIT") return ai; }
@@ -548,6 +552,9 @@ async function cycle(cosmos, pm) {
   }
 
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
+  // Precompute the "Cosmos AI" exit verdicts for ALL positions in ONE batch call (was one POST per
+  // position -> a per-token 429 storm that force-sold held positions at -50%).
+  const adviceMap = await batchAdvice(cosmos, settings, Object.values(positions));
   let endDateLookups = 0; // cap the per-cycle gamma lookups for the horizon stop
   for (const cid of Object.keys(positions)) {
     const pos = positions[cid];
@@ -590,7 +597,7 @@ async function cycle(cosmos, pm) {
       // salvage at minute 85+ when the favorite isn't winning, rest to resolution) - NOT the
       // user's TP/SL settings.
       if (pos.source === "sports") { await sportsExitStep(cosmos, pm, positions, pos); continue; }
-      v = await decideExit(cosmos, pm, settings, pos, edge.cur);
+      v = await decideExit(cosmos, pm, settings, pos, edge.cur, adviceMap.get(cid));
     }
     if (!v || v.action === "HOLD") continue;
     const r = await marketableSell(cosmos, pm, pos, v.action);
@@ -735,13 +742,14 @@ async function cycle(cosmos, pm) {
 
   // --- MANUAL TRADES (apply the same exits to your existing positions, if enabled). ---
   if (config.applyToManualTrades && (settings.tp_manual || settings.sl_manual)) {
+    const manualAdviceMap = await batchAdvice(cosmos, settings, [...held.values()].map((m) => ({ condition_id: m.condition_id, outcome: m.outcome, entry_cents: m.entry_cents, entry_whales: [] })));
     for (const m of held.values()) {
       if (positions[m.condition_id]) continue; // a bot position — already handled
       const pos = { condition_id: m.condition_id, token_id: m.token_id, outcome: m.outcome, entry_cents: m.entry_cents, size_shares: m.size_shares, entry_whales: [] };
       // Same order as bot positions: the always-on edge rules first, then the user's TP/SL.
       const edge = await edgeExit(pm, pos);
       if (edge.action === "HOLD") continue;
-      const v = edge.action ? edge : await decideExit(cosmos, pm, settings, pos, edge.cur);
+      const v = edge.action ? edge : await decideExit(cosmos, pm, settings, pos, edge.cur, manualAdviceMap.get(m.condition_id));
       if (!v || v.action === "HOLD") continue;
       const r = await marketableSell(cosmos, pm, pos, v.action);
       if (r.ok) log(`(manual) ${v.action} ${m.outcome} @ ~${r.sellPrice ?? r.mid}c · ${v.reason || ""}`);
