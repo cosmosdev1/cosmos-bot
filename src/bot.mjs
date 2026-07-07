@@ -315,14 +315,35 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
 }
 
 // Strategy exit for one in-play SPORTS position. Asks the server (which tracks the live game) and
-// executes: SELL_HALF = the one-time 50% take-profit at entry*1.6; SELL_ALL = the minute-85 salvage
-// when the favorite isn't winning (dump to any bid - the share is heading to $0 on a draw/loss).
+// executes: SELL_PARTIAL = the one-time 60% take-profit at 85c (rest held to resolution);
+// SELL_HALF/SELL_ALL kept for backward compatibility with any legacy verdict.
 async function sportsExitStep(cosmos, pm, positions, pos) {
   const cur = await pm.getPriceCents(pos.token_id);
   let d = null;
   try { d = await cosmos.sportsExit(pos, cur ?? 0); }
   catch (e) { warn("sports-exit:", e.message); return; }
   if (!d || d.action === "HOLD") return;
+
+  if (d.action === "SELL_PARTIAL") {
+    const fraction = Number(d.fraction) > 0 && Number(d.fraction) < 1 ? Number(d.fraction) : 0.6;
+    const chunk = Math.floor(pos.size_shares * fraction);
+    // Polymarket's ~$1 order minimum: if the chunk can't clear it, bank the whole position instead.
+    if (chunk < 1 || (cur != null && chunk * cur < 110)) {
+      const r = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT");
+      if (r.ok) { pos.partial_sold = true; log(`SPORTS TP (full - too small to split) ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${d.reason || ""}`); }
+      return; // reconcile removes it once the holding is gone
+    }
+    const r = await marketableSell(cosmos, pm, { ...pos, size_shares: chunk }, "TAKE_PROFIT");
+    if (r.ok) {
+      pos.partial_sold = true; // one-time flag: never fire the 60% chunk again
+      pos.size_shares -= chunk; // reconcile re-syncs to the true holding next cycle anyway
+      store.save(positions);
+      log(`SPORTS TP sold ${chunk} shares (${Math.round(fraction * 100)}%) @ ~${r.sellPrice ?? r.mid}c, holding ${pos.size_shares} to resolution · ${d.reason || ""}`);
+    } else if (!r.held) {
+      warn("sports partial-sell failed (will retry next cycle):", r.status);
+    }
+    return;
+  }
 
   if (d.action === "SELL_HALF") {
     const half = Math.floor(pos.size_shares / 2);

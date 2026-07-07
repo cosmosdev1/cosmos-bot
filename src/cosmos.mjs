@@ -38,16 +38,17 @@ export function makeCosmos(config) {
     },
 
     // The strategy-owned exit verdict for an in-play SPORTS position (source "sports"). The user's
-    // TP/SL settings don't apply to these - the server runs the fixed strategy exits (50% at
-    // entry*1.6, full salvage at minute 85+ when not winning, rest to resolution).
+    // TP/SL settings don't apply to these - the server runs the fixed strategy exit: sell 60% once
+    // the live price reaches 85c (SELL_PARTIAL), hold the remaining 40% to resolution. `partial`
+    // tells the server the 60% chunk has already been banked so it isn't fired twice.
     async sportsExit(pos, curCents) {
       const q = new URLSearchParams({
         cid: pos.condition_id,
         cur: String(curCents ?? 0),
         entry: String(pos.entry_cents ?? 0),
-        half: pos.half_sold ? "1" : "0",
+        partial: pos.partial_sold ? "1" : "0",
       });
-      return getJSON(`/api/v1/sports-exit?${q}`); // { action, reason }
+      return getJSON(`/api/v1/sports-exit?${q}`); // { action, fraction?, reason }
     },
 
     // Model re-price for a HELD quant (crypto) position (source "quant"). The server reprices the
