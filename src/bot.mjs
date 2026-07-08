@@ -10,6 +10,7 @@ import { makeCosmos } from "./cosmos.mjs";
 import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
 import { log, warn, err } from "./log.mjs";
+import { startQTable } from "./qtable.mjs";
 
 // Config comes from config.json (local install via `npm run setup`) OR env vars (cloud/24-7
 // deploy — Render/Railway/Docker, where there's no interactive terminal). Env vars win so a
@@ -40,6 +41,8 @@ if (!config.cosmosToken || !config.polymarket.privateKey) {
 const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_BACKLOG === "1";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
+// Live cycle state shared with the qtable fast loop (updated every 30s cycle; the 5s loop reads it).
+const qtState = { cash: null, portfolio: 0, deployed: 0, sizing: null };
 
 // Hard floor per trade: Polymarket's ~$1 minimum order. Any computed size below this is bumped up
 // to $1 (e.g. 3% of a $10 balance = $0.30 still trades at $1), as long as there's room.
@@ -234,7 +237,7 @@ async function edgeExit(pm, pos) {
   // QUANT (crypto/stocks math engine) positions hold out for 99c - each extra cent on a
   // near-certain bet is real yield, and an unfilled 99c costs nothing (resolution pays 100).
   // Everything else locks from 97c. Env: QUANT_TP_CENTS.
-  const tpC = pos.source === "quant" ? HZ("QUANT_TP_CENTS", 99) : pos.source === "weather" ? HZ("WEATHER_TP_CENTS", 98) : 97;
+  const tpC = pos.source === "quant" || pos.source === "qtable" ? HZ("QUANT_TP_CENTS", 99) : pos.source === "weather" ? HZ("WEATHER_TP_CENTS", 98) : 97;
   // A take-profit must actually PROFIT: the trigger is the mid, but the fill is the BID. A 97c-entry
   // whose mid hits 98 with a 95c bid used to "lock the win" at -2c (audited: repeated tiny losses).
   // Require the executable bid (or mid when no bid was read) to clear entry+1; otherwise hold -
@@ -512,6 +515,7 @@ async function cycle(cosmos, pm) {
   const pmValue = await pm.getPortfolioValue();
   const positionsValue = Math.max(Number(pmValue) || 0, deployed);
   const portfolioValue = balance + positionsValue;
+  qtState.cash = balance; qtState.portfolio = portfolioValue; qtState.deployed = deployed;
   const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
   const basisNote = pmValue != null && Number(pmValue) >= deployed ? " (cash + polymarket positions)" : !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
   // Per-source feed breakdown, so the log SHOWS what the server is serving (e.g. "wallets 55 ·
@@ -593,6 +597,9 @@ async function cycle(cosmos, pm) {
     // -50% fallback, a manual SL, or the horizon stop. A near-certain bracket bet just holds to
     // its same-day resolution unless it hits one of those two edges.
     if (pos.source === "weather" && !v) continue;
+    // QTABLE: edge rules only (99c lock-in or the <=3c salvage) - these resolve within minutes to
+    // hours and the table priced the entry; no advice brain, no user TP/SL, no horizon stop.
+    if (pos.source === "qtable" && !v) continue;
     // HORIZON STOP: dead-money positions get sold no matter what the TP/SL settings say.
     if (!v) {
       const hz = horizonVerdict(pos, edge.cur);
@@ -639,6 +646,7 @@ async function cycle(cosmos, pm) {
   } else {
     // Sizing comes from the dashboard; fall back to legacy per_trade_pct if absent.
     const sizing = settings.sizing || { mode: "pct", pct: settings.per_trade_pct ?? config.perTradePct ?? DEFAULT_PCT, tierPct: { gold: 6, platinum: 6, bronze: 6, free: 6 }, conviction: false, maxPerTradeUsd: null, maxExposurePct: null, accountSizeUsd: null };
+    qtState.sizing = sizing;
     let remaining = balance; // `deployed` (true portfolio basis) is computed above from real holdings
     // Mark a market "evaluated" so it's never reconsidered. Called only after a real decision
     // (sized-out, price ran past entry, or an order was attempted) — NOT on transient failures
@@ -808,6 +816,11 @@ async function main() {
     log(`geoblock: clear (${geo.country ?? "?"}${geo.region ? "/" + geo.region : ""})`);
   } else {
     warn("geoblock check failed:", geo.status ?? geo.error);
+  }
+
+  // QTABLE fast engine (5s tick, direct orders). Kill: QTABLE_ENABLED=0.
+  if (process.env.QTABLE_ENABLED !== "0") {
+    startQTable({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 
   // eslint-disable-next-line no-constant-condition
