@@ -235,8 +235,14 @@ async function edgeExit(pm, pos) {
   // near-certain bet is real yield, and an unfilled 99c costs nothing (resolution pays 100).
   // Everything else locks from 97c. Env: QUANT_TP_CENTS.
   const tpC = pos.source === "quant" ? HZ("QUANT_TP_CENTS", 99) : pos.source === "weather" ? HZ("WEATHER_TP_CENTS", 98) : 97;
-  if (cur != null && cur >= tpC) return { cur, action: "TAKE_PROFIT", reason: `reached ${cur}c - locking the win` };
-  if (bid != null && bid >= tpC) return { cur, action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
+  // A take-profit must actually PROFIT: the trigger is the mid, but the fill is the BID. A 97c-entry
+  // whose mid hits 98 with a 95c bid used to "lock the win" at -2c (audited: repeated tiny losses).
+  // Require the executable bid (or mid when no bid was read) to clear entry+1; otherwise hold -
+  // near-certain positions resolve at 100c anyway, so an unfilled TP costs nothing.
+  const minExec = (Number(pos.entry_cents) || 0) + 1; // executable price must clear entry
+  const exec = bid ?? cur;
+  if (cur != null && cur >= tpC && exec != null && exec >= minExec) return { cur, action: "TAKE_PROFIT", reason: `reached ${cur}c (exec ${exec}c) - locking the win` };
+  if (bid != null && bid >= tpC && bid >= minExec) return { cur, action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
   if (cur != null && cur <= 3) return { cur, action: "STOP_LOSS", reason: `reached ${cur}c - salvaging before zero` };
   if (bid != null && bid <= 3 && (cur == null || cur <= 10)) return { cur, action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
   if (cur == null && bid == null) return { cur, action: "HOLD", reason: "book gone - resolution pays out automatically" };
