@@ -33,6 +33,9 @@ const SPOT_STALE_MS = N("QTABLE_SPOT_STALE_MS", 15000);
 // (coin-flips - spot hugging the strike, table P hypersensitive to spot jitter between tick and
 // fill), while 5-15bps realized 82%. Tiny-|d| "edges" are model noise, not signal - floor them.
 const MIN_ABS_D = N("QTABLE_MIN_ABS_D", 0.0005);
+// PNL-by-decile audit: entries in the first 10% of the window bled -13.6% on 35% of all volume
+// (candle barely off its open -> P is noise). Owner rule: never trade the first 10%.
+const MIN_ELAPSED_PCT = N("QTABLE_MIN_ELAPSED_PCT", 10);
 const DRY = process.env.QTABLE_DRY === "1";
 
 const FRAME_MS = { "15m": 900e3, "1h": 3600e3, "4h": 14400e3, "1d": 86400e3 };
@@ -179,6 +182,7 @@ export function startQTable(deps) {
       const d = (S - K) / K;
       if (Math.abs(d) < MIN_ABS_D) continue;                    // knife's-edge spot: P is noise there
       const elapsedPct = 100 * (1 - remaining / frameMs);
+      if (elapsedPct < MIN_ELAPSED_PCT) continue;              // owner: never trade the first 10%
       const look = lookupP(m.sym, m.frame, elapsedPct, d);
       if (!look) continue;
       dbg.evald++;
