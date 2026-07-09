@@ -7,7 +7,7 @@
 //
 // Trading spec: tick every 5s (QTABLE_TICK_MS) -> one Binance spot fetch -> per tracked market
 // compute d + elapsed -> table P -> trade a side only when P >= 50% (QTABLE_MIN_P) AND the
-// EXECUTABLE ask leaves >= 8pp (QTABLE_EDGE) of edge. Orders are placed IMMEDIATELY from this
+// EXECUTABLE ask leaves >= 12pp (QTABLE_EDGE) of edge. Orders are placed IMMEDIATELY from this
 // loop (marketable FAK via the same CLOB client + builder code) - no server round-trip.
 //
 // Source caveat, measured not assumed: the 15m/5m candle family resolves on CHAINLINK BTC/USD,
@@ -21,13 +21,13 @@ const TABLE = JSON.parse(readFileSync(new URL("./qtable-data.json", import.meta.
 const N = (k, f) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : f; };
 const TICK_MS = N("QTABLE_TICK_MS", 5000);
 const DISCOVER_MS = N("QTABLE_DISCOVER_MS", 120000);
-const EDGE = N("QTABLE_EDGE", 0.08);
+const EDGE = N("QTABLE_EDGE", 0.12); // hardened 8->12pp (owner 2026-07-09): day-one calibration showed ~11pp claim-vs-realized deficit
 const MIN_P = N("QTABLE_MIN_P", 0.50);
 const MIN_REMAIN_S = N("QTABLE_MIN_REMAIN_S", 90);   // knife-edge guard: no entries in the last 90s
 const MAX_OPEN = N("QTABLE_MAX_OPEN", 8);            // concurrent qtable positions
 const MIN_VOL = N("QTABLE_MIN_VOL", 100);            // $ traded floor per market
 const MAX_SPREAD_C = N("QTABLE_MAX_SPREAD_C", 10);   // book sanity
-const CANDLE_HAIRCUT = N("QTABLE_CANDLE_HAIRCUT", 0.015); // Chainlink-vs-Binance divergence buffer
+const CANDLE_HAIRCUT = N("QTABLE_CANDLE_HAIRCUT", 0.05); // Chainlink buffer + candle miscalibration margin (day-one: 15m realized 54% WR vs 57% breakeven at 8pp) -> candles need 17pp total
 const SPOT_STALE_MS = N("QTABLE_SPOT_STALE_MS", 15000);
 const DRY = process.env.QTABLE_DRY === "1";
 
