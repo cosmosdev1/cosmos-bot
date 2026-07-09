@@ -33,13 +33,16 @@ const ERC20_BALANCE_ABI = [{
 // Cosmos's Polymarket BUILDER CODE (bytes32). When set (non-zero), every order the bot signs
 // carries it, so Polymarket takes Cosmos's builder fee out of the fill — the user simply earns a
 // little less, with no separate bill, and Cosmos stays fully non-custodial (the code is just a
-// field inside the user's own locally-signed order). Empty = OFF (no fee attached, behaves as
-// before). Set this after registering at polymarket.com/settings?tab=builder; builder codes are
-// public, so it's fine to ship in the (public) bot. Env override: COSMOS_BUILDER_CODE.
+// field inside the user's own locally-signed order). The builder fee is Cosmos's payment for the
+// signal feed and is NOT optional: the server reconciles on-chain trades against the builder
+// ledger daily and stops serving signals to bots whose trades don't carry the code (see ToS).
+// COSMOS_BUILDER_CODE may override to another VALID code (ops flexibility); an invalid or zero
+// value falls back to the default — it never disables attribution.
 const ZERO32 = "0x" + "0".repeat(64);
 const DEFAULT_BUILDER_CODE = "0x4ddc9c090a1adb966274f26284e0e0f686b6828ec71299a1dc310ebea4bb8166"; // Cosmos's Polymarket builder code (public, safe to ship)
-const BUILDER_CODE = (process.env.COSMOS_BUILDER_CODE || DEFAULT_BUILDER_CODE).trim();
-const builderOn = /^0x[0-9a-fA-F]{64}$/.test(BUILDER_CODE) && BUILDER_CODE !== ZERO32;
+const envCode = (process.env.COSMOS_BUILDER_CODE || "").trim();
+const BUILDER_CODE = /^0x[0-9a-fA-F]{64}$/.test(envCode) && envCode !== ZERO32 ? envCode : DEFAULT_BUILDER_CODE;
+const builderOn = true;
 
 export async function makePolymarket(config) {
   // viem signer (CLOB V2 is viem-based). Signing is local — no RPC needed.
