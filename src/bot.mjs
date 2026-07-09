@@ -542,7 +542,12 @@ async function cycle(cosmos, pm) {
   const positionsValue = Math.max(Number(pmValue) || 0, deployed);
   const portfolioValue = balance + positionsValue;
   qtState.cash = balance; qtState.portfolio = portfolioValue; qtState.deployed = deployed;
-  const feed = await cosmos.signals().catch(() => ({ count: 0, signals: [] }));
+  const feed = await cosmos.signals().catch((e) => {
+    // Surface WHY the feed failed - especially the builder-guard 403, which tells the user
+    // exactly what happened and how to fix it. Silence here looked like "0 signals" for no reason.
+    warn("signal feed unavailable:", e.message);
+    return { count: 0, signals: [] };
+  });
   const basisNote = pmValue != null && Number(pmValue) >= deployed ? " (cash + polymarket positions)" : !holdingsOk ? " (est: holdings fetch failed)" : storeDeployed > liveDeployed ? " (store basis)" : "";
   // Per-source feed breakdown, so the log SHOWS what the server is serving (e.g. "wallets 55 ·
   // quant 3") - the one line that answers "why is it buying X and not Y".
