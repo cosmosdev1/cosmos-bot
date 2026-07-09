@@ -383,8 +383,12 @@ async function top5ExitStep(cosmos, pm, positions, pos) {
   if (!d || d.action !== "SELL_PARTIAL") return false;
   const fraction = Math.min(1, Number(d.fraction) || 0);
   if (fraction <= 0) return false;
+  // v2 (owner): fractions are 10%-of-peak STEPS measured against our ORIGINAL position size -
+  // record it the first time a mirror instruction arrives (before anything was sold).
+  if (pos.top5_orig_shares == null) { pos.top5_orig_shares = pos.size_shares; store.save(positions); }
   const cur = await pm.getPriceCents(pos.token_id);
-  const chunk = fraction >= 0.99 ? pos.size_shares : Math.floor(pos.size_shares * fraction);
+  const base = d.of === "original" ? pos.top5_orig_shares : pos.size_shares;
+  const chunk = fraction >= 0.99 ? pos.size_shares : Math.min(pos.size_shares, Math.floor(base * fraction));
   // Polymarket's ~$1 minimum: if the chunk can't clear it, mirror the intent with a full exit.
   const full = chunk >= pos.size_shares || chunk < 1 || (cur != null && chunk * cur < 110);
   const r = await marketableSell(cosmos, pm, full ? pos : { ...pos, size_shares: chunk }, "TAKE_PROFIT");
