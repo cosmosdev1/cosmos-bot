@@ -52,7 +52,11 @@ const MIN_TRADE_USD = 2;
 // weather ladders, in-play sports). These are never "stale backlog": their caps and expiries
 // self-limit, and the server retires a signal the moment its edge is gone. They are therefore
 // exempt from the first-run baseline and from the permanent burn rules below.
-const ENGINE_SOURCES = new Set((process.env.COSMOS_ENGINE_SOURCES || "quant,weather,sports").split(",").map((s) => s.trim()).filter(Boolean));
+const ENGINE_SOURCES = new Set((process.env.COSMOS_ENGINE_SOURCES || "quant,weather,sports,top5").split(",").map((s) => s.trim()).filter(Boolean));
+// top5 added 2026-07-09: it IS a server-curated engine (orca-gated, server retires stale/misaligned
+// signals), but as a "raw" source every self-update restart baselined its live book away (the
+// July-6 "never buys engines" bug again), over-cap burned permanently, and one FAK 4xx on a thin
+// book (obscure soccer/esports) burned the signal for good.
 // A real-but-thin engine market can FAK-kill with a 4xx a few times before filling; give it a
 // bounded number of attempts (across cycles) before burning it. Non-engine sources burn on first 4xx.
 const ENTRY_4XX_LIMIT = Number(process.env.ENTRY_4XX_LIMIT) || 3;
