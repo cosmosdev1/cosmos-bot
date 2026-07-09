@@ -19,7 +19,7 @@ import { log, warn } from "./log.mjs";
 
 const TABLE = JSON.parse(readFileSync(new URL("./qtable-data.json", import.meta.url), "utf8"));
 const N = (k, f) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : f; };
-const TICK_MS = N("QTABLE_TICK_MS", 5000);
+const TICK_MS = N("QTABLE_TICK_MS", 3000); // owner: order speed is critical - faster trigger detection
 const DISCOVER_MS = N("QTABLE_DISCOVER_MS", 120000);
 const EDGE = N("QTABLE_EDGE", 0.12); // hardened 8->12pp (owner 2026-07-09): day-one calibration showed ~11pp claim-vs-realized deficit
 const MIN_P = N("QTABLE_MIN_P", 0.50);
@@ -29,6 +29,10 @@ const MIN_VOL = N("QTABLE_MIN_VOL", 100);            // $ traded floor per marke
 const MAX_SPREAD_C = N("QTABLE_MAX_SPREAD_C", 10);   // book sanity
 const CANDLE_HAIRCUT = N("QTABLE_CANDLE_HAIRCUT", 0.05); // Chainlink buffer + candle miscalibration margin (day-one: 15m realized 54% WR vs 57% breakeven at 8pp) -> candles need 17pp total
 const SPOT_STALE_MS = N("QTABLE_SPOT_STALE_MS", 15000);
+// Fill-reconstruction audit (92 real fills, 2026-07-09): entries with |d| < 5bps realized 49% WR
+// (coin-flips - spot hugging the strike, table P hypersensitive to spot jitter between tick and
+// fill), while 5-15bps realized 82%. Tiny-|d| "edges" are model noise, not signal - floor them.
+const MIN_ABS_D = N("QTABLE_MIN_ABS_D", 0.0005);
 const DRY = process.env.QTABLE_DRY === "1";
 
 const FRAME_MS = { "15m": 900e3, "1h": 3600e3, "4h": 14400e3, "1d": 86400e3 };
@@ -173,6 +177,7 @@ export function startQTable(deps) {
       const S = spot.px[m.sym];
       if (!S) continue;
       const d = (S - K) / K;
+      if (Math.abs(d) < MIN_ABS_D) continue;                    // knife's-edge spot: P is noise there
       const elapsedPct = 100 * (1 - remaining / frameMs);
       const look = lookupP(m.sym, m.frame, elapsedPct, d);
       if (!look) continue;
@@ -181,6 +186,7 @@ export function startQTable(deps) {
       // cheap pre-trigger: only touch the book when an order is even possible
       const pMax = Math.max(look.p, 1 - look.p) - haircut;
       if (pMax < MIN_P || pMax - EDGE < 0.02) continue;
+      const tTrig = Date.now(); // trigger hit: measure book+order latency (owner budget: <=1s)
       const [askA, askB] = await Promise.all([
         look.p - haircut >= MIN_P ? bestAskC(m.tokenA) : null,
         (1 - look.p) - haircut >= MIN_P ? bestAskC(m.tokenB) : null,
@@ -214,7 +220,7 @@ export function startQTable(deps) {
       store.save(positions);
       state.cash -= orderUsd; state.deployed += orderUsd; openQt++;
       done.add(cid); tracked.delete(cid);
-      log(`BUY  [qtable] ${outcome} @ ~${priceCents}c · $${orderUsd.toFixed(2)} · P=${(dec.p * 100).toFixed(1)}% d=${(d * 100).toFixed(3)}% t=${elapsedPct.toFixed(0)}% ${m.frame} · ${m.q.slice(0, 44)}`);
+      log(`BUY  [qtable] ${outcome} @ ~${priceCents}c · $${orderUsd.toFixed(2)} · P=${(dec.p * 100).toFixed(1)}% d=${(d * 100).toFixed(3)}% t=${elapsedPct.toFixed(0)}% ${m.frame} · lat=${Date.now() - tTrig}ms · ${m.q.slice(0, 44)}`);
     }
     if (process.env.QTABLE_DEBUG === "1" && ++tickN % 6 === 0) log(`qtable: tracked ${tracked.size} · in-window ${dbg.inWin} · evaluated ${dbg.evald} · book-checked ${dbg.booked}`);
   }
