@@ -369,6 +369,32 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
 // Strategy exit for one in-play SPORTS position. Asks the server (which tracks the live game) and
 // executes: SELL_PARTIAL = the one-time 60% take-profit at 85c (rest held to resolution);
 // SELL_HALF/SELL_ALL kept for backward compatibility with any legacy verdict.
+// TOP5 mirror exits: the copied wallet sold >10% of his shares -> sell the SAME fraction (owner
+// spec). Exactly-once per step via the server seq. Returns true if it acted this cycle (caller
+// then skips the generic exits for this position until next cycle).
+async function top5ExitStep(cosmos, pm, positions, pos) {
+  let d = null;
+  try { d = await cosmos.top5Exit(pos); }
+  catch (e) { warn("top5-exit:", e.message); return false; }
+  if (!d || d.action !== "SELL_PARTIAL") return false;
+  const fraction = Math.min(1, Number(d.fraction) || 0);
+  if (fraction <= 0) return false;
+  const cur = await pm.getPriceCents(pos.token_id);
+  const chunk = fraction >= 0.99 ? pos.size_shares : Math.floor(pos.size_shares * fraction);
+  // Polymarket's ~$1 minimum: if the chunk can't clear it, mirror the intent with a full exit.
+  const full = chunk >= pos.size_shares || chunk < 1 || (cur != null && chunk * cur < 110);
+  const r = await marketableSell(cosmos, pm, full ? pos : { ...pos, size_shares: chunk }, "TAKE_PROFIT");
+  if (r.ok) {
+    pos.top5_seq = Number(d.seq) || (pos.top5_seq ?? 0) + 1;
+    if (!full) pos.size_shares -= chunk;
+    store.save(positions);
+    log(`TOP5 mirror-sell ${full ? "ALL" : chunk + " shares (" + Math.round(fraction * 100) + "%)"} ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${d.reason || ""}`);
+  } else if (!r.held) {
+    warn("top5 mirror-sell failed (will retry next cycle):", r.status);
+  }
+  return r.ok;
+}
+
 async function sportsExitStep(cosmos, pm, positions, pos) {
   const cur = await pm.getPriceCents(pos.token_id);
   let d = null;
@@ -587,6 +613,12 @@ async function cycle(cosmos, pm) {
         else warn("quant-stop exit failed (will retry next cycle):", r.status);
         continue; // next cycle's reconcile removes it once the holding is gone
       }
+    }
+    // TOP5 mirror exits run FIRST for copies: if the whale is selling, we follow immediately;
+    // otherwise the position falls through to the normal exits below.
+    if (pos.source === "top5") {
+      const acted = await top5ExitStep(cosmos, pm, positions, pos);
+      if (acted) continue;
     }
     // EDGE RULES FIRST, for EVERY position type - sports included. Sports used to skip straight
     // to the server strategy, so the 97c+ lock-in and <=3c salvage never fired on them.

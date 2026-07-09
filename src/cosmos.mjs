@@ -71,6 +71,17 @@ export function makeCosmos(config) {
       return getJSON(`/api/v1/sports-exit?${q}`); // { action, fraction?, reason }
     },
 
+    // Mirror-exit verdict for a TOP5 copy: when the copied wallet sold >10% of his shares, the
+    // server returns SELL_PARTIAL with the same fraction (+ a seq so each step executes once).
+    async top5Exit(pos) {
+      const q = new URLSearchParams({
+        cid: pos.condition_id,
+        outcome: String(pos.outcome ?? ""),
+        seq: String(pos.top5_seq ?? 0),
+      });
+      return getJSON(`/api/v1/top5-exit?${q}`); // { action, fraction?, seq?, reason }
+    },
+
     // Model re-price for a HELD quant (crypto) position (source "quant"). The server reprices the
     // position with the SAME model that drove entry and returns { ok, modelP, tauMin }. The
     // model-stop RULE (thresholds, shadow/live) lives in the bot; this just fetches the fresh modelP.
