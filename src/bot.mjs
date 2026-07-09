@@ -855,8 +855,12 @@ async function main() {
     warn("geoblock check failed:", geo.status ?? geo.error);
   }
 
-  // QTABLE fast engine (5s tick, direct orders). Kill: QTABLE_ENABLED=0.
-  if (process.env.QTABLE_ENABLED !== "0") {
+  // QTABLE fast engine - PAUSED by owner 2026-07-09: the table's fit had a structural bug
+  // (unconditional-threshold shortcut + off-by-one elapsed labels) that inflated P with |d|,
+  // so "edge" selected model error (fleet -18.6% in 24h; the corrected model showed the real
+  // edge was <4pp on 78% of fills). Re-enable ONLY with a conditionally-refit table via
+  // QTABLE_ENABLED=1. Open qtable positions still exit normally (TP/salvage/resolution).
+  if (process.env.QTABLE_ENABLED === "1") {
     startQTable({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 
