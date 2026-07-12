@@ -30,7 +30,7 @@ const TICK_MS = N("QTABLE2_TICK_MS", 250);
 const DRY = process.env.QTABLE2_DRY === "1";
 // guards — identical to the validated qtable-live engine
 const MIN_D = 0.0005, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
-const MIN_P = N("QTABLE2_MIN_P", 0.60);         // owner: only trade when the model prob >= 60%
+const MIN_P = N("QTABLE2_MIN_P", 0.55);         // owner 2026-07-12: only trade when the model prob >= 55%
 const MIN_PRICE = 0.05, MAX_PRICE = 0.97;
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
 const MAX_EDGE = N("QTABLE2_MAX_EDGE", 3.0);    // >3x P/ask almost always = wrong reference, not edge

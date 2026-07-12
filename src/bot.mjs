@@ -874,10 +874,10 @@ async function main() {
 
   // QTABLE2 - the CORRECTED candle engine (refit tow-aware table + Chainlink RTDS spot/reference +
   // strict guards; the fixed successor to qtable.mjs, which used the buggy pre-refit table + Binance
-  // spot). PER-DEPLOYMENT gate: set QTABLE2_ENABLED=1 as a Fly secret on ONE user's app to run it there
-  // ONLY - every other bot leaves the flag unset and never even imports the module (dynamic import).
+  // spot). ON BY DEFAULT for ALL users (owner rollout 2026-07-12): runs unless QTABLE2_ENABLED=0.
+  // Each bot sizes from its own dashboard % (QTABLE2_STAKE_USD>0 overrides to a fixed $/trade).
   // DRY preview: QTABLE2_DRY=1 logs would-be fills, places nothing. See src/qtable2.mjs.
-  if (process.env.QTABLE2_ENABLED === "1") {
+  if (process.env.QTABLE2_ENABLED !== "0") {
     const { startQTable2 } = await import("./qtable2.mjs");
     startQTable2({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
