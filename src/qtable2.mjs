@@ -12,7 +12,7 @@
 // Spawned from main() ONLY when QTABLE2_ENABLED=1 (per-deployment gate — set as a Fly secret on ONE
 // user's app; every other bot leaves the flag unset and never even imports this file). Runs as a fast
 // ~250ms side-loop next to the 30s cycle. DRY: QTABLE2_DRY=1 logs would-be fills, places nothing.
-import { readFileSync } from "node:fs";
+import { readFileSync, appendFileSync } from "node:fs";
 import { log, warn } from "./log.mjs";
 
 // The bot runs on node:20-slim, which has NO global WebSocket. Without this the Chainlink RTDS feed
@@ -29,7 +29,8 @@ const MAX_OPEN = N("QTABLE2_MAX_OPEN", 8);
 const TICK_MS = N("QTABLE2_TICK_MS", 250);
 const DRY = process.env.QTABLE2_DRY === "1";
 // guards — identical to the validated qtable-live engine
-const MIN_D = 0.0005, MIN_P = 0.5, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
+const MIN_D = 0.0005, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
+const MIN_P = N("QTABLE2_MIN_P", 0.60);         // owner: only trade when the model prob >= 60%
 const MIN_PRICE = 0.05, MAX_PRICE = 0.97;
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
 const MAX_EDGE = N("QTABLE2_MAX_EDGE", 3.0);    // >3x P/ask almost always = wrong reference, not edge
@@ -40,6 +41,11 @@ const WS_SYM = { "btc/usd": "BTCUSDT", "eth/usd": "ETHUSDT" };
 const API_SYM = { BTCUSDT: "BTC", ETHUSDT: "ETH" };
 const VARIANT = { "5m": "fiveminute", "15m": "fifteenminute" };
 const TABLE = JSON.parse(readFileSync(new URL("./qtable-live-data.json", import.meta.url), "utf8"));
+
+// Durable per-trade ledger on the persistent volume (survives restarts) — read by src/qtable2-report.mjs.
+const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
+const LEDGER = `${DATA_DIR}/qtable2-trades.ndjson`;
+function appendLedger(rec) { try { appendFileSync(LEDGER, JSON.stringify(rec) + "\n"); } catch (e) { warn("qtable2 ledger:", e?.message); } }
 
 // ---- table lookup (tow-aware; ported from lib/qtable.ts) ----
 function towBucket(ms, buckets) {
@@ -192,6 +198,7 @@ export function startQTable2(deps) {
       const pAbove = lookupP(m.sym, TABLE_FRAME[m.frame], elapsed, d, towB);
       if (pAbove == null) continue;
       const pUp = pAbove, pDn = 1 - pAbove;
+      const tBook = Date.now();                                        // start of book-fetch + order latency
       const cands = [];
       if (pUp >= MIN_P) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= EDGE && e <= MAX_EDGE) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
       if (pDn >= MIN_P) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= EDGE && e <= MAX_EDGE) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
@@ -199,23 +206,26 @@ export function startQTable2(deps) {
       if (!pick) continue;
 
       stats.signals++;
-      const priceCents = Math.min(97, Math.round(pick.ask * 100) + 1);  // cross the ask
+      const bookMs = Date.now() - tBook;                               // book-fetch + decision latency
+      const priceCents = Math.min(97, Math.round(pick.ask * 100) + 1); // cross the ask
       const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(STAKE, priceCents));
       const orderUsd = (shares * priceCents) / 100;
-      const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% edge=${pick.edge.toFixed(3)} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}% · ${m.question.slice(0, 40)}`;
-      if (orderUsd > state.cash) { done.add(m.cid); continue; }         // no room; re-armed next discover
-      if (DRY) { log(`qtable2 DRY would BUY ${tag}`); done.add(m.cid); continue; }
+      const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% edge=${pick.edge.toFixed(3)} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
+      if (orderUsd > state.cash) { done.add(m.cid); continue; }        // no room; re-armed next discover
+      if (DRY) { log(`qtable2 DRY would BUY ${tag} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 36)}`); done.add(m.cid); continue; }
 
       done.add(m.cid); // one shot per market
       const t0 = Date.now();
       const r = await placeWithRetry(pm, { tokenId: pick.token, side: "BUY", sizeShares: shares, priceCents, orderType: "FAK" }, 2, 80);
-      const lat = Date.now() - t0;
+      const orderMs = Date.now() - t0, totalMs = bookMs + orderMs;     // fresh-spot -> order landed
       stats.orders++;
+      const rec = { ts: new Date().toISOString(), cid: m.cid, q: m.question, sym: m.sym, frame: m.frame, side: pick.side, outcome: pick.outcome, entry_cents: priceCents, edge: Number(pick.edge.toFixed(4)), p: Number(pick.p.toFixed(4)), d_pct: Number((d * 100).toFixed(4)), elapsed_pct: Number(elapsed.toFixed(1)), size_usd: Number(orderUsd.toFixed(2)), shares: Number(shares.toFixed(2)), token_id: pick.token, end_ms: m.endMs, spot_age_ms: spotAge, book_ms: bookMs, order_ms: orderMs, total_ms: totalMs };
       if (!r.ok) {
         const f = (fails.get(m.cid) ?? 0) + 1; fails.set(m.cid, f);
         if (!(f >= 5 || (typeof r.status === "number" && r.status >= 400 && r.status < 500 && f >= 3))) done.delete(m.cid); // let it retry next tick
         else markets.delete(m.cid);
-        log(`FAIL [qtable2] ${tag} · lat=${lat}ms · ${String(r.error ?? r.err ?? r.status ?? "").slice(0, 120)}`);
+        appendLedger({ ...rec, ok: false, err: String(r.error ?? r.err ?? r.status ?? "").slice(0, 140) });
+        log(`FAIL [qtable2] ${tag} · order=${orderMs}ms · ${String(r.error ?? r.err ?? r.status ?? "").slice(0, 110)}`);
         continue;
       }
       stats.fills++;
@@ -223,12 +233,13 @@ export function startQTable2(deps) {
       positions[m.cid] = {
         condition_id: m.cid, token_id: pick.token, outcome: pick.outcome, source: "qtable",
         entry_cents: priceCents, size_usd: orderUsd, size_shares: shares, entry_whales: [],
-        market_question: m.question, opened_at: new Date().toISOString(),
+        market_question: m.question, opened_at: rec.ts,
       };
       store.save(positions);
+      appendLedger({ ...rec, ok: true });
       state.cash -= orderUsd; state.deployed += orderUsd; openQt++;
       markets.delete(m.cid);
-      log(`BUY  [qtable2] ${tag} · $${orderUsd.toFixed(2)} · lat=${lat}ms ✓`);
+      log(`BUY  [qtable2] ${tag} · $${orderUsd.toFixed(2)} · spotAge=${spotAge}ms book=${bookMs}ms order=${orderMs}ms total=${totalMs}ms${totalMs > 1000 ? " ⚠SLOW" : ""} · ${m.question.slice(0, 36)} ✓`);
     }
   }
 
