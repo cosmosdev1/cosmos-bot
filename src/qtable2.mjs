@@ -22,7 +22,7 @@ const WSImpl = globalThis.WebSocket ?? (await import("ws")).WebSocket;
 const WS_OPTS = globalThis.WebSocket ? undefined : { headers: { Origin: "https://polymarket.com" } };
 
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
-const STAKE = N("QTABLE2_STAKE_USD", 2);
+const STAKE = N("QTABLE2_STAKE_USD", 0);        // fixed $/trade override; 0 (default) = account's dashboard % sizing (e.g. 3%)
 const EDGE = N("QTABLE2_EDGE", 1.08);           // multiplicative: P / best-ask
 const COINS = (process.env.QTABLE2_COINS || "BTCUSDT").split(",").map((s) => s.trim());
 const MAX_OPEN = N("QTABLE2_MAX_OPEN", 8);
@@ -127,7 +127,7 @@ async function bestAsk(tokenId) {
 }
 
 export function startQTable2(deps) {
-  const { pm, cosmos, store, placeWithRetry, sharesFor, state } = deps;
+  const { pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state } = deps;
   const markets = new Map();  // cid -> descriptor
   const apiRef = {};          // cid -> backfilled window-open reference
   const done = new Set();     // cid -> already ordered / permanently skipped this run
@@ -207,8 +207,10 @@ export function startQTable2(deps) {
 
       stats.signals++;
       const bookMs = Date.now() - tBook;                               // book-fetch + decision latency
+      // sizing: fixed $ if QTABLE2_STAKE_USD>0, else the account's dashboard % (e.g. 3% flat), floored at $2
+      const sizeUsd = STAKE > 0 ? STAKE : Math.max(2, sizeForSignal(state.sizing, { source: "qtable", outcome: pick.outcome }, state.portfolio, state.deployed));
       const priceCents = Math.min(97, Math.round(pick.ask * 100) + 1); // cross the ask
-      const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(STAKE, priceCents));
+      const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(sizeUsd, priceCents));
       const orderUsd = (shares * priceCents) / 100;
       const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% edge=${pick.edge.toFixed(3)} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
       if (orderUsd > state.cash) { done.add(m.cid); continue; }        // no room; re-armed next discover
@@ -244,12 +246,16 @@ export function startQTable2(deps) {
   }
 
   (async function run() {
-    log(`qtable2: engine ON · $${STAKE}/trade · edge>=${EDGE} · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge>=${EDGE} · minP ${(MIN_P * 100).toFixed(0)}% · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const stopWs = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
     const bi = setInterval(() => backfillRefs().catch(() => {}), 4_000);
-    const si = setInterval(() => log(`qtable2 … tracking ${markets.size} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills}`), 30_000);
+    const si = setInterval(() => {
+      const bh = hist["BTCUSDT"]; const age = bh?.length ? Date.now() - bh[bh.length - 1].t : Infinity;
+      const feed = age === Infinity ? "NO FEED ⚠" : `$${(spot["BTCUSDT"] ?? 0).toFixed(0)} ${age}ms`;
+      log(`qtable2 … tracking ${markets.size} · btc ${feed} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills}`);
+    }, 30_000);
     while (alive) {
       const t0 = Date.now();
       try { await tick(); } catch (e) { warn("qtable2:", e?.message); }
