@@ -30,7 +30,11 @@ const TICK_MS = N("QTABLE2_TICK_MS", 250);
 const DRY = process.env.QTABLE2_DRY === "1";
 // guards — identical to the validated qtable-live engine
 const MIN_D = 0.0005, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
-const MIN_P = N("QTABLE2_MIN_P", 0.55);         // owner 2026-07-12: only trade when the model prob >= 55%
+// Tiered entry (owner 2026-07-12): floor at 35% model prob; the lower prob band needs a bigger edge.
+const MIN_P = N("QTABLE2_MIN_P", 0.35);         // absolute floor — never trade a side below 35% model prob
+const HIGH_P = N("QTABLE2_HIGH_P", 0.55);       // p >= HIGH_P uses EDGE; MIN_P..HIGH_P uses the stricter EDGE_MID
+const EDGE_MID = N("QTABLE2_EDGE_MID", 1.15);   // required edge (P/ask) on the 35%-54% band
+const edgeReqFor = (p) => (p >= HIGH_P ? EDGE : EDGE_MID); // (only called when p >= MIN_P)
 const MIN_PRICE = 0.05, MAX_PRICE = 0.97;
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
 const MAX_EDGE = N("QTABLE2_MAX_EDGE", 3.0);    // >3x P/ask almost always = wrong reference, not edge
@@ -200,8 +204,8 @@ export function startQTable2(deps) {
       const pUp = pAbove, pDn = 1 - pAbove;
       const tBook = Date.now();                                        // start of book-fetch + order latency
       const cands = [];
-      if (pUp >= MIN_P) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= EDGE && e <= MAX_EDGE) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
-      if (pDn >= MIN_P) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= EDGE && e <= MAX_EDGE) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
+      if (pUp >= MIN_P) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pUp) && e <= MAX_EDGE) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
+      if (pDn >= MIN_P) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pDn) && e <= MAX_EDGE) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
       const pick = cands.sort((a, b) => b.edge - a.edge)[0];
       if (!pick) continue;
 
@@ -246,7 +250,7 @@ export function startQTable2(deps) {
   }
 
   (async function run() {
-    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge>=${EDGE} · minP ${(MIN_P * 100).toFixed(0)}% · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${EDGE}@p≥${(HIGH_P * 100).toFixed(0)}% / ${EDGE_MID}@p${(MIN_P * 100).toFixed(0)}-${(HIGH_P * 100).toFixed(0)}% · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const stopWs = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
