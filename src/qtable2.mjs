@@ -15,6 +15,12 @@
 import { readFileSync } from "node:fs";
 import { log, warn } from "./log.mjs";
 
+// The bot runs on node:20-slim, which has NO global WebSocket. Without this the Chainlink RTDS feed
+// silently retries forever (the reconnect catch swallows the ReferenceError) and the engine never gets
+// spot -> never signals. Fall back to the `ws` package (already a transitive dep, pinned in package.json).
+const WSImpl = globalThis.WebSocket ?? (await import("ws")).WebSocket;
+const WS_OPTS = globalThis.WebSocket ? undefined : { headers: { Origin: "https://polymarket.com" } };
+
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const STAKE = N("QTABLE2_STAKE_USD", 2);
 const EDGE = N("QTABLE2_EDGE", 1.08);           // multiplicative: P / best-ask
@@ -67,7 +73,7 @@ const refFor = (sym, windowStartMs) => {
 function connectChainlink() {
   let ws, stopped = false;
   const go = () => {
-    try { ws = new WebSocket("wss://ws-live-data.polymarket.com"); } catch { return setTimeout(go, 1500); }
+    try { ws = new WSImpl("wss://ws-live-data.polymarket.com", WS_OPTS); } catch { return setTimeout(go, 1500); }
     ws.onopen = () => { ws.send(JSON.stringify({ action: "subscribe", subscriptions: [
       { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
       { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "eth/usd" }) },
