@@ -872,6 +872,16 @@ async function main() {
     startQTable({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 
+  // QTABLE2 - the CORRECTED candle engine (refit tow-aware table + Chainlink RTDS spot/reference +
+  // strict guards; the fixed successor to qtable.mjs, which used the buggy pre-refit table + Binance
+  // spot). PER-DEPLOYMENT gate: set QTABLE2_ENABLED=1 as a Fly secret on ONE user's app to run it there
+  // ONLY - every other bot leaves the flag unset and never even imports the module (dynamic import).
+  // DRY preview: QTABLE2_DRY=1 logs would-be fills, places nothing. See src/qtable2.mjs.
+  if (process.env.QTABLE2_ENABLED === "1") {
+    const { startQTable2 } = await import("./qtable2.mjs");
+    startQTable2({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
+  }
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
     maybeSelfUpdate(); // pull + relaunch on a new commit (throttled to every SELF_UPDATE_MS)

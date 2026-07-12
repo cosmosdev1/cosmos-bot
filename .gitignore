@@ -6,3 +6,7 @@ positions.json
 seen.json
 # app-specific (holds YOUR fly app name + volume mount) - each install generates its own
 fly.toml
+
+# QTABLE live-test key file — NEVER commit
+qtable-live.env
+*.env
