@@ -403,6 +403,35 @@ async function top5ExitStep(cosmos, pm, positions, pos) {
   return r.ok;
 }
 
+// COPYTRADE mirror exit: the driving whale cut >=10% below his peak shares -> we sell the same fraction
+// of OUR original copied position (owner spec 2026-07-13). Steps fire exactly once via the server seq;
+// seq>=10 (or fraction 1) = full exit. Mirrors top5ExitStep. Returns true if it acted this cycle.
+async function copyExitStep(cosmos, pm, positions, pos) {
+  let d = null;
+  try { d = await cosmos.copyExit(pos); }
+  catch (e) { warn("copy-exit:", e.message); return false; }
+  if (!d || d.action !== "SELL_PARTIAL") return false;
+  const fraction = Math.min(1, Number(d.fraction) || 0);
+  if (fraction <= 0) return false;
+  if (pos.copy_orig_shares == null) { pos.copy_orig_shares = pos.size_shares; store.save(positions); }
+  const cur = await pm.getPriceCents(pos.token_id);
+  const base = d.of === "original" ? pos.copy_orig_shares : pos.size_shares;
+  const chunk = fraction >= 0.99 ? pos.size_shares : Math.min(pos.size_shares, Math.floor(base * fraction));
+  const full = chunk >= pos.size_shares || chunk < 1 || (cur != null && chunk * cur < 110); // ~$1 min -> full exit
+  const r = await marketableSell(cosmos, pm, full ? pos : { ...pos, size_shares: chunk }, "TAKE_PROFIT");
+  if (r.ok) {
+    const sold = full ? pos.size_shares : chunk;
+    pos.copy_seq = Number(d.seq) || (pos.copy_seq ?? 0) + 1;
+    if (!full) pos.size_shares -= chunk;
+    store.save(positions);
+    cosmos.copyReport({ wallet: pos.copy_wallet, condition_id: pos.condition_id, outcome: pos.outcome, category: pos.copy_category, action: "SELL", shares: sold, price_cents: r.sellPrice ?? r.mid ?? cur ?? 0, size_usd: Number(((sold * (r.sellPrice ?? r.mid ?? cur ?? 0)) / 100).toFixed(2)), market_question: pos.market_question }).catch(() => {});
+    log(`COPY mirror-sell ${full ? "ALL" : chunk + " shares (" + Math.round(fraction * 100) + "%)"} ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${d.reason || ""}`);
+  } else if (!r.held) {
+    warn("copy mirror-sell failed (will retry next cycle):", r.status);
+  }
+  return r.ok;
+}
+
 async function sportsExitStep(cosmos, pm, positions, pos) {
   const cur = await pm.getPriceCents(pos.token_id);
   let d = null;
@@ -462,7 +491,9 @@ async function holdingsMap(pm) {
   const arr = await pm.getMyPositions();
   if (arr == null) return null; // the /positions fetch failed - signal "unknown", NOT "no positions"
   const m = new Map();
-  for (const p of arr) m.set(p.condition_id, p);
+  // Key by condition_id#token_id so BOTH sides of a market coexist (copytrade can hold opposite sides
+  // when two whales split). Bare-cid lookups moved to the heldCids set / matchHeld() helper in cycle().
+  for (const p of arr) m.set(`${p.condition_id}#${p.token_id}`, p);
   return m;
 }
 
@@ -482,17 +513,25 @@ async function cycle(cosmos, pm) {
   const positions = store.load();
   const heldRaw = await holdingsMap(pm); // null = the /positions fetch FAILED (not "no positions")
   const holdingsOk = heldRaw != null;
-  const held = heldRaw ?? new Map();
+  const held = heldRaw ?? new Map(); // keyed by condition_id#token_id
+  // heldCids = markets we hold on ANY side; matchHeld = the held row for one position's exact (cid,token).
+  const heldCids = new Set([...held.values()].map((h) => h.condition_id));
+  const matchHeld = (p) => {
+    if (p.token_id) { const h = held.get(`${p.condition_id}#${p.token_id}`); if (h) return h; }
+    for (const h of held.values()) if (h.condition_id === p.condition_id) return h; // legacy pos without a stored token
+    return null;
+  };
   // Only reconcile-delete when we actually got the wallet holdings. If the fetch failed, KEEP the
   // tracked positions - deleting them would drop their exits AND collapse `deployed` to 0 (cash sizing).
   if (holdingsOk) {
-    for (const cid of Object.keys(positions)) {
-      const h = held.get(cid);
-      if (!h || h.size_shares < 1) { delete positions[cid]; continue; } // never filled or already sold
-      positions[cid].size_shares = h.size_shares; // sync to actual holding
-      if (h.entry_cents > 0) positions[cid].entry_cents = h.entry_cents; // sync the REAL avg fill price
-      if (!positions[cid].token_id) positions[cid].token_id = h.token_id;
-      if (!positions[cid].end_date && h.end_date) positions[cid].end_date = h.end_date; // holdings now carry it
+    for (const key of Object.keys(positions)) {
+      const p = positions[key];
+      const h = matchHeld(p); // match by this position's own (cid, token) - so both sides reconcile independently
+      if (!h || h.size_shares < 1) { delete positions[key]; continue; } // never filled or already sold
+      p.size_shares = h.size_shares; // sync to actual holding
+      if (h.entry_cents > 0) p.entry_cents = h.entry_cents; // sync the REAL avg fill price
+      if (!p.token_id) p.token_id = h.token_id;
+      if (!p.end_date && h.end_date) p.end_date = h.end_date; // holdings now carry it
     }
 
     // RE-ADOPTION: wallet holdings the bot BOUGHT but lost track of (the old single-page holdings
@@ -509,19 +548,24 @@ async function cycle(cosmos, pm) {
     }
     if (global.__botTokens) {
       let adopted = 0;
+      // match by (cid, token) pair so a held side isn't considered "already tracked" just because the
+      // OTHER side of that market is in positions.json (copytrade opposite-side holdings).
+      const havePair = new Set(Object.values(positions).map((p) => `${p.condition_id}#${p.token_id}`));
       for (const h of held.values()) {
-        if (positions[h.condition_id]) continue;
+        if (havePair.has(`${h.condition_id}#${h.token_id}`)) continue;
         if (!h.token_id || !global.__botTokens.has(String(h.token_id))) continue;
         // A holding under 1 share is worth under $1 (a share pays at most $1), which is below
         // Polymarket's ~$1 minimum order, so it can NEVER be sold. Don't re-adopt un-exitable dust -
         // it just creates an exit that fails every cycle. It settles automatically at resolution.
         if (!(h.size_shares >= 1)) continue;
-        positions[h.condition_id] = {
+        const key = positions[h.condition_id] ? `${h.condition_id}#${h.token_id}` : h.condition_id; // free primary else composite
+        positions[key] = {
           condition_id: h.condition_id, token_id: h.token_id, outcome: h.outcome, source: "adopted",
           entry_cents: h.entry_cents || h.cur_cents || 50, size_usd: Math.round(h.cur_value * 100) / 100,
           size_shares: h.size_shares, entry_whales: [], market_question: h.title || "",
           end_date: h.end_date ?? undefined, opened_at: new Date().toISOString(),
         };
+        havePair.add(`${h.condition_id}#${h.token_id}`);
         adopted++;
       }
       if (adopted) log(`re-adopted ${adopted} bot-bought position(s) that had fallen out of tracking`);
@@ -605,8 +649,8 @@ async function cycle(cosmos, pm) {
   // position -> a per-token 429 storm that force-sold held positions at -50%).
   const adviceMap = await batchAdvice(cosmos, settings, Object.values(positions));
   let endDateLookups = 0; // cap the per-cycle gamma lookups for the horizon stop
-  for (const cid of Object.keys(positions)) {
-    const pos = positions[cid];
+  for (const key of Object.keys(positions)) {
+    const pos = positions[key];
     // Lazy end-date lookup (max a few per cycle) so the horizon stop knows each position's
     // capital-lock. Cached forever in positions.json; "none" = gamma had no date (skip rules).
     if (pos.end_date === undefined && endDateLookups < 5) {
@@ -633,6 +677,12 @@ async function cycle(cosmos, pm) {
       const acted = await top5ExitStep(cosmos, pm, positions, pos);
       if (acted) continue;
     }
+    // COPYTRADE mirror exits run FIRST for copies: follow the whale's peak-share cuts immediately;
+    // otherwise the position falls through to the edge rules below (99c lock-in / <=3c salvage only).
+    if (pos.source === "copytrade") {
+      const acted = await copyExitStep(cosmos, pm, positions, pos);
+      if (acted) continue;
+    }
     // EDGE RULES FIRST, for EVERY position type - sports included. Sports used to skip straight
     // to the server strategy, so the 97c+ lock-in and <=3c salvage never fired on them.
     const edge = await edgeExit(pm, pos);
@@ -645,6 +695,9 @@ async function cycle(cosmos, pm) {
     // QTABLE: edge rules only (99c lock-in or the <=3c salvage) - these resolve within minutes to
     // hours and the table priced the entry; no advice brain, no user TP/SL, no horizon stop.
     if (pos.source === "qtable" && !v) continue;
+    // COPYTRADE: edge rules only (99c lock-in / <=3c salvage) beyond the whale mirror above. We follow
+    // the whale, NOT the user's TP/SL or the AI advice brain or the horizon stop.
+    if (pos.source === "copytrade" && !v) continue;
     // HORIZON STOP: dead-money positions get sold no matter what the TP/SL settings say.
     if (!v) {
       const hz = horizonVerdict(pos, edge.cur);
@@ -655,7 +708,7 @@ async function cycle(cosmos, pm) {
       // salvage at minute 85+ when the favorite isn't winning, rest to resolution) - NOT the
       // user's TP/SL settings.
       if (pos.source === "sports") { await sportsExitStep(cosmos, pm, positions, pos); continue; }
-      v = await decideExit(cosmos, pm, settings, pos, edge.cur, adviceMap.get(cid));
+      v = await decideExit(cosmos, pm, settings, pos, edge.cur, adviceMap.get(pos.condition_id));
     }
     if (!v || v.action === "HOLD") continue;
     const r = await marketableSell(cosmos, pm, pos, v.action);
@@ -700,7 +753,7 @@ async function cycle(cosmos, pm) {
 
     for (const s of feed.signals) {
       if (!s.condition_id) continue;
-      if (seen[s.condition_id] || positions[s.condition_id] || held.has(s.condition_id)) continue; // already evaluated / held
+      if (seen[s.condition_id] || positions[s.condition_id] || heldCids.has(s.condition_id)) continue; // already evaluated / held (any side)
       if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break; // full — leave for when a slot frees
 
       let sizeUsd = sizeForSignal(sizing, s, portfolioValue, deployed);
@@ -880,6 +933,14 @@ async function main() {
   if (process.env.QTABLE2_ENABLED === "1") {
     const { startQTable2 } = await import("./qtable2.mjs");
     startQTable2({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
+  }
+
+  // COPYTRADE - mirror the hand-picked whales at a per-user RATIO of their money-in (owner spec
+  // 2026-07-13). Fast side-loop OPENS + SCALES IN; the whale's peak-share cuts exit in the main cycle
+  // (copyExitStep). Runs ONLY where COPYTRADE_ENABLED=1; DRY preview: COPYTRADE_DRY=1. See src/copytrade.mjs.
+  if (process.env.COPYTRADE_ENABLED === "1") {
+    const { startCopyTrade } = await import("./copytrade.mjs");
+    startCopyTrade({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 
   // eslint-disable-next-line no-constant-condition

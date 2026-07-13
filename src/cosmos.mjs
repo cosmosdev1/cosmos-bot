@@ -102,6 +102,23 @@ export function makeCosmos(config) {
       }
     },
 
+    // The active whale-copy signals (source "copytrade"). Whale-side numbers only — the bot applies the
+    // per-user ratio locally. Separate from the main feed because copy sizing isn't the standard % sizing.
+    copySignals: () => getJSON("/api/v1/copy-signals"), // { count, signals: [{ condition_id, token_id, outcome, category, wallets:[{wallet,cost_usd,avg_trade_usd}], his_cost_usd, entry_cents, max_entry_cents, sell_seq, end_date }] }
+
+    // Mirror-exit verdict for a COPYTRADE position: when the driving whale cut >=10% below his peak
+    // shares, the server returns SELL_PARTIAL with that fraction (of our original) + a seq (once per step).
+    async copyExit(pos) {
+      const q = new URLSearchParams({ cid: pos.condition_id, outcome: String(pos.outcome ?? ""), seq: String(pos.copy_seq ?? 0) });
+      return getJSON(`/api/v1/copy-exit?${q}`); // { action, fraction?, seq?, reason }
+    },
+
+    // Report a copy fill (BUY on entry/scale-in, SELL on a mirror step) to the per-user admin ledger.
+    // Fire-and-forget: never blocks or breaks the copy loop.
+    async copyReport(trade) {
+      try { await fetch(`${base}/api/v1/copy-trade`, { method: "POST", headers, body: JSON.stringify({ trade }) }); } catch { /* observability only */ }
+    },
+
     // Report a placed order to Cosmos: records the $0.09 fee and returns whether the daily
     // spend limit has been reached (paused). The order itself is posted directly to Polymarket
     // by the bot — Cosmos never touches keys or funds.
