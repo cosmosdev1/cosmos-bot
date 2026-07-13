@@ -872,12 +872,12 @@ async function main() {
     startQTable({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 
-  // QTABLE2 - the CORRECTED candle engine (refit tow-aware table + Chainlink RTDS spot/reference +
-  // strict guards; the fixed successor to qtable.mjs, which used the buggy pre-refit table + Binance
-  // spot). ON BY DEFAULT for ALL users (owner rollout 2026-07-12): runs unless QTABLE2_ENABLED=0.
-  // Each bot sizes from its own dashboard % (QTABLE2_STAKE_USD>0 overrides to a fixed $/trade).
-  // DRY preview: QTABLE2_DRY=1 logs would-be fills, places nothing. See src/qtable2.mjs.
-  if (process.env.QTABLE2_ENABLED !== "0") {
+  // QTABLE2 - the CORRECTED candle engine (refit tow-aware table + Chainlink RTDS spot/reference).
+  // PULLED FROM ALL USERS 2026-07-13: a live audit showed the "edge" is a sub-second spike-selection
+  // artifact (model P overstated ~18pp; -13% over 78 trades). Back to OPT-IN - runs ONLY where
+  // QTABLE2_ENABLED=1 (the owner's app, for continued validation). Every other bot leaves it unset
+  // and never loads the module. DRY preview: QTABLE2_DRY=1. See src/qtable2.mjs.
+  if (process.env.QTABLE2_ENABLED === "1") {
     const { startQTable2 } = await import("./qtable2.mjs");
     startQTable2({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
