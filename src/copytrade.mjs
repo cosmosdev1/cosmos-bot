@@ -25,7 +25,10 @@ const MAX_OPEN = N("COPY_MAX_OPEN", 25);
 const MIN_ORDER_USD = N("COPY_MIN_USD", 1);       // Polymarket ~$1 min order = "the first beat"
 const MIN_ADD_USD = N("COPY_MIN_ADD_USD", 1);     // smallest scale-in increment worth an order
 const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy within the on-chain settle window
-const MAX_CENTS = N("COPY_MAX_CENTS", 96);
+// Owner 2026-07-13: never OPEN a new copy above 92c (95c risks 95c to win 5c). But once we're IN, if the
+// whale keeps adding we follow him up — scale-ins are capped only by the sanity ceiling.
+const MAX_ENTRY_CENTS = N("COPY_MAX_ENTRY_CENTS", 92); // new positions
+const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a position we already hold
 
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
 const LEDGER = `${DATA_DIR}/copytrade-trades.ndjson`;
@@ -52,8 +55,9 @@ export function startCopyTrade(deps) {
   async function priceFor(tokenId, capCents) {
     const mid = await pm.getPriceCents(tokenId);
     if (mid == null) return null;
+    if (mid > capCents) return null;                    // market is above our cap -> don't chase it
     const px = Math.min(capCents, Math.round(mid) + 1); // cross toward the ask, capped
-    return px >= 1 && px <= MAX_CENTS ? px : null;
+    return px >= 1 ? px : null;
   }
 
   async function buy(sig, orderUsd, priceCents, kind, positions, existing, key = sig.condition_id) {
@@ -128,7 +132,8 @@ export function startCopyTrade(deps) {
       if (mine) {
         const add = target - (Number(mine.size_usd) || 0);
         if (add < MIN_ADD_USD) continue;                                // no ratio transition worth an order
-        const px = await priceFor(sig.token_id, Math.min(MAX_CENTS, Number(sig.max_entry_cents) || MAX_CENTS));
+        // ALREADY IN: he's reinforcing, so we follow him up — the 92c entry cap does NOT apply here.
+        const px = await priceFor(sig.token_id, MAX_ADD_CENTS);
         if (px == null) continue;
         await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
       } else {
@@ -138,7 +143,8 @@ export function startCopyTrade(deps) {
         // (hold both). Primary holds the SAME side already (any engine) -> don't stack, skip.
         const key = primary ? (sameSide(primary) ? null : compKey) : sig.condition_id;
         if (!key || positions[key]) continue;
-        const px = await priceFor(sig.token_id, Math.min(MAX_CENTS, Number(sig.max_entry_cents) || MAX_CENTS));
+        // NEW ENTRY: hard 92c cap (owner). priceFor returns null if the market is already above it.
+        const px = await priceFor(sig.token_id, Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS));
         if (px == null) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) openCopy++;
