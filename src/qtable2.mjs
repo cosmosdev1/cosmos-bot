@@ -59,10 +59,21 @@ const WS_SYM = { "btc/usd": "BTCUSDT", "eth/usd": "ETHUSDT", "sol/usd": "SOLUSDT
 const SYM_WS = Object.fromEntries(Object.entries(WS_SYM).map(([k, v]) => [v, k]));
 const API_SYM = { BTCUSDT: "BTC", ETHUSDT: "ETH", SOLUSDT: "SOL", XRPUSDT: "XRP", DOGEUSDT: "DOGE" };
 const VARIANT = { "5m": "fiveminute", "15m": "fifteenminute", "1h": "hourly" };
-const TABLE = JSON.parse(readFileSync(new URL("./qtable-live-data.json", import.meta.url), "utf8"));
-// Coins default to EVERY coin the table covers (BTC+ETH today; SOL/XRP/DOGE auto-activate when their
-// refit lands in qtable-live-data.json). QTABLE2_COINS restricts; a coin without table data never trades.
-const COINS = (process.env.QTABLE2_COINS || Object.keys(TABLE.coins).join(",")).split(",").map((s) => s.trim()).filter((c) => TABLE.coins[c]);
+// MEMORY (2026-07-13): the table is loaded PER COIN. The old monolithic qtable-live-data.json was 21MB
+// of JSON across 5 coins and JSON.parse blew it up to ~112MB of heap AT IMPORT TIME — on a 256MB host
+// the OOM killer took down the ENTIRE bot every ~2 minutes (not just qtable2: no feed, no exits, no
+// copytrade — the whole process died). Each coin costs roughly 25MB of heap, so we parse only the ones
+// we actually trade. Default BTC+ETH (~7.4MB -> ~45MB heap) — the config that ran fine before SOL/XRP/
+// DOGE tripled the file. Add coins with QTABLE2_COINS only if the host has the RAM for it.
+const TDIR = new URL("./qtable-data/", import.meta.url);
+const TMETA = JSON.parse(readFileSync(new URL("meta.json", TDIR), "utf8"));
+const WANT = (process.env.QTABLE2_COINS || "BTCUSDT,ETHUSDT").split(",").map((s) => s.trim()).filter(Boolean);
+const TABLE = { meta: TMETA.meta, coins: {} };
+for (const c of WANT) {
+  try { TABLE.coins[c] = JSON.parse(readFileSync(new URL(`${c}.json`, TDIR), "utf8")); }
+  catch { warn(`qtable2: no table data for ${c} — skipping (have: ${TMETA.coins.join(",")})`); }
+}
+const COINS = Object.keys(TABLE.coins);
 
 // Durable per-trade ledger on the persistent volume (survives restarts) — read by src/qtable2-report.mjs.
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
