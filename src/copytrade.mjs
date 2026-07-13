@@ -103,6 +103,7 @@ export function startCopyTrade(deps) {
   }
 
   async function tick() {
+    if (state.copytrade === false) return;                       // server turned the engine off -> stop trading
     if (state.cash == null || state.sizing == null) return;      // no cycle data yet
     let feed;
     try { feed = await cosmos.copySignals(); } catch (e) { warn("copytrade feed:", e.message); return; }

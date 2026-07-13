@@ -497,9 +497,32 @@ async function holdingsMap(pm) {
   return m;
 }
 
+// Strategy engines are SERVER-controlled: users run their own bots, so /api/v1/account is the only
+// switch that reaches the whole fleet. Start each engine the first cycle the server enables it (no
+// restart needed), and mirror the flag into qtState every cycle so turning it OFF stops the engine
+// trading on its next tick - a real kill switch. A local env var still forces one on for testing.
+const engines = { qtable2: false, copytrade: false };
+async function maybeStartEngines(settings, pm, cosmos) {
+  const wantQt = process.env.QTABLE2_ENABLED === "1" || settings.qtable2 === true;
+  const wantCopy = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;
+  qtState.qtable2 = wantQt;       // engines check these each tick (off => stop trading)
+  qtState.copytrade = wantCopy;
+  if (wantQt && !engines.qtable2) {
+    engines.qtable2 = true;
+    const { startQTable2 } = await import("./qtable2.mjs");
+    startQTable2({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
+  }
+  if (wantCopy && !engines.copytrade) {
+    engines.copytrade = true;
+    const { startCopyTrade } = await import("./copytrade.mjs");
+    startCopyTrade({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
+  }
+}
+
 async function cycle(cosmos, pm) {
   const account = await cosmos.account();
   const settings = account.settings;
+  await maybeStartEngines(settings, pm, cosmos).catch((e) => warn("engine start:", e.message));
 
   // --- MASTER STOP: the dashboard Start/Stop switch. When stopped, the bot trades nothing
   // (no entries, no exits) but stays connected and re-checks every cycle, so Start resumes it. ---
@@ -925,23 +948,11 @@ async function main() {
     startQTable({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 
-  // QTABLE2 - the CORRECTED candle engine (refit tow-aware table + Chainlink RTDS spot/reference).
-  // PULLED FROM ALL USERS 2026-07-13: a live audit showed the "edge" is a sub-second spike-selection
-  // artifact (model P overstated ~18pp; -13% over 78 trades). Back to OPT-IN - runs ONLY where
-  // QTABLE2_ENABLED=1 (the owner's app, for continued validation). Every other bot leaves it unset
-  // and never loads the module. DRY preview: QTABLE2_DRY=1. See src/qtable2.mjs.
-  if (process.env.QTABLE2_ENABLED === "1") {
-    const { startQTable2 } = await import("./qtable2.mjs");
-    startQTable2({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
-  }
-
-  // COPYTRADE - mirror the hand-picked whales at a per-user RATIO of their money-in (owner spec
-  // 2026-07-13). Fast side-loop OPENS + SCALES IN; the whale's peak-share cuts exit in the main cycle
-  // (copyExitStep). Runs ONLY where COPYTRADE_ENABLED=1; DRY preview: COPYTRADE_DRY=1. See src/copytrade.mjs.
-  if (process.env.COPYTRADE_ENABLED === "1") {
-    const { startCopyTrade } = await import("./copytrade.mjs");
-    startCopyTrade({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
-  }
+  // NOTE: the strategy engines (QTABLE2, COPYTRADE) are no longer started here from a local env var.
+  // Every user runs their OWN bot on their OWN host, so an env var can only ever reach the owner's
+  // machine - there is no way to switch an engine on for the fleet from outside. They are now started
+  // by maybeStartEngines() from the SERVER's account settings (see cycle()), which also makes turning
+  // the server flag off a live kill switch. A local env var still forces one on, for local testing.
 
   // eslint-disable-next-line no-constant-condition
   while (true) {

@@ -212,6 +212,7 @@ export function startQTable2(deps) {
   // qtable.mjs): the in-window candle set is tiny (1–2 markets), and it avoids the store clobber a
   // concurrent load/save would cause.
   async function tick() {
+    if (state.qtable2 === false) return;                     // server turned the engine off -> stop trading
     if (state.cash == null || state.sizing == null) return;  // no cycle data yet (first 30s after boot)
     const now = Date.now();
     const positions = store.load();
