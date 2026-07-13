@@ -60,14 +60,13 @@ const SYM_WS = Object.fromEntries(Object.entries(WS_SYM).map(([k, v]) => [v, k])
 const API_SYM = { BTCUSDT: "BTC", ETHUSDT: "ETH", SOLUSDT: "SOL", XRPUSDT: "XRP", DOGEUSDT: "DOGE" };
 const VARIANT = { "5m": "fiveminute", "15m": "fifteenminute", "1h": "hourly" };
 // MEMORY (2026-07-13): the table is loaded PER COIN. The old monolithic qtable-live-data.json was 21MB
-// of JSON across 5 coins and JSON.parse blew it up to ~112MB of heap AT IMPORT TIME — on a 256MB host
-// the OOM killer took down the ENTIRE bot every ~2 minutes (not just qtable2: no feed, no exits, no
-// copytrade — the whole process died). Each coin costs roughly 25MB of heap, so we parse only the ones
-// we actually trade. Default BTC+ETH (~7.4MB -> ~45MB heap) — the config that ran fine before SOL/XRP/
-// DOGE tripled the file. Add coins with QTABLE2_COINS only if the host has the RAM for it.
+// of JSON across 5 coins and JSON.parse blew it up to ~147MB RSS AT IMPORT TIME — on a 256MB host the
+// OOM killer took down the ENTIRE bot every ~2 minutes (not just qtable2: no feed, no exits, no
+// copytrade — the whole process died, for hours). Each coin costs ~25MB, so we parse only what we trade.
+// Owner 2026-07-13: DOGE and XRP DROPPED from this strategy. BTC+ETH+SOL = 95MB RSS, 161MB headroom.
 const TDIR = new URL("./qtable-data/", import.meta.url);
 const TMETA = JSON.parse(readFileSync(new URL("meta.json", TDIR), "utf8"));
-const WANT = (process.env.QTABLE2_COINS || "BTCUSDT,ETHUSDT").split(",").map((s) => s.trim()).filter(Boolean);
+const WANT = (process.env.QTABLE2_COINS || "BTCUSDT,ETHUSDT,SOLUSDT").split(",").map((s) => s.trim()).filter(Boolean);
 const TABLE = { meta: TMETA.meta, coins: {} };
 for (const c of WANT) {
   try { TABLE.coins[c] = JSON.parse(readFileSync(new URL(`${c}.json`, TDIR), "utf8")); }
