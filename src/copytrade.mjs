@@ -15,13 +15,13 @@
 //
 // Spawned from main() ONLY when COPYTRADE_ENABLED=1 (per-deployment gate). DRY: COPYTRADE_DRY=1 logs
 // would-be fills and places nothing. Positions are tagged source:"copytrade".
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { log, warn } from "./log.mjs";
 
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const DRY = process.env.COPYTRADE_DRY === "1";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
-const MAX_OPEN = N("COPY_MAX_OPEN", 25);
+const MAX_OPEN = N("COPY_MAX_OPEN", 10);          // blowup fix: 25 -> 10
 const MIN_ORDER_USD = N("COPY_MIN_USD", 1);       // Polymarket ~$1 min order = "the first beat"
 const MIN_ADD_USD = N("COPY_MIN_ADD_USD", 1);     // smallest scale-in increment worth an order
 const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy within the on-chain settle window
@@ -29,15 +29,33 @@ const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy w
 // whale keeps adding we follow him up — scale-ins are capped only by the sanity ceiling.
 const MAX_ENTRY_CENTS = N("COPY_MAX_ENTRY_CENTS", 92); // new positions
 const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a position we already hold
+// ---- POST-BLOWUP GUARDS (2026-07-13 forensics; each one maps to a proven loss channel) ----
+const MIN_ENTRY_CENTS = N("COPY_MIN_ENTRY_CENTS", 10); // no penny legs: 1c spread at 3c = 33%/round-trip
+const MIN_ADD_CENTS = N("COPY_MIN_ADD_CENTS_FLOOR", 5);
+// copytrade may hold at most this % of the portfolio in cost basis — the blowup deployed 100% (cash $0.54)
+const MAX_EXPOSURE_PCT = N("COPY_MAX_EXPOSURE_PCT", 20);
+// fleet churned 4.4 buys/min for 3h; a real directional copy has no business firing faster than this
+const MAX_BUYS_PER_HOUR = N("COPY_MAX_BUYS_PER_HOUR", 12);
+// owner: "smaller amount per trade" — the copy unit is this fraction of the dashboard per-trade size,
+// and the ceiling premium (+1pt) shrinks with it
+const UNIT_FRACTION = N("COPY_UNIT_FRACTION", 0.5);
 
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
 const LEDGER = `${DATA_DIR}/copytrade-trades.ndjson`;
 function appendLedger(rec) { try { appendFileSync(LEDGER, JSON.stringify(rec) + "\n"); } catch (e) { warn("copytrade ledger:", e?.message); } }
 
+// BUY-ONCE-EVER memory (persisted): a (market, side) we have already OPENED is never opened again —
+// the blowup's worst channel was salvage-sell -> 60s cooldown expires -> re-open the dying side -> loop
+// (one market ate $148 in 8 re-buys). Adds to a still-open position remain allowed; re-OPENS never.
+const SEEN_FILE = `${DATA_DIR}/copytrade-seen.json`;
+function loadSeen() { try { return JSON.parse(readFileSync(SEEN_FILE, "utf8")); } catch { return {}; } }
+function saveSeen(s) { try { writeFileSync(SEEN_FILE, JSON.stringify(s)); } catch (e) { warn("copytrade seen:", e?.message); } }
+
 // our target $ for a signal, given this user's unit + portfolio. Sums each driving whale's own ratio;
-// 2 same-side whales stack. Capped at the ceiling. 0 => can't size (no valid whale avg) or first-beat unmet.
+// 2 same-side whales stack. Capped at the ceiling (unit + 1pt, both scaled by UNIT_FRACTION).
+// 0 => can't size (no valid whale avg) or first-beat unmet.
 function targetUsd(sig, unit, portfolio) {
-  const ceiling = unit + portfolio * 0.01;
+  const ceiling = unit + portfolio * 0.01 * UNIT_FRACTION;
   let t = 0;
   for (const w of sig.wallets ?? []) {
     const avg = Number(w.avg_trade_usd) || 0, cost = Number(w.cost_usd) || 0;
@@ -49,16 +67,28 @@ function targetUsd(sig, unit, portfolio) {
 export function startCopyTrade(deps) {
   const { pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state } = deps;
   const recentBuy = new Map(); // cid -> ts (settle-window cooldown; also throttles scale-in cadence)
+  const seen = loadSeen();     // (cid#token) -> ts of first OPEN — never re-open (persisted)
+  const buyTimes = [];         // sliding-window rate limit
   const stats = { signals: 0, opens: 0, adds: 0, fills: 0 };
   let alive = true;
 
-  async function priceFor(tokenId, capCents) {
+  async function priceFor(tokenId, capCents, floorCents) {
     const mid = await pm.getPriceCents(tokenId);
     if (mid == null) return null;
     if (mid > capCents) return null;                    // market is above our cap -> don't chase it
+    if (mid < floorCents) return null;                  // penny leg -> spread eats any edge; skip
     const px = Math.min(capCents, Math.round(mid) + 1); // cross toward the ask, capped
     return px >= 1 ? px : null;
   }
+  const rateLimited = () => {
+    const cut = Date.now() - 3600e3;
+    while (buyTimes.length && buyTimes[0] < cut) buyTimes.shift();
+    return buyTimes.length >= MAX_BUYS_PER_HOUR;
+  };
+  const copyExposure = (positions) => {
+    let s = 0; for (const p of Object.values(positions)) if (p.source === "copytrade") s += Number(p.size_usd) || 0;
+    return s;
+  };
 
   async function buy(sig, orderUsd, priceCents, kind, positions, existing, key = sig.condition_id) {
     const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(orderUsd, priceCents));
@@ -66,7 +96,7 @@ export function startCopyTrade(deps) {
     if (realUsd > (state.cash ?? 0)) return false;
     const who = (sig.wallets?.[0]?.username) || (sig.wallets?.[0]?.wallet || "").slice(0, 8);
     const tag = `${sig.category} ${sig.outcome} @${priceCents}c · ${kind} $${realUsd.toFixed(2)} · via ${who} ($${Math.round(Number(sig.his_cost_usd) || 0).toLocaleString()} in)`;
-    if (DRY) { log(`copytrade DRY would ${kind === "open" ? "OPEN" : "ADD"} ${tag} · ${String(sig.market_question || "").slice(0, 40)}`); recentBuy.set(sig.condition_id, Date.now()); return true; }
+    if (DRY) { log(`copytrade DRY would ${kind === "open" ? "OPEN" : "ADD"} ${tag} · ${String(sig.market_question || "").slice(0, 40)}`); recentBuy.set(sig.condition_id, Date.now()); return true; } // DRY returns true so seen/rate-limit apply like a real fill
 
     const r = await placeWithRetry(pm, { tokenId: sig.token_id, side: "BUY", sizeShares: shares, priceCents, orderType: "FAK" }, 2, 100);
     recentBuy.set(sig.condition_id, Date.now());
@@ -111,8 +141,10 @@ export function startCopyTrade(deps) {
     if (!signals.length) return;
     const positions = store.load();
     let openCopy = 0; for (const p of Object.values(positions)) if (p.source === "copytrade") openCopy++;
-    const unitBasis = sizeForSignal(state.sizing, { source: "copytrade", outcome: "Yes" }, state.portfolio, state.deployed);
+    // "smaller amount per trade" (owner): the copy unit is a FRACTION of the dashboard per-trade size
+    const unitBasis = sizeForSignal(state.sizing, { source: "copytrade", outcome: "Yes" }, state.portfolio, state.deployed) * UNIT_FRACTION;
     if (!(unitBasis > 0)) return;
+    const exposureCap = ((state.portfolio || 0) * MAX_EXPOSURE_PCT) / 100;
 
     for (const sig of signals) {
       if (!sig.condition_id || !sig.token_id) continue;
@@ -133,28 +165,37 @@ export function startCopyTrade(deps) {
       if (mine) {
         const add = target - (Number(mine.size_usd) || 0);
         if (add < MIN_ADD_USD) continue;                                // no ratio transition worth an order
+        if (rateLimited()) continue;
+        if (copyExposure(positions) + add > exposureCap) continue;      // copytrade never exceeds its slice
         // ALREADY IN: he's reinforcing, so we follow him up — the 92c entry cap does NOT apply here.
-        const px = await priceFor(sig.token_id, MAX_ADD_CENTS);
+        const px = await priceFor(sig.token_id, MAX_ADD_CENTS, MIN_ADD_CENTS);
         if (px == null) continue;
-        await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
+        const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
+        if (ok) buyTimes.push(Date.now());
       } else {
         if (target < MIN_ORDER_USD) continue;                           // first beat not reached
         if (openCopy >= MAX_OPEN) continue;
+        if (rateLimited()) continue;
         // pick the store key: free primary slot -> cid; primary holds the OPPOSITE side -> composite key
         // (hold both). Primary holds the SAME side already (any engine) -> don't stack, skip.
         const key = primary ? (sameSide(primary) ? null : compKey) : sig.condition_id;
         if (!key || positions[key]) continue;
-        // NEW ENTRY: hard 92c cap (owner). priceFor returns null if the market is already above it.
-        const px = await priceFor(sig.token_id, Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS));
+        // BUY-ONCE-EVER: a (market, side) we already opened once is never re-opened — kills the
+        // salvage->cooldown->re-buy loop that shoveled $148 into one dying candle side.
+        const seenKey = `${sig.condition_id}#${sig.token_id}`;
+        if (seen[seenKey]) continue;
+        if (copyExposure(positions) + target > exposureCap) continue;   // copytrade never exceeds its slice
+        // NEW ENTRY: hard 92c cap + 10c floor (owner + blowup forensics).
+        const px = await priceFor(sig.token_id, Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS), MIN_ENTRY_CENTS);
         if (px == null) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
-        if (ok) openCopy++;
+        if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
       }
     }
   }
 
   (async function run() {
-    log(`copytrade: engine ON · ratio sizing (portfolio x pct, ceiling +1pt) · max ${MAX_OPEN} open · poll ${POLL_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`copytrade: engine ON · unit=${UNIT_FRACTION}x dashboard size · exposure≤${MAX_EXPOSURE_PCT}% · ${MIN_ENTRY_CENTS}-${MAX_ENTRY_CENTS}c entries · ≤${MAX_BUYS_PER_HOUR} buys/h · max ${MAX_OPEN} open · buy-once · poll ${POLL_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const si = setInterval(() => log(`copytrade … signals ${stats.signals} · opens ${stats.opens} · adds ${stats.adds} · fills ${stats.fills}`), 120_000);
     while (alive) {
       const t0 = Date.now();
