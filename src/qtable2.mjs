@@ -24,7 +24,6 @@ const WS_OPTS = globalThis.WebSocket ? undefined : { headers: { Origin: "https:/
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const STAKE = N("QTABLE2_STAKE_USD", 0);        // fixed $/trade override; 0 (default) = account's dashboard % sizing (e.g. 3%)
 const EDGE = N("QTABLE2_EDGE", 1.10);           // multiplicative: P / best-ask (hardened 1.08->1.10, owner 2026-07-13)
-const COINS = (process.env.QTABLE2_COINS || "BTCUSDT").split(",").map((s) => s.trim());
 const MAX_OPEN = N("QTABLE2_MAX_OPEN", 8);
 const TICK_MS = N("QTABLE2_TICK_MS", 250);
 const DRY = process.env.QTABLE2_DRY === "1";
@@ -54,12 +53,16 @@ const spotAt = (sym, atMs) => {  // latest buffered tick at/just before atMs (nu
   return v;
 };
 
-const FRAME_MS = { "5m": 300_000, "15m": 900_000 };
-const TABLE_FRAME = { "5m": "5m", "15m": "15m" };
-const WS_SYM = { "btc/usd": "BTCUSDT", "eth/usd": "ETHUSDT" };
-const API_SYM = { BTCUSDT: "BTC", ETHUSDT: "ETH" };
-const VARIANT = { "5m": "fiveminute", "15m": "fifteenminute" };
+const FRAME_MS = { "5m": 300_000, "15m": 900_000, "1h": 3_600_000 };
+const TABLE_FRAME = { "5m": "5m", "15m": "15m", "1h": "1h" };
+const WS_SYM = { "btc/usd": "BTCUSDT", "eth/usd": "ETHUSDT", "sol/usd": "SOLUSDT", "xrp/usd": "XRPUSDT", "doge/usd": "DOGEUSDT" };
+const SYM_WS = Object.fromEntries(Object.entries(WS_SYM).map(([k, v]) => [v, k]));
+const API_SYM = { BTCUSDT: "BTC", ETHUSDT: "ETH", SOLUSDT: "SOL", XRPUSDT: "XRP", DOGEUSDT: "DOGE" };
+const VARIANT = { "5m": "fiveminute", "15m": "fifteenminute", "1h": "hourly" };
 const TABLE = JSON.parse(readFileSync(new URL("./qtable-live-data.json", import.meta.url), "utf8"));
+// Coins default to EVERY coin the table covers (BTC+ETH today; SOL/XRP/DOGE auto-activate when their
+// refit lands in qtable-live-data.json). QTABLE2_COINS restricts; a coin without table data never trades.
+const COINS = (process.env.QTABLE2_COINS || Object.keys(TABLE.coins).join(",")).split(",").map((s) => s.trim()).filter((c) => TABLE.coins[c]);
 
 // Durable per-trade ledger on the persistent volume (survives restarts) — read by src/qtable2-report.mjs.
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
@@ -99,10 +102,9 @@ function connectChainlink() {
   let ws, stopped = false;
   const go = () => {
     try { ws = new WSImpl("wss://ws-live-data.polymarket.com", WS_OPTS); } catch { return setTimeout(go, 1500); }
-    ws.onopen = () => { ws.send(JSON.stringify({ action: "subscribe", subscriptions: [
-      { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "btc/usd" }) },
-      { topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: "eth/usd" }) },
-    ] })); log("qtable2 chainlink: connected"); };
+    ws.onopen = () => { ws.send(JSON.stringify({ action: "subscribe", subscriptions:
+      COINS.map((c) => ({ topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: SYM_WS[c] }) })),
+    })); log(`qtable2 chainlink: connected (${COINS.map((c) => SYM_WS[c]).join(", ")})`); };
     ws.onmessage = (ev) => {
       let m; try { m = JSON.parse(String(ev.data)); } catch { return; }
       const p = m?.payload ?? m; const sym = WS_SYM[String(p?.symbol ?? "").toLowerCase()];
@@ -125,12 +127,24 @@ function connectChainlink() {
 const j = async (u, ms = 4000) => { try { const r = await fetch(u, { signal: AbortSignal.timeout(ms) }); return r.ok ? await r.json() : null; } catch { return null; } };
 const parseArr = (s) => { try { return JSON.parse(String(s ?? "[]")); } catch { return []; } };
 
+// All Polymarket up-or-down candle families (verified live 2026-07-13). A slug that stops existing
+// just returns nothing from gamma; a coin not in COINS/table is filtered out.
 const SERIES = [
   { frame: "5m", sym: "BTCUSDT", slug: "btc-up-or-down-5m" },
   { frame: "5m", sym: "ETHUSDT", slug: "eth-up-or-down-5m" },
+  { frame: "5m", sym: "SOLUSDT", slug: "sol-up-or-down-5m" },
+  { frame: "5m", sym: "XRPUSDT", slug: "xrp-up-or-down-5m" },
+  { frame: "5m", sym: "DOGEUSDT", slug: "doge-up-or-down-5m" },
   { frame: "15m", sym: "BTCUSDT", slug: "btc-up-or-down-15m" },
   { frame: "15m", sym: "ETHUSDT", slug: "eth-up-or-down-15m" },
   { frame: "15m", sym: "ETHUSDT", slug: "ethereum-up-or-down-15m" },
+  { frame: "15m", sym: "SOLUSDT", slug: "sol-up-or-down-15m" },
+  { frame: "15m", sym: "XRPUSDT", slug: "xrp-up-or-down-15m" },
+  { frame: "15m", sym: "DOGEUSDT", slug: "doge-up-or-down-15m" },
+  { frame: "1h", sym: "BTCUSDT", slug: "btc-up-or-down-hourly" },
+  { frame: "1h", sym: "ETHUSDT", slug: "eth-up-or-down-hourly" },
+  { frame: "1h", sym: "XRPUSDT", slug: "xrp-up-or-down-hourly" },
+  { frame: "1h", sym: "DOGEUSDT", slug: "doge-up-or-down-hourly" },
 ].filter((s) => COINS.includes(s.sym));
 
 // best ASK (what a marketable BUY actually pays), in [0,1], with a two-sided-book spread sanity guard
@@ -277,9 +291,11 @@ export function startQTable2(deps) {
     const di = setInterval(() => discover().catch(() => {}), 15_000);
     const bi = setInterval(() => backfillRefs().catch(() => {}), 4_000);
     const si = setInterval(() => {
-      const bh = hist["BTCUSDT"]; const age = bh?.length ? Date.now() - bh[bh.length - 1].t : Infinity;
-      const feed = age === Infinity ? "NO FEED ⚠" : `$${(spot["BTCUSDT"] ?? 0).toFixed(0)} ${age}ms`;
-      log(`qtable2 … tracking ${markets.size} · btc ${feed} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills}`);
+      const feeds = COINS.map((c) => {
+        const h = hist[c]; const age = h?.length ? Date.now() - h[h.length - 1].t : Infinity;
+        return `${API_SYM[c].toLowerCase()} ${age === Infinity ? "NO FEED ⚠" : (age / 1000).toFixed(1) + "s"}`;
+      }).join(" · ");
+      log(`qtable2 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills}`);
     }, 30_000);
     while (alive) {
       const t0 = Date.now();
