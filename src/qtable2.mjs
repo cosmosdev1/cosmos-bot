@@ -23,7 +23,7 @@ const WS_OPTS = globalThis.WebSocket ? undefined : { headers: { Origin: "https:/
 
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const STAKE = N("QTABLE2_STAKE_USD", 0);        // fixed $/trade override; 0 (default) = account's dashboard % sizing (e.g. 3%)
-const EDGE = N("QTABLE2_EDGE", 1.08);           // multiplicative: P / best-ask
+const EDGE = N("QTABLE2_EDGE", 1.10);           // multiplicative: P / best-ask (hardened 1.08->1.10, owner 2026-07-13)
 const COINS = (process.env.QTABLE2_COINS || "BTCUSDT").split(",").map((s) => s.trim());
 const MAX_OPEN = N("QTABLE2_MAX_OPEN", 8);
 const TICK_MS = N("QTABLE2_TICK_MS", 250);
@@ -33,7 +33,7 @@ const MIN_D = 0.0005, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
 // Tiered entry (owner 2026-07-12): floor at 35% model prob; the lower prob band needs a bigger edge.
 const MIN_P = N("QTABLE2_MIN_P", 0.35);         // absolute floor — never trade a side below 35% model prob
 const HIGH_P = N("QTABLE2_HIGH_P", 0.55);       // p >= HIGH_P uses EDGE; MIN_P..HIGH_P uses the stricter EDGE_MID
-const EDGE_MID = N("QTABLE2_EDGE_MID", 1.15);   // required edge (P/ask) on the 35%-54% band
+const EDGE_MID = N("QTABLE2_EDGE_MID", 1.18);   // required edge (P/ask) on the 35%-54% band (hardened 1.15->1.18, owner 2026-07-13)
 const edgeReqFor = (p) => (p >= HIGH_P ? EDGE : EDGE_MID); // (only called when p >= MIN_P)
 const MIN_PRICE = 0.05, MAX_PRICE = 0.97;
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
