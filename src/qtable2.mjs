@@ -30,14 +30,29 @@ const TICK_MS = N("QTABLE2_TICK_MS", 250);
 const DRY = process.env.QTABLE2_DRY === "1";
 // guards — identical to the validated qtable-live engine
 const MIN_D = 0.0005, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
-// Tiered entry (owner 2026-07-12): floor at 35% model prob; the lower prob band needs a bigger edge.
-const MIN_P = N("QTABLE2_MIN_P", 0.35);         // absolute floor — never trade a side below 35% model prob
+// Tiered entry — RECALIBRATED 2026-07-13 from the 78-trade live audit: the 35-54% band lost money
+// under every rule-set tested (0/2 even with the persistence guard), so the default floor is back at
+// 55%. The tier machinery stays env-enabled (QTABLE2_MIN_P=0.35 re-opens the mid band).
+const MIN_P = N("QTABLE2_MIN_P", 0.55);         // absolute floor — never trade a side below this model prob
 const HIGH_P = N("QTABLE2_HIGH_P", 0.55);       // p >= HIGH_P uses EDGE; MIN_P..HIGH_P uses the stricter EDGE_MID
-const EDGE_MID = N("QTABLE2_EDGE_MID", 1.18);   // required edge (P/ask) on the 35%-54% band (hardened 1.15->1.18, owner 2026-07-13)
+const EDGE_MID = N("QTABLE2_EDGE_MID", 1.18);   // required edge (P/ask) on the mid band (if re-opened)
 const edgeReqFor = (p) => (p >= HIGH_P ? EDGE : EDGE_MID); // (only called when p >= MIN_P)
 const MIN_PRICE = 0.05, MAX_PRICE = 0.97;
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
-const MAX_EDGE = N("QTABLE2_MAX_EDGE", 3.0);    // >3x P/ask almost always = wrong reference, not edge
+// Live audit 2026-07-13 (78 fills): every trade with edge >1.30 lost (0/7 above 1.5) — a "huge edge"
+// is a bad tick / transient spike, not an opportunity. Cap hardened 3.0 -> 1.30.
+const MAX_EDGE = N("QTABLE2_MAX_EDGE", 1.30);
+// PERSISTENCE GUARD (the root-cause fix, 2026-07-13): the audit showed the bot entered on sub-second
+// d spikes that reverted before settlement (recorded d disagreed with the settled d in 65/78 trades,
+// overstating P by ~18pp). Require the displacement to have ALREADY HELD PERSIST_S seconds ago — same
+// sign, still >= MIN_D — read from the in-memory Chainlink buffer. ZERO added latency: the order still
+// fires the same instant off the live tick; we only additionally check a past tick we already hold.
+const PERSIST_S = N("QTABLE2_PERSIST_S", 6);
+const spotAt = (sym, atMs) => {  // latest buffered tick at/just before atMs (null if none)
+  const h = hist[sym]; if (!h?.length || h[0].t > atMs) return null;
+  let v = null; for (const x of h) { if (x.t > atMs) break; v = x.v; }
+  return v;
+};
 
 const FRAME_MS = { "5m": 300_000, "15m": 900_000 };
 const TABLE_FRAME = { "5m": "5m", "15m": "15m" };
@@ -196,6 +211,12 @@ export function startQTable2(deps) {
       const d = (S - strike) / strike;
       const elapsed = 100 * (1 - remaining / m.frameMs);
       if (Math.abs(d) < MIN_D) continue;
+      // persistence guard: the same displacement must ALREADY have been in force PERSIST_S ago —
+      // otherwise this is a fresh sub-second spike (the audited money-loser). In-memory, no latency.
+      const past = spotAt(m.sym, now - PERSIST_S * 1000);
+      if (past == null) continue;
+      const dPast = (past - strike) / strike;
+      if (Math.sign(dPast) !== Math.sign(d) || Math.abs(dPast) < MIN_D) continue;
       if (elapsed < MIN_ELAPSED || elapsed > MAX_ELAPSED) continue;
       if (remaining < MIN_REMAIN_S * 1000) continue;
       const towB = TABLE.meta.towBuckets ? towBucket(m.windowStartMs, TABLE.meta.towBuckets) : undefined;
@@ -225,7 +246,7 @@ export function startQTable2(deps) {
       const r = await placeWithRetry(pm, { tokenId: pick.token, side: "BUY", sizeShares: shares, priceCents, orderType: "FAK" }, 2, 80);
       const orderMs = Date.now() - t0, totalMs = bookMs + orderMs;     // fresh-spot -> order landed
       stats.orders++;
-      const rec = { ts: new Date().toISOString(), cid: m.cid, q: m.question, sym: m.sym, frame: m.frame, side: pick.side, outcome: pick.outcome, entry_cents: priceCents, edge: Number(pick.edge.toFixed(4)), p: Number(pick.p.toFixed(4)), d_pct: Number((d * 100).toFixed(4)), elapsed_pct: Number(elapsed.toFixed(1)), size_usd: Number(orderUsd.toFixed(2)), shares: Number(shares.toFixed(2)), token_id: pick.token, end_ms: m.endMs, spot_age_ms: spotAge, book_ms: bookMs, order_ms: orderMs, total_ms: totalMs };
+      const rec = { ts: new Date().toISOString(), cid: m.cid, q: m.question, sym: m.sym, frame: m.frame, side: pick.side, outcome: pick.outcome, entry_cents: priceCents, edge: Number(pick.edge.toFixed(4)), p: Number(pick.p.toFixed(4)), d_pct: Number((d * 100).toFixed(4)), d_past_pct: Number((dPast * 100).toFixed(4)), elapsed_pct: Number(elapsed.toFixed(1)), size_usd: Number(orderUsd.toFixed(2)), shares: Number(shares.toFixed(2)), token_id: pick.token, end_ms: m.endMs, spot_age_ms: spotAge, book_ms: bookMs, order_ms: orderMs, total_ms: totalMs };
       if (!r.ok) {
         const f = (fails.get(m.cid) ?? 0) + 1; fails.set(m.cid, f);
         if (!(f >= 5 || (typeof r.status === "number" && r.status >= 400 && r.status < 500 && f >= 3))) done.delete(m.cid); // let it retry next tick
@@ -250,7 +271,7 @@ export function startQTable2(deps) {
   }
 
   (async function run() {
-    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${EDGE}@p≥${(HIGH_P * 100).toFixed(0)}% / ${EDGE_MID}@p${(MIN_P * 100).toFixed(0)}-${(HIGH_P * 100).toFixed(0)}% · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${EDGE}-${MAX_EDGE}@p≥${(MIN_P * 100).toFixed(0)}% · persist ${PERSIST_S}s · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const stopWs = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
