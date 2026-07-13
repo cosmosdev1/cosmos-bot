@@ -93,9 +93,15 @@ function lookupP(sym, tblFrame, elapsedPct, d, towB) {
 // ---- Chainlink RTDS: reference buffer + live spot (same source Polymarket resolves on) ----
 const hist = {}; // sym -> [{t,v}] last ~35min
 const spot = {}; // sym -> latest value
+// Trust a buffered tick as the window-open reference ONLY if it landed near the boundary. A dormant
+// event-driven feed (ETH/SOL/XRP off-hours) wakes AFTER a move, so its first tick can be minutes late
+// and post-move — a wrong reference → fake d → fake edge (the audited "$6 ETH move" mechanism; probe
+// 2026-07-13 measured a 9.6bps late-tick ref error live). Late ref -> null -> price-history backfill
+// or NO TRADE. Verified-correct data or nothing.
+const REF_TRUST_MS = N("QTABLE2_REF_TRUST_MS", 15000);
 const refFor = (sym, windowStartMs) => {
   const h = hist[sym]; if (!h || !h.length || h[0].t > windowStartMs) return null;
-  for (let i = 0; i < h.length; i++) if (h[i].t >= windowStartMs) return h[i].v;
+  for (let i = 0; i < h.length; i++) if (h[i].t >= windowStartMs) return h[i].t - windowStartMs <= REF_TRUST_MS ? h[i].v : null;
   return null;
 };
 function connectChainlink() {
