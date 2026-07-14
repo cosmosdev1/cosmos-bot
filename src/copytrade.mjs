@@ -169,7 +169,11 @@ export function startCopyTrade(deps) {
   // What do we put into THIS signal? Beats for a new position he just opened; a flat 1% for one we are
   // adopting (he is already in it, at roughly this price).
   function sizeFor(sig, unitBasis, portfolio) {
-    if (sig.kind === "adopt") return { target: (portfolio || 0) * (ADOPT_PCT / 100), beats: null };
+    // ADOPT: flat 1% of the portfolio - but FLOORED at Polymarket's $1 minimum, exactly like a beat.
+    // Without the floor a $76 portfolio sizes an adopt at $0.76, which is below the minimum order, so
+    // `if (target < MIN_ORDER_USD) continue` silently drops it. That is not "small", it is NEVER: no
+    // account under $100 could ever take an adopt signal, and 13 of them sat unbought while we watched.
+    if (sig.kind === "adopt") return { target: Math.max(MIN_ORDER_USD, (portfolio || 0) * (ADOPT_PCT / 100)), beats: null };
     return targetUsd(sig, unitBasis, portfolio);
   }
 
