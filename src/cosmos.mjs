@@ -106,6 +106,15 @@ export function makeCosmos(config) {
     // per-user ratio locally. Separate from the main feed because copy sizing isn't the standard % sizing.
     copySignals: () => getJSON("/api/v1/copy-signals"), // { count, signals: [{ condition_id, token_id, outcome, category, wallets:[{wallet,cost_usd,avg_trade_usd}], his_cost_usd, entry_cents, max_entry_cents, sell_seq, end_date }] }
 
+    // THE FAST PATH (chainwatch). The whale roster to subscribe to on-chain, and the per-fill verdict.
+    // copyCheck is called the instant a whale's ERC-1155 balance grows — the server applies EVERY rule
+    // (new-only, category lock, runway, pair cost, entry band) and upserts the signal. ~200ms.
+    copyWallets: () => getJSON("/api/v1/copy-wallets"), // { wallets: [{ wallet, username, category }] }
+    async copyCheck({ wallet, token_id }) {
+      const r = await fetch(`${base}/api/v1/copy-check`, { method: "POST", headers, body: JSON.stringify({ wallet, token_id }) });
+      return r.json(); // { ok: true, signal } | { ok: false, reason }
+    },
+
     // Mirror-exit verdict for a COPYTRADE position: when the driving whale cut >=10% below his peak
     // shares, the server returns SELL_PARTIAL with that fraction (of our original) + a seq (once per step).
     async copyExit(pos) {

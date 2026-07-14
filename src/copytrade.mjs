@@ -132,6 +132,45 @@ export function startCopyTrade(deps) {
     return true;
   }
 
+  // THE FAST PATH (chainwatch). The whale's fill is seen on-chain in ~2s instead of ~360s via the
+  // activity indexer, and the server has ALREADY applied every rule (new-only, category, runway, pair
+  // cost, entry band) in /api/v1/copy-check. What's left is exactly the local half — the caps that
+  // protect THIS account — so it runs the same guards the polled loop does, on a signal that is just
+  // minutes fresher. Buy-once-ever means the slow feed re-delivering it later is a no-op.
+  async function fastOpen(sig) {
+    if (state.copytrade === false) return;
+    if (state.cash == null || state.sizing == null) return;      // no cycle data yet -> can't size
+    const positions = store.load();
+    let openCopy = 0; for (const p of Object.values(positions)) if (p.source === "copytrade") openCopy++;
+    const unitBasis = sizeForSignal(state.sizing, { source: "copytrade", outcome: "Yes" }, state.portfolio, state.deployed) * UNIT_FRACTION;
+    if (!(unitBasis > 0)) return;
+    const exposureCap = ((state.portfolio || 0) * MAX_EXPOSURE_PCT) / 100;
+    // The whale's money-in is unknowable this fast (that IS the slow part), so the ratio has nothing to
+    // work with: size one unit. The cron backfills his real numbers, and scale-ins follow from there.
+    const target = unitBasis;
+
+    if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return;
+    if (target < MIN_ORDER_USD) return;
+    if (openCopy >= MAX_OPEN) return;
+    if (rateLimited()) return;
+    const primary = positions[sig.condition_id];
+    const sameSide = (p) => p && String(p.outcome).toLowerCase() === String(sig.outcome).toLowerCase();
+    const compKey = `${sig.condition_id}#${sig.token_id}`;
+    const key = primary ? (sameSide(primary) ? null : compKey) : sig.condition_id;
+    if (!key || positions[key]) return;                           // already in this side
+    const seenKey = compKey;
+    if (seen[seenKey]) return;                                    // BUY-ONCE-EVER
+    if (copyExposure(positions) + target > exposureCap) return;
+    const cap = sig.is_pair
+      ? Math.min(99, Number(sig.max_entry_cents) || 99)
+      : Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS);
+    const floor = sig.is_pair ? 1 : MIN_ENTRY_CENTS;
+    const px = await priceFor(sig.token_id, cap, floor);
+    if (px == null) return;
+    const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
+    if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
+  }
+
   async function tick() {
     if (state.copytrade === false) return;                       // server turned the engine off -> stop trading
     if (state.cash == null || state.sizing == null) return;      // no cycle data yet
@@ -200,6 +239,18 @@ export function startCopyTrade(deps) {
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
       }
     }
+  }
+
+  // REAL-TIME TRIGGER. Watches the whales' ERC-1155 balances on Polygon and opens within ~1s of their
+  // fill, instead of ~6 minutes later via Polymarket's activity indexer. Off with COPY_CHAINWATCH=0.
+  if (process.env.COPY_CHAINWATCH !== "0") {
+    import("./chainwatch.mjs")
+      .then(({ startChainWatch }) => startChainWatch({
+        cosmos,
+        isArmed: () => alive && state.copytrade !== false,
+        onSignal: (sig) => fastOpen(sig),
+      }))
+      .catch((e) => warn("chainwatch failed to start:", e?.message));
   }
 
   (async function run() {
