@@ -28,7 +28,24 @@ const T_BATCH = "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f
 
 const WSS = (process.env.COSMOS_WSS_URLS || "wss://polygon-bor-rpc.publicnode.com,wss://polygon.drpc.org")
   .split(",").map((s) => s.trim()).filter(Boolean);
+// HTTP twin of the socket, used to BACKFILL the gap around a reconnect (see below).
+const HTTP = (process.env.COSMOS_RPC_URL || "https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 const WALLET_REFRESH_MS = 5 * 60_000;
+
+async function rpc(method, params) {
+  for (const url of HTTP) {
+    try {
+      const r = await fetch(url, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        signal: AbortSignal.timeout(8000),
+      }).then((x) => x.json());
+      if (r?.result !== undefined) return r.result;
+    } catch { /* next endpoint */ }
+  }
+  return null;
+}
 
 const pad32 = (addr) => "0x" + addr.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 const words = (hex) => (hex.replace(/^0x/, "").match(/.{64}/g) ?? []);
@@ -63,7 +80,7 @@ function tokensFromLog(l) {
 export function startChainWatch({ cosmos, onSignal, isArmed }) {
   let wallets = [];          // [{wallet, username}]
   let byAddr = new Map();
-  let ws = null, sub = null, urlIx = 0, alive = false, seenCount = 0;
+  let ws = null, sub = null, urlIx = 0, alive = false, seenCount = 0, lastBlock = 0;
   const done = new Set();    // txHash#logIndex — a reconnect can replay logs; never act twice
 
   async function refreshWallets() {
@@ -99,6 +116,8 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     if (done.has(key)) return;
     done.add(key);
     if (done.size > 5000) done.clear();
+    const b = parseInt(l.blockNumber, 16);
+    if (Number.isFinite(b) && b > lastBlock) lastBlock = b;    // how far we have actually seen
     const to = "0x" + String(l.topics[3] ?? "").slice(-40).toLowerCase();
     const w = byAddr.get(to);
     if (!w) return;                                   // not one of ours (shouldn't happen: the node filters)
@@ -109,6 +128,30 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
       seenCount++;
       onFill(w, tokenId, shares, l);                   // fire-and-forget: never block the socket
     }
+  }
+
+  // BACKFILL THE RECONNECT GAP. A subscription only pushes what happens while you are listening, and
+  // the public nodes drop the socket every couple of minutes (observed live). Those seconds are exactly
+  // when a whale fill would be lost — silently, with no error anywhere. So on every (re)subscribe we
+  // replay the logs from the last block we actually saw. handle()'s tx#logIndex dedupe makes a replayed
+  // fill a no-op, and buy-once-ever backstops it again at the order layer.
+  async function backfill() {
+    const head = parseInt(await rpc("eth_blockNumber", []) ?? "0x0", 16);
+    if (!Number.isFinite(head) || head <= 0) return;
+    if (!lastBlock) { lastBlock = head; return; }                 // first connect: start from now
+    const from = lastBlock + 1;
+    if (from > head) return;
+    if (head - from > 3000) { lastBlock = head; return; }         // hours-long outage: don't chase old fills
+    const logs = await rpc("eth_getLogs", [{
+      address: CTF_ERC1155,
+      fromBlock: "0x" + from.toString(16),
+      toBlock: "0x" + head.toString(16),
+      topics: [[T_SINGLE, T_BATCH], null, null, wallets.map((w) => pad32(w.wallet))],
+    }]);
+    if (!Array.isArray(logs)) return;
+    if (logs.length) log(`chainwatch: backfilled ${logs.length} fill(s) missed across blocks ${from}-${head}`);
+    for (const l of logs) { try { handle(l); } catch { /* keep going */ } }
+    lastBlock = head;
   }
 
   function connect() {
@@ -144,6 +187,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
           sub = m.result;
           if (confirm) clearTimeout(confirm);
           log(`chainwatch: LIVE — watching ${wallets.length} wallets on-chain via ${url.replace("wss://", "")}`);
+          backfill();                                   // cover the blocks we were disconnected for
         } else {
           warn("chainwatch subscribe rejected:", JSON.stringify(m.error ?? {}).slice(0, 80));
           try { socket.close(); } catch { /* onclose reconnects on the next endpoint */ }
