@@ -186,7 +186,15 @@ export function startCopyTrade(deps) {
         if (seen[seenKey]) continue;
         if (copyExposure(positions) + target > exposureCap) continue;   // copytrade never exceeds its slice
         // NEW ENTRY: hard 92c cap + 10c floor (owner + blowup forensics).
-        const px = await priceFor(sig.token_id, Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS), MIN_ENTRY_CENTS);
+        // PAIR LEG (is_pair): the whale holds BOTH sides — we mirror both, so this leg is half of a
+        // hedge, not a directional bet. The 92c cap and 10c floor DON'T apply: a 96c/3c pair is a good
+        // arb, and refusing the 96c half would leave us naked on the 3c half. The server has already
+        // verified both legs together cost less than the $1 redemption; its max_entry_cents is the cap.
+        const cap = sig.is_pair
+          ? Math.min(99, Number(sig.max_entry_cents) || 99)
+          : Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS);
+        const floor = sig.is_pair ? 1 : MIN_ENTRY_CENTS;
+        const px = await priceFor(sig.token_id, cap, floor);
         if (px == null) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
