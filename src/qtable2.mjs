@@ -137,7 +137,14 @@ function connectChainlink() {
     ws.onerror = () => { try { ws.close(); } catch { /* */ } };
   };
   go();
-  return () => { stopped = true; try { ws?.close(); } catch { /* */ } };
+  return {
+    stop: () => { stopped = true; try { ws?.close(); } catch { /* */ } },
+    // WATCHDOG HOOK (2026-07-14): RTDS subscriptions can HALF-DIE — the socket stays open and BTC keeps
+    // ticking while ETH/SOL go silent (observed: 85+ min stale on a live socket while a fresh
+    // subscription got ticks instantly). onclose-based reconnect never fires for that, so the engine
+    // silently loses 2/3 of its coins. kick() closes the socket, forcing a clean reconnect+resubscribe.
+    kick: () => { try { ws?.close(); } catch { /* */ } },
+  };
 }
 
 const j = async (u, ms = 4000) => { try { const r = await fetch(u, { signal: AbortSignal.timeout(ms) }); return r.ok ? await r.json() : null; } catch { return null; } };
@@ -226,7 +233,15 @@ export function startQTable2(deps) {
     if (state.cash == null || state.sizing == null) return;  // no cycle data yet (first 30s after boot)
     const now = Date.now();
     const positions = store.load();
-    let openQt = 0; for (const p of Object.values(positions)) if (p.source === "qtable") openQt++;
+    // openQt counts only LIVE qtable positions. Dead ones (market already ended; worthless loser dust
+    // that never hit the 97c TP or 3c salvage) linger in positions.json because their shares stay in
+    // the wallet — 3 fleet bots hit MAX_OPEN purely on dust (9-24 stuck) and their engine froze forever.
+    let openQt = 0;
+    for (const p of Object.values(positions)) {
+      if (p.source !== "qtable") continue;
+      const ended = p.end_date && p.end_date !== "none" && Date.parse(p.end_date) < now - 15 * 60_000;
+      if (!ended) openQt++;
+    }
 
     for (const m of [...markets.values()]) {
       const remaining = m.endMs - now;
@@ -303,23 +318,35 @@ export function startQTable2(deps) {
 
   (async function run() {
     log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${EDGE}-${MAX_EDGE}@p≥${(MIN_P * 100).toFixed(0)}% · persist ${PERSIST_S}s · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
-    const stopWs = connectChainlink();
+    const wsCtl = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
     const bi = setInterval(() => backfillRefs().catch(() => {}), 4_000);
+    // FEED WATCHDOG: a coin that HAS ticked before but has been silent > WATCHDOG_MS means the
+    // subscription half-died (socket open, stream gone — the 2026-07-14 overnight failure: eth/sol
+    // stale 85 min while btc ticked). Force a reconnect; rate-limited so a genuinely dormant feed
+    // only costs one cheap reconnect every few minutes.
+    const WATCHDOG_MS = N("QTABLE2_FEED_WATCHDOG_MS", 300_000);
+    let lastKick = 0;
     const si = setInterval(() => {
       const feeds = COINS.map((c) => {
         const h = hist[c]; const age = h?.length ? Date.now() - h[h.length - 1].t : Infinity;
         return `${API_SYM[c].toLowerCase()} ${age === Infinity ? "NO FEED ⚠" : (age / 1000).toFixed(1) + "s"}`;
       }).join(" · ");
       log(`qtable2 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills}`);
+      const staleCoin = COINS.find((c) => { const h = hist[c]; return h?.length && Date.now() - h[h.length - 1].t > WATCHDOG_MS; });
+      if (staleCoin && Date.now() - lastKick > WATCHDOG_MS) {
+        lastKick = Date.now();
+        warn(`qtable2 watchdog: ${API_SYM[staleCoin]} silent ${Math.round((Date.now() - hist[staleCoin][hist[staleCoin].length - 1].t) / 1000)}s on an open socket — forcing reconnect`);
+        wsCtl.kick();
+      }
     }, 30_000);
     while (alive) {
       const t0 = Date.now();
       try { await tick(); } catch (e) { warn("qtable2:", e?.message); }
       await new Promise((res) => setTimeout(res, Math.max(120, TICK_MS - (Date.now() - t0))));
     }
-    clearInterval(di); clearInterval(bi); clearInterval(si); stopWs();
+    clearInterval(di); clearInterval(bi); clearInterval(si); wsCtl.stop();
   })();
   return () => { alive = false; };
 }

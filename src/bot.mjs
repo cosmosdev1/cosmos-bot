@@ -555,6 +555,15 @@ async function cycle(cosmos, pm) {
       if (h.entry_cents > 0) p.entry_cents = h.entry_cents; // sync the REAL avg fill price
       if (!p.token_id) p.token_id = h.token_id;
       if (!p.end_date && h.end_date) p.end_date = h.end_date; // holdings now carry it
+      // DEAD DUST (2026-07-14): a resolved LOSER's shares stay in the wallet forever (nothing to sell,
+      // nothing to redeem, value $0) so the position never leaves tracking — it eats a MAX_OPEN slot
+      // and an advice/exit check every cycle. 3 fleet bots froze their qtable engine on 9-24 of these.
+      // Market ended 30+ min ago and the holding is worth ~nothing -> stop tracking it.
+      const endMs = Date.parse(p.end_date && p.end_date !== "none" ? p.end_date : h.end_date ?? "");
+      if (Number.isFinite(endMs) && endMs < Date.now() - 30 * 60_000 && (Number(h.cur_value) || 0) < 0.02) {
+        delete positions[key];
+        continue;
+      }
     }
 
     // RE-ADOPTION: wallet holdings the bot BOUGHT but lost track of (the old single-page holdings
