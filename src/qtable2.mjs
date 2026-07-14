@@ -35,7 +35,28 @@ const MIN_D = 0.0005, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
 const MIN_P = N("QTABLE2_MIN_P", 0.55);         // absolute floor — never trade a side below this model prob
 const HIGH_P = N("QTABLE2_HIGH_P", 0.55);       // p >= HIGH_P uses EDGE; MIN_P..HIGH_P uses the stricter EDGE_MID
 const EDGE_MID = N("QTABLE2_EDGE_MID", 1.18);   // required edge (P/ask) on the mid band (if re-opened)
-const edgeReqFor = (p) => (p >= HIGH_P ? EDGE : EDGE_MID); // (only called when p >= MIN_P)
+
+// EDGE HARDENING (owner 2026-07-14). Every entry now needs +2pp more edge than the table asks for,
+// and +3pp during the 16:00-18:30 Israel window on Mon-Fri — the hours where fills are worst.
+// The bump is added to the multiplicative edge (P/ask), so 1.10 -> 1.12, and 1.13 in the window.
+const EDGE_BUMP = N("QTABLE2_EDGE_BUMP", 0.02);            // always-on hardening
+const EDGE_BUMP_PEAK = N("QTABLE2_EDGE_BUMP_PEAK", 0.03);  // instead of EDGE_BUMP inside the window
+const PEAK_TZ = process.env.QTABLE2_PEAK_TZ || "Asia/Jerusalem";
+const PEAK_FROM_MIN = N("QTABLE2_PEAK_FROM", 16 * 60);     // 16:00
+const PEAK_TO_MIN = N("QTABLE2_PEAK_TO", 18 * 60 + 30);    // 18:30
+// Mon..Fri in the owner's own timezone — DST-correct, because the wall clock is what he specified.
+function inPeakWindow(now = new Date()) {
+  const p = new Intl.DateTimeFormat("en-GB", {
+    timeZone: PEAK_TZ, weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false, hourCycle: "h23",
+  }).formatToParts(now);
+  const get = (t) => p.find((x) => x.type === t)?.value ?? "";
+  const day = get("weekday");                               // Mon Tue Wed Thu Fri Sat Sun
+  if (!["Mon", "Tue", "Wed", "Thu", "Fri"].includes(day)) return false;
+  const mins = Number(get("hour")) * 60 + Number(get("minute"));
+  return mins >= PEAK_FROM_MIN && mins < PEAK_TO_MIN;
+}
+const edgeBump = () => (inPeakWindow() ? EDGE_BUMP_PEAK : EDGE_BUMP);
+const edgeReqFor = (p) => (p >= HIGH_P ? EDGE : EDGE_MID) + edgeBump(); // (only called when p >= MIN_P)
 const MIN_PRICE = 0.05, MAX_PRICE = 0.97;
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
 // Live audit 2026-07-13 (78 fills): every trade with edge >1.30 lost (0/7 above 1.5) — a "huge edge"
@@ -283,7 +304,7 @@ export function startQTable2(deps) {
       const priceCents = Math.min(97, Math.round(pick.ask * 100) + 1); // cross the ask
       const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(sizeUsd, priceCents));
       const orderUsd = (shares * priceCents) / 100;
-      const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% edge=${pick.edge.toFixed(3)} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
+      const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% edge=${pick.edge.toFixed(3)}/req${edgeReqFor(pick.p).toFixed(2)}${inPeakWindow() ? "[peak]" : ""} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
       if (orderUsd > state.cash) { done.add(m.cid); continue; }        // no room; re-armed next discover
       if (DRY) { log(`qtable2 DRY would BUY ${tag} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 36)}`); done.add(m.cid); continue; }
 
@@ -317,7 +338,7 @@ export function startQTable2(deps) {
   }
 
   (async function run() {
-    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${EDGE}-${MAX_EDGE}@p≥${(MIN_P * 100).toFixed(0)}% · persist ${PERSIST_S}s · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${(EDGE + EDGE_BUMP).toFixed(2)}-${MAX_EDGE}@p≥${(MIN_P * 100).toFixed(0)}% (hardened +${(EDGE_BUMP * 100).toFixed(0)}pp; +${(EDGE_BUMP_PEAK * 100).toFixed(0)}pp Mon-Fri 16:00-18:30 ${PEAK_TZ}) · persist ${PERSIST_S}s · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const wsCtl = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
