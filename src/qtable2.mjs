@@ -61,7 +61,7 @@ const edgeBump = () => (inPeakWindow() ? EDGE_BUMP_PEAK : EDGE_BUMP);
 const edgeReqFor = (p) => (p >= HIGH_P ? EDGE : EDGE_MID) + edgeBump(); // (only called when p >= MIN_P)
 // Entry price band 5-97c -> 7-90c (owner 2026-07-14, same replay): below 7c the spread eats the
 // edge, above 90c you risk 90c to win 10c and the winners are already priced.
-const MIN_PRICE = N("QTABLE2_MIN_PRICE", 0.07), MAX_PRICE = N("QTABLE2_MAX_PRICE", 0.90);
+const MIN_PRICE = N("QTABLE2_MIN_PRICE", 0.10), MAX_PRICE = N("QTABLE2_MAX_PRICE", 0.90);   // 7c floor went 0-for-2 live (-100% of stake) - back to 10c
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
 // CEILING REMOVED (owner 2026-07-14). The 1.30 cap came from a 78-fill audit on 2026-07-13 ("every
 // trade with edge >1.30 lost, 0/7 above 1.5"). The 24h replay of ALL 492 candles says the opposite —
@@ -70,7 +70,14 @@ const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
 // measuring the fake edges those bugs manufactured, not real ones.
 // WATCH THIS: the ±3s prints show these entries land just before a 16-30c repricing, so the fills are
 // the risk, not the signal. Re-cap instantly with QTABLE2_MAX_EDGE=1.30 if slippage shows up.
-const MAX_EDGE = N("QTABLE2_MAX_EDGE", 99);
+//
+// IT SHOWED UP. Uncapped, 2026-07-14 16:54->19:00 UTC: 13 markets, -$7.36 on $34.86 staked (-21% of
+// stake, vs -9% under the cap in the same session). Every sub-20c entry the uncapped model reached for
+// was a total wipeout (2 of 2, -$6.12, -100%). This is the SAME failure the engine was paused for on
+// 07-09: a big edge number is the model being WRONG about a cheap token, not a bargain - P is inflated
+// exactly where the ask is thin. The 24h replay that said "uncapped is worth +$22/day" was fitting that
+// error, not measuring it. Cap restored; do not remove it again without an OUT-OF-SAMPLE test.
+const MAX_EDGE = N("QTABLE2_MAX_EDGE", 1.30);
 // PERSISTENCE GUARD (the root-cause fix, 2026-07-13): the audit showed the bot entered on sub-second
 // d spikes that reverted before settlement (recorded d disagreed with the settled d in 65/78 trades,
 // overstating P by ~18pp). Require the displacement to have ALREADY HELD PERSIST_S seconds ago — same
