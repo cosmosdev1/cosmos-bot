@@ -23,7 +23,7 @@ const WS_OPTS = globalThis.WebSocket ? undefined : { headers: { Origin: "https:/
 
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const STAKE = N("QTABLE2_STAKE_USD", 0);        // fixed $/trade override; 0 (default) = account's dashboard % sizing (e.g. 3%)
-const EDGE = N("QTABLE2_EDGE", 1.10);           // multiplicative: P / best-ask (hardened 1.08->1.10, owner 2026-07-13)
+const EDGE = N("QTABLE2_EDGE", 1.15);           // multiplicative: P / best-ask (1.08 -> 1.10 -> 1.15, owner 2026-07-14 off the 24h replay)
 const MAX_OPEN = N("QTABLE2_MAX_OPEN", 8);
 const TICK_MS = N("QTABLE2_TICK_MS", 250);
 const DRY = process.env.QTABLE2_DRY === "1";
@@ -36,11 +36,13 @@ const MIN_P = N("QTABLE2_MIN_P", 0.55);         // absolute floor — never trad
 const HIGH_P = N("QTABLE2_HIGH_P", 0.55);       // p >= HIGH_P uses EDGE; MIN_P..HIGH_P uses the stricter EDGE_MID
 const EDGE_MID = N("QTABLE2_EDGE_MID", 1.18);   // required edge (P/ask) on the mid band (if re-opened)
 
-// EDGE HARDENING (owner 2026-07-14). Every entry now needs +2pp more edge than the table asks for,
-// and +3pp during the 16:00-18:30 Israel window on Mon-Fri — the hours where fills are worst.
-// The bump is added to the multiplicative edge (P/ask), so 1.10 -> 1.12, and 1.13 in the window.
-const EDGE_BUMP = N("QTABLE2_EDGE_BUMP", 0.02);            // always-on hardening
-const EDGE_BUMP_PEAK = N("QTABLE2_EDGE_BUMP_PEAK", 0.03);  // instead of EDGE_BUMP inside the window
+// EDGE FLOOR + WINDOW HARDENING (owner 2026-07-14). The base floor is now 1.15, chosen off a 24h
+// replay of all 492 candles: at 1.10-1.30 the model made +$11 (its live result, reproduced to within
+// 0.1pp by the replay); at a 1.15 floor with no ceiling it made +$45 on the same capital.
+// The earlier "+2pp" hardening is folded INTO that 1.15 base, so the bump is now only the extra
+// strictness inside the owner's 16:00-18:30 Israel window (Mon-Fri), where fills are worst: 1.16.
+const EDGE_BUMP = N("QTABLE2_EDGE_BUMP", 0);               // base floor already carries the hardening
+const EDGE_BUMP_PEAK = N("QTABLE2_EDGE_BUMP_PEAK", 0.01);  // instead of EDGE_BUMP inside the window
 const PEAK_TZ = process.env.QTABLE2_PEAK_TZ || "Asia/Jerusalem";
 const PEAK_FROM_MIN = N("QTABLE2_PEAK_FROM", 16 * 60);     // 16:00
 const PEAK_TO_MIN = N("QTABLE2_PEAK_TO", 18 * 60 + 30);    // 18:30
@@ -57,11 +59,18 @@ function inPeakWindow(now = new Date()) {
 }
 const edgeBump = () => (inPeakWindow() ? EDGE_BUMP_PEAK : EDGE_BUMP);
 const edgeReqFor = (p) => (p >= HIGH_P ? EDGE : EDGE_MID) + edgeBump(); // (only called when p >= MIN_P)
-const MIN_PRICE = 0.05, MAX_PRICE = 0.97;
+// Entry price band 5-97c -> 7-90c (owner 2026-07-14, same replay): below 7c the spread eats the
+// edge, above 90c you risk 90c to win 10c and the winners are already priced.
+const MIN_PRICE = N("QTABLE2_MIN_PRICE", 0.07), MAX_PRICE = N("QTABLE2_MAX_PRICE", 0.90);
 const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
-// Live audit 2026-07-13 (78 fills): every trade with edge >1.30 lost (0/7 above 1.5) — a "huge edge"
-// is a bad tick / transient spike, not an opportunity. Cap hardened 3.0 -> 1.30.
-const MAX_EDGE = N("QTABLE2_MAX_EDGE", 1.30);
+// CEILING REMOVED (owner 2026-07-14). The 1.30 cap came from a 78-fill audit on 2026-07-13 ("every
+// trade with edge >1.30 lost, 0/7 above 1.5"). The 24h replay of ALL 492 candles says the opposite —
+// the trades above 1.30 were the most profitable in the book, and the cap alone cost +$22/day. That
+// old audit predates the persistence guard and the Chainlink-reference fix, i.e. it was very likely
+// measuring the fake edges those bugs manufactured, not real ones.
+// WATCH THIS: the ±3s prints show these entries land just before a 16-30c repricing, so the fills are
+// the risk, not the signal. Re-cap instantly with QTABLE2_MAX_EDGE=1.30 if slippage shows up.
+const MAX_EDGE = N("QTABLE2_MAX_EDGE", 99);
 // PERSISTENCE GUARD (the root-cause fix, 2026-07-13): the audit showed the bot entered on sub-second
 // d spikes that reverted before settlement (recorded d disagreed with the settled d in 65/78 trades,
 // overstating P by ~18pp). Require the displacement to have ALREADY HELD PERSIST_S seconds ago — same
