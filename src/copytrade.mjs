@@ -51,17 +51,35 @@ const SEEN_FILE = `${DATA_DIR}/copytrade-seen.json`;
 function loadSeen() { try { return JSON.parse(readFileSync(SEEN_FILE, "utf8")); } catch { return {}; } }
 function saveSeen(s) { try { writeFileSync(SEEN_FILE, JSON.stringify(s)); } catch (e) { warn("copytrade seen:", e?.message); } }
 
-// our target $ for a signal, given this user's unit + portfolio. Sums each driving whale's own ratio;
-// 2 same-side whales stack. Capped at the ceiling (unit + 1pt, both scaled by UNIT_FRACTION).
-// 0 => can't size (no valid whale avg) or first-beat unmet.
+// THE BEATS (owner 2026-07-14, exact spec). We do NOT track his money-in continuously. His AVERAGE
+// position is the yardstick, and we enter in FIVE BEATS of 20%:
+//
+//   his position reaches 20% of HIS average  ->  we hold 20% of OUR max copy size
+//                        40%                 ->  40%
+//                        ...                     ...
+//                        100% (a full, average-sized position for him)  ->  100% of our size
+//
+// So on a $2,500 average, every $500 he commits moves us one beat. The beat is relative to HIM: a whale
+// whose average is $30 moves a beat every $6. Our max size for an average position is `unit`; if he goes
+// beyond his own average we keep following up to the ceiling (unit + 1pt).
+// Two same-side whales stack (each contributes its own beats). 0 => cannot size / first beat not reached.
+const BEATS = N("COPY_BEATS", 5);                 // 5 beats -> 20% each
 function targetUsd(sig, unit, portfolio) {
   const ceiling = unit + portfolio * 0.01 * UNIT_FRACTION;
-  let t = 0;
+  const step = 1 / BEATS;                          // 0.20 of his average = 0.20 of our size
+  let t = 0, beats = 0;
   for (const w of sig.wallets ?? []) {
     const avg = Number(w.avg_trade_usd) || 0, cost = Number(w.cost_usd) || 0;
-    if (avg > 0 && cost > 0) t += (cost * unit) / avg;
+    if (!(avg > 0 && cost > 0)) continue;
+    const frac = cost / avg;                       // how far into a normal-sized position he is
+    // +1e-9: 0.6/0.2 is 2.9999999999999996 in floating point, so an exact 60% would floor to 2 beats
+    // and silently under-buy every third beat.
+    const n = Math.floor(frac / step + 1e-9);      // completed beats (0..5, and beyond if he oversizes)
+    if (n <= 0) continue;                          // hasn't reached his first 20% -> we do nothing yet
+    beats += n;
+    t += n * step * unit;                          // each beat buys 20% of our max size
   }
-  return { target: Math.min(t, ceiling), ceiling };
+  return { target: Math.min(t, ceiling), ceiling, beats };
 }
 
 export function startCopyTrade(deps) {
