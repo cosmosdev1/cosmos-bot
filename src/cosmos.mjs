@@ -110,8 +110,8 @@ export function makeCosmos(config) {
     // copyCheck is called the instant a whale's ERC-1155 balance grows — the server applies EVERY rule
     // (new-only, category lock, runway, pair cost, entry band) and upserts the signal. ~200ms.
     copyWallets: () => getJSON("/api/v1/copy-wallets"), // { wallets: [{ wallet, username, category }] }
-    async copyCheck({ wallet, token_id }) {
-      const r = await fetch(`${base}/api/v1/copy-check`, { method: "POST", headers, body: JSON.stringify({ wallet, token_id }) });
+    async copyCheck({ wallet, token_id, shares }) {
+      const r = await fetch(`${base}/api/v1/copy-check`, { method: "POST", headers, body: JSON.stringify({ wallet, token_id, shares }) });
       return r.json(); // { ok: true, signal } | { ok: false, reason }
     },
 

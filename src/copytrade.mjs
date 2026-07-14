@@ -145,9 +145,12 @@ export function startCopyTrade(deps) {
     const unitBasis = sizeForSignal(state.sizing, { source: "copytrade", outcome: "Yes" }, state.portfolio, state.deployed) * UNIT_FRACTION;
     if (!(unitBasis > 0)) return;
     const exposureCap = ((state.portfolio || 0) * MAX_EXPOSURE_PCT) / 100;
-    // The whale's money-in is unknowable this fast (that IS the slow part), so the ratio has nothing to
-    // work with: size one unit. The cron backfills his real numbers, and scale-ins follow from there.
-    const target = unitBasis;
+    // RATIO SIZING (owner's spec, "the beats"): our_$ = his_$ x (our_unit / his_avg_trade_$), capped at
+    // the ceiling. The chain gives his exact share count, so copy-check prices his money-in and this
+    // path sizes IDENTICALLY to the polled one — a flat unit would buy the same off a $50 dab as off a
+    // $50,000 conviction. Below the $1 Polymarket minimum ("the first beat") we simply don't buy.
+    const { target } = targetUsd(sig, unitBasis, state.portfolio);
+    if (!(target > 0)) return;
 
     if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return;
     if (target < MIN_ORDER_USD) return;

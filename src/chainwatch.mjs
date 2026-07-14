@@ -98,7 +98,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
   async function onFill(w, tokenId, shares, l) {
     const t0 = Date.now();
     let res;
-    try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId }); }
+    try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); }
     catch (e) { warn("chainwatch check:", e.message); return; }
     const ms = Date.now() - t0;
     if (!res?.ok) {
