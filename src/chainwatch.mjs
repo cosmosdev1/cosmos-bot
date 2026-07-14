@@ -135,22 +135,41 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
   // when a whale fill would be lost — silently, with no error anywhere. So on every (re)subscribe we
   // replay the logs from the last block we actually saw. handle()'s tx#logIndex dedupe makes a replayed
   // fill a no-op, and buy-once-ever backstops it again at the order layer.
+  // The FREE Polygon RPCs only serve eth_getLogs over a SHORT recent window — ask for more and they
+  // answer "Archive requests require a personal token" (publicnode) or reject the range (drpc). A
+  // too-greedy backfill therefore errors and recovers NOTHING, silently, which is worse than not
+  // trying. So: walk the gap in small chunks, and say out loud when a gap is too old to recover.
+  // MEASURED, not assumed: publicnode serves eth_getLogs only for roughly the last 100 blocks and calls
+  // anything older an "archive request" (4 of 5 chunks refused at 400 blocks back). drpc rejects the
+  // range outright. A reconnect gap is normally seconds, so ~100 blocks (3.5 min) covers the real case;
+  // a longer outage simply cannot be recovered on a free node, and we SAY so rather than pretend.
+  // A paid RPC (COSMOS_RPC_URL / COSMOS_WSS_URLS) removes this limit entirely.
+  const CHUNK = 100;
+  const MAX_GAP = Number(process.env.COPY_BACKFILL_BLOCKS) || 100;
   async function backfill() {
     const head = parseInt(await rpc("eth_blockNumber", []) ?? "0x0", 16);
     if (!Number.isFinite(head) || head <= 0) return;
     if (!lastBlock) { lastBlock = head; return; }                 // first connect: start from now
-    const from = lastBlock + 1;
+    let from = lastBlock + 1;
     if (from > head) return;
-    if (head - from > 3000) { lastBlock = head; return; }         // hours-long outage: don't chase old fills
-    const logs = await rpc("eth_getLogs", [{
-      address: CTF_ERC1155,
-      fromBlock: "0x" + from.toString(16),
-      toBlock: "0x" + head.toString(16),
-      topics: [[T_SINGLE, T_BATCH], null, null, wallets.map((w) => pad32(w.wallet))],
-    }]);
-    if (!Array.isArray(logs)) return;
-    if (logs.length) log(`chainwatch: backfilled ${logs.length} fill(s) missed across blocks ${from}-${head}`);
-    for (const l of logs) { try { handle(l); } catch { /* keep going */ } }
+    if (head - from > MAX_GAP) {
+      warn(`chainwatch: gap of ${head - from} blocks is beyond what a free RPC will serve — ${head - from - MAX_GAP} blocks NOT recovered`);
+      from = head - MAX_GAP;
+    }
+    let found = 0;
+    for (let a = from; a <= head; a += CHUNK) {
+      const b = Math.min(a + CHUNK - 1, head);
+      const logs = await rpc("eth_getLogs", [{
+        address: CTF_ERC1155,
+        fromBlock: "0x" + a.toString(16),
+        toBlock: "0x" + b.toString(16),
+        topics: [[T_SINGLE, T_BATCH], null, null, wallets.map((w) => pad32(w.wallet))],
+      }]);
+      if (!Array.isArray(logs)) { warn(`chainwatch: backfill ${a}-${b} failed (rpc refused) — those blocks are unchecked`); continue; }
+      found += logs.length;
+      for (const l of logs) { try { handle(l); } catch { /* keep going */ } }
+    }
+    if (found) log(`chainwatch: backfilled ${found} fill(s) missed across blocks ${from}-${head}`);
     lastBlock = head;
   }
 
