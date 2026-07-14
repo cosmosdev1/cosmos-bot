@@ -63,7 +63,7 @@ function tokensFromLog(l) {
 export function startChainWatch({ cosmos, onSignal, isArmed }) {
   let wallets = [];          // [{wallet, username}]
   let byAddr = new Map();
-  let ws = null, sub = null, urlIx = 0, alive = false;
+  let ws = null, sub = null, urlIx = 0, alive = false, seenCount = 0;
   const done = new Set();    // txHash#logIndex — a reconnect can replay logs; never act twice
 
   async function refreshWallets() {
@@ -106,6 +106,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     if (byAddr.has(from)) return;                      // whale-to-whale shuffle, not a new position
     for (const { tokenId, shares } of tokensFromLog(l)) {
       if (shares <= 0) continue;
+      seenCount++;
       onFill(w, tokenId, shares, l);                   // fire-and-forget: never block the socket
     }
   }
@@ -119,6 +120,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     ws = socket;
     let pinger = null;
 
+    let confirm = null;
     socket.onopen = () => {
       alive = true;
       const params = [
@@ -126,12 +128,28 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
         { address: CTF_ERC1155, topics: [[T_SINGLE, T_BATCH], null, null, wallets.map((w) => pad32(w.wallet))] },
       ];
       socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params }));
-      log(`chainwatch: watching ${wallets.length} wallets on-chain via ${url.replace("wss://", "")}`);
+      // A CONNECTED SOCKET WITH NO SUBSCRIPTION IS THE WORST FAILURE MODE: it looks perfectly healthy
+      // and copies nothing, forever. The public nodes DO intermittently answer eth_subscribe with
+      // "Internal error" (seen live). So: if the subscription isn't confirmed, tear the socket down and
+      // reconnect — which rotates to the next endpoint.
+      confirm = setTimeout(() => {
+        if (!sub) { warn("chainwatch: no subscription confirmed in 10s — reconnecting"); try { socket.close(); } catch { /* onclose reconnects */ } }
+      }, 10_000);
       pinger = setInterval(() => { try { socket.send(JSON.stringify({ jsonrpc: "2.0", id: 99, method: "net_version", params: [] })); } catch { /* closing */ } }, 30_000);
     };
     socket.onmessage = (ev) => {
       let m; try { m = JSON.parse(typeof ev.data === "string" ? ev.data : ev.data.toString()); } catch { return; }
-      if (m.id === 1) { if (m.result) sub = m.result; else warn("chainwatch subscribe failed:", JSON.stringify(m.error ?? {}).slice(0, 80)); return; }
+      if (m.id === 1) {
+        if (m.result) {
+          sub = m.result;
+          if (confirm) clearTimeout(confirm);
+          log(`chainwatch: LIVE — watching ${wallets.length} wallets on-chain via ${url.replace("wss://", "")}`);
+        } else {
+          warn("chainwatch subscribe rejected:", JSON.stringify(m.error ?? {}).slice(0, 80));
+          try { socket.close(); } catch { /* onclose reconnects on the next endpoint */ }
+        }
+        return;
+      }
       if (m.method === "eth_subscription" && m.params?.result) { try { handle(m.params.result); } catch (e) { warn("chainwatch handle:", e.message); } }
     };
     const down = () => {
@@ -154,5 +172,13 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
       const changed = await refreshWallets();
       if (changed && ws) { try { ws.close(); } catch { /* reconnect handles it */ } }   // resubscribe with the new roster
     }, WALLET_REFRESH_MS);
+    // WATCHDOG. Same reason as the confirm timeout: a watcher that is quietly not subscribed is
+    // indistinguishable from a quiet market, and would cost us every trade without ever erroring.
+    // Say so out loud every 10 minutes, and self-heal if the subscription is gone.
+    setInterval(() => {
+      if (!isArmed()) return;
+      if (sub) log(`chainwatch: alive · ${wallets.length} wallets · ${seenCount} fills seen`);
+      else { warn("chainwatch: NOT subscribed — reconnecting"); if (ws) { try { ws.close(); } catch { /* ignore */ } } else connect(); }
+    }, 10 * 60_000);
   })();
 }
