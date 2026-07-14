@@ -2,7 +2,7 @@
 // The bot posts each signed order DIRECTLY to Polymarket (so Polymarket sees the user's own
 // region), then reports it to Cosmos for $0.09 metering. Written against @polymarket/clob-client-v2
 // (Polymarket's CLOB V2 client — the old clob-client signs an order version V2 now rejects).
-import { ClobClient, Side, OrderType, AssetType, Chain, SignatureTypeV2 } from "@polymarket/clob-client-v2";
+import { ClobClient, Side, OrderType, AssetType, Chain, SignatureTypeV2, createL1Headers } from "@polymarket/clob-client-v2";
 import { createWalletClient, createPublicClient, http, fallback } from "viem";
 import { polygon } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
@@ -56,9 +56,29 @@ export async function makePolymarket(config) {
   let lastGoodValue = null; // last good Polymarket /value total (authoritative portfolio value)
   let lastClobRefresh = 0; // last time we forced the CLOB to recompute its cached balance
 
-  // L1: derive (or create) the L2 API credentials from a wallet signature.
+  // L1: derive (or create) the L2 API credentials from a wallet signature. These are bound to the
+  // SIGNER EOA — correct for EOA / POLY_PROXY / Safe accounts.
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
   const creds = await pre.createOrDeriveApiKey();
+
+  // API key bound to the FUNDER (deposit wallet), signed by the EOA — REQUIRED for POLY_1271 accounts
+  // (Polymarket's NEW deposit-wallet flow): the CLOB demands order.signer (= the deposit wallet) equal
+  // the API key's address, so the EOA-bound `creds` above are rejected with "maker address not
+  // allowed, please use the deposit wallet flow". Ported from the validated qtable-live tester —
+  // without this, every new-style Polymarket account fails 100% of its orders.
+  const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has to be the address of the API/i;
+  let depositCreds = null;
+  const deriveForFunder = async () => {
+    if (depositCreds) return depositCreds;
+    try {
+      const mkH = async () => createL1Headers(walletClient, 137, 0, undefined, funder);
+      let jj = await fetch(`${CLOB_HOST}/auth/api-key`, { method: "POST", headers: await mkH() }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      if (!jj?.apiKey) jj = await fetch(`${CLOB_HOST}/auth/derive-api-key`, { headers: await mkH() }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      depositCreds = jj?.apiKey ? { key: jj.apiKey, secret: jj.secret, passphrase: jj.passphrase } : null;
+    } catch { depositCreds = null; }
+    console.log(depositCreds ? "[polymarket] ✓ API key bound to the deposit wallet (POLY_1271 ready)" : "[polymarket] ⚠ could not derive a deposit-wallet API key");
+    return depositCreds;
+  };
 
   // ---- AUTO-DETECT the Polymarket account's SIGNATURE TYPE. ----
   // Polymarket has FOUR account kinds, and hardcoding POLY_PROXY (the original email/Magic wallets)
@@ -111,10 +131,41 @@ export async function makePolymarket(config) {
   } catch { /* detection must never block startup - default stays POLY_PROXY */ }
   console.log(`[polymarket] account type: ${SIG_NAMES[sigType]} (wallet: ${walletKind})`);
 
-  // Full client: L1 + L2 + the DETECTED signature type for the funder account.
+  // FUNDER SANITY CHECK (non-blocking, loud): the #1 silent-failure onboarding mistake is pasting the
+  // wrong address — the DEPOSIT address from the deposit dialog, a truncated paste, or the untouched
+  // placeholder — and the first symptom used to be "bot runs, never trades". Verify the funder against
+  // Polymarket's public data API and say EXACTLY what's wrong in the log the user actually reads.
+  try {
+    const [valR, actR] = await Promise.all([
+      fetch(`${DATA_API}/value?user=${funder}`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      fetch(`${DATA_API}/activity?user=${funder}&limit=1`).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+    ]);
+    const value = Array.isArray(valR) ? Number(valR[0]?.value ?? 0) : 0;
+    const known = value > 0 || (Array.isArray(actR) && actR.length > 0);
+    if (!known && funder.toLowerCase() !== address.toLowerCase()) {
+      console.warn(
+        `[polymarket] ⚠ FUNDER CHECK: ${funder} has NO history on Polymarket. This usually means the ` +
+        `address is wrong — most often it's the DEPOSIT address instead of your account address. Open ` +
+        `polymarket.com, click your profile picture, and copy the address shown on your PROFILE page ` +
+        `(polymarket.com/profile/0x…). Then redeploy with that as POLYMARKET_FUNDER. The bot will keep ` +
+        `running but cannot trade until this is fixed.`,
+      );
+    } else if (known) {
+      console.log(`[polymarket] funder verified on Polymarket ✓`);
+    }
+  } catch { /* advisory only — never block startup */ }
+
+  // Full client: L1 + L2 + the DETECTED signature type for the funder account. POLY_1271 (deposit
+  // wallets) needs the FUNDER-bound key; everything else uses the EOA-bound key.
   // When a builder code is configured, builderConfig makes the client auto-stamp it onto every
   // order (the SDK applies it at order-build time), so Polymarket collects Cosmos's builder fee.
-  const client = mkClient(sigType);
+  const mkClientFor = (t, c) => {
+    const o = { host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient, creds: c, signatureType: t, funderAddress: funder };
+    if (builderOn) o.builderConfig = { builderCode: BUILDER_CODE };
+    return new ClobClient(o);
+  };
+  if (sigType === SignatureTypeV2.POLY_1271) await deriveForFunder();
+  let client = sigType === SignatureTypeV2.POLY_1271 && depositCreds ? mkClientFor(sigType, depositCreds) : mkClient(sigType);
 
   const tokenCache = new Map();
 
@@ -282,18 +333,35 @@ export async function makePolymarket(config) {
       }
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
       const meta = { market: tokenId, side: side.toLowerCase(), size, price: priceCents };
-      try {
-        const resp = await client.createAndPostOrder(
-          { tokenID: tokenId, price, side: side === "SELL" ? Side.SELL : Side.BUY, size },
-          undefined, // options: let the client resolve tickSize + negRisk per market
-          ot,
-        );
-        // V2 returns { error, status } on failure (throwOnError is off by default).
-        if (resp && resp.error) return { ok: false, status: resp.status ?? 400, body: { polymarket: resp }, meta };
-        return { ok: true, status: 200, body: { polymarket: resp }, meta };
-      } catch (e) {
-        return { ok: false, status: 400, body: { polymarket: { error: e?.message ?? "order failed" } }, meta };
+      const attempt = async () => {
+        try {
+          const resp = await client.createAndPostOrder(
+            { tokenID: tokenId, price, side: side === "SELL" ? Side.SELL : Side.BUY, size },
+            undefined, // options: let the client resolve tickSize + negRisk per market
+            ot,
+          );
+          // V2 returns { error, status } on failure (throwOnError is off by default).
+          if (resp && resp.error) return { ok: false, status: resp.status ?? 400, body: { polymarket: resp }, meta };
+          return { ok: true, status: 200, body: { polymarket: resp }, meta };
+        } catch (e) {
+          return { ok: false, status: 400, body: { polymarket: { error: e?.message ?? "order failed" } }, meta };
+        }
+      };
+      let r = await attempt();
+      // DEPOSIT-WALLET AUTO-RECOVERY: "maker address not allowed, please use the deposit wallet flow"
+      // means this account is Polymarket's NEW kind and needs POLY_1271 + a FUNDER-bound API key.
+      // Detection can miss it (an empty/undeployed deposit wallet probes $0), so recover at order time:
+      // derive the funder-bound key, switch the client to POLY_1271, and retry ONCE. Sticky — every
+      // later order uses the working client. This is what makes the bot work for EVERY account kind.
+      if (!r.ok && sigType !== SignatureTypeV2.POLY_1271 && DEPOSIT_ERR.test(JSON.stringify(r.body ?? ""))) {
+        console.log("[polymarket] ↻ deposit-wallet account detected at order time — switching to POLY_1271 with a funder-bound API key…");
+        const dc = await deriveForFunder();
+        sigType = SignatureTypeV2.POLY_1271;
+        client = mkClientFor(sigType, dc || creds);
+        r = await attempt();
+        if (r.ok) console.log("[polymarket] ✓ POLY_1271 (deposit wallet) works — using it from now on");
       }
+      return r;
     },
 
     // The wallet's current Polymarket holdings (for reconcile + "apply to manual trades").

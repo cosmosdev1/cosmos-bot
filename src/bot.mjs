@@ -36,6 +36,21 @@ if (!config.cosmosToken || !config.polymarket.privateKey) {
   console.error("Missing config. Either run `npm run setup` (local) or set the env vars COSMOS_TOKEN + POLYMARKET_PRIVATE_KEY (+ POLYMARKET_FUNDER) for a 24/7 host.");
   process.exit(1);
 }
+// PLAIN-LANGUAGE CONFIG VALIDATION (2026-07-14): users pasted the deploy command with the placeholder
+// text still in it, or a truncated key/address — and the only symptom was a crash deep inside viem or
+// a bot that never trades. Fail FAST with a message a non-technical user can act on.
+{
+  const pk = String(config.polymarket.privateKey).trim();
+  const fu = String(config.polymarket.funderAddress || "").trim();
+  const die = (msg) => { console.error(`CONFIG ERROR: ${msg}`); process.exit(1); };
+  if (/YOUR.?POLYMARKET/i.test(pk)) die("the private key is still the placeholder text. In Polymarket: profile picture → Settings → Export private key, then put that value in the command.");
+  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(pk)) die(`the private key doesn't look like a key (expected 64 hex characters, got ${pk.length}). Re-export it from Polymarket: profile picture → Settings → Export private key.`);
+  if (!pk.startsWith("0x")) config.polymarket.privateKey = "0x" + pk; // accept keys pasted without the 0x prefix
+  if (fu) {
+    if (/YOUR.?POLYMARKET/i.test(fu)) die("the Polymarket address is still the placeholder text. Open polymarket.com, click your profile picture, and copy the address on your profile page.");
+    if (!/^0x[0-9a-fA-F]{40}$/.test(fu)) die(`the Polymarket address doesn't look like an address (expected 0x + 40 hex characters, got "${fu.slice(0, 20)}…"). Copy it from your profile page: polymarket.com/profile/0x…`);
+  }
+}
 // One-time switch: evaluate + buy the markets ALREADY in the feed on this start
 // (instead of only newly-added ones). Set COSMOS_BUY_BACKLOG=1 or config.buyBacklogOnStart.
 const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_BACKLOG === "1";
@@ -853,7 +868,15 @@ async function cycle(cosmos, pm) {
       if (orderUsd > remaining) continue; // the $1-min bump exceeds balance — retry when funds free
       const r = await placeWithRetry(pm, { tokenId, side: "BUY", sizeShares: shares, priceCents: buyPrice, orderType: "FAK" });
       if (!r.ok) {
-        warn("entry failed after retries:", r.status, JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400));
+        const errStr = JSON.stringify(r.body?.polymarket ?? r.body?.error ?? r.body ?? "").slice(0, 400);
+        warn("entry failed after retries:", r.status, errStr);
+        // Translate the two account-level rejections into instructions a user can actually follow —
+        // these are the errors that used to strand paying users with a bot that "runs but never trades".
+        if (/deposit wallet|maker address not allowed/i.test(errStr)) {
+          warn("→ Polymarket rejected the ACCOUNT, not the trade. Check that POLYMARKET_FUNDER is the address from your PROFILE page (polymarket.com/profile/0x…), NOT the deposit address. If it is correct, your account may need one manual trade on polymarket.com first to activate trading.");
+        } else if (/not enough (balance|allowance)/i.test(errStr)) {
+          warn("→ your Polymarket cash is lower than the order size. Deposit funds on polymarket.com or lower your per-trade size in the Cosmos dashboard.");
+        }
         // A 4xx means the ORDER itself was rejected (illiquid / "no match" FAK kill / bad params).
         // Raw sources give up immediately (won't fill on a retry). ENGINE markets are often real but
         // momentarily thin (fresh hourly strikes) - allow ENTRY_4XX_LIMIT attempts across cycles
