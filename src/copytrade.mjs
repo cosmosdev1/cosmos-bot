@@ -65,8 +65,15 @@ function saveSeen(s) { try { writeFileSync(SEEN_FILE, JSON.stringify(s)); } catc
 // Two same-side whales stack (each contributes its own beats). 0 => cannot size / first beat not reached.
 const BEATS = N("COPY_BEATS", 5);                 // 5 beats -> 20% each
 function targetUsd(sig, unit, portfolio) {
-  const ceiling = unit + portfolio * 0.01 * UNIT_FRACTION;
   const step = 1 / BEATS;                          // 0.20 of his average = 0.20 of our size
+  // THE $1 BEAT FLOOR (owner 2026-07-14). Polymarket will not accept an order under ~$1, so a beat
+  // worth $0.30 is not a small trade — it is NO trade. The ratio alone made the big whales uncopyable:
+  // against a $44,843 average, one beat sized $0.09 and nothing could ever be placed. So each beat is
+  // AT LEAST the minimum order, which makes a full 5-beat entry (him at 100% of his average) $5.
+  // Our max copy size is therefore max(unit, 5 x $1) and the ceiling rises with it.
+  const beatUsd = Math.max(MIN_ORDER_USD, (unit * step));
+  const maxPos = BEATS * beatUsd;                  // what we hold once he is at 100% of his average
+  const ceiling = Math.max(maxPos, unit + portfolio * 0.01 * UNIT_FRACTION);
   let t = 0, beats = 0;
   for (const w of sig.wallets ?? []) {
     const avg = Number(w.avg_trade_usd) || 0, cost = Number(w.cost_usd) || 0;
@@ -77,9 +84,9 @@ function targetUsd(sig, unit, portfolio) {
     const n = Math.floor(frac / step + 1e-9);      // completed beats (0..5, and beyond if he oversizes)
     if (n <= 0) continue;                          // hasn't reached his first 20% -> we do nothing yet
     beats += n;
-    t += n * step * unit;                          // each beat buys 20% of our max size
+    t += n * beatUsd;                              // each beat buys one full, placeable beat
   }
-  return { target: Math.min(t, ceiling), ceiling, beats };
+  return { target: Math.min(t, ceiling), ceiling, beats, beatUsd };
 }
 
 export function startCopyTrade(deps) {
