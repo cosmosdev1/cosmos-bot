@@ -39,6 +39,10 @@ const MAX_BUYS_PER_HOUR = N("COPY_MAX_BUYS_PER_HOUR", 12);
 // owner: "smaller amount per trade" — the copy unit is this fraction of the dashboard per-trade size,
 // and the ceiling premium (+1pt) shrinks with it
 const UNIT_FRACTION = N("COPY_UNIT_FRACTION", 0.5);
+// ADOPT sizing (owner 2026-07-14): a position he opened weeks ago is sized FLAT at 1% of the portfolio,
+// not by the beats. The beats measure how far into a NEW position he is; that says nothing about one he
+// has been sitting in — there is no "20% of his average" to read off it.
+const ADOPT_PCT = N("COPY_ADOPT_PCT", 1);
 
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
 const LEDGER = `${DATA_DIR}/copytrade-trades.ndjson`;
@@ -162,8 +166,17 @@ export function startCopyTrade(deps) {
   // cost, entry band) in /api/v1/copy-check. What's left is exactly the local half — the caps that
   // protect THIS account — so it runs the same guards the polled loop does, on a signal that is just
   // minutes fresher. Buy-once-ever means the slow feed re-delivering it later is a no-op.
+  // What do we put into THIS signal? Beats for a new position he just opened; a flat 1% for one we are
+  // adopting (he is already in it, at roughly this price).
+  function sizeFor(sig, unitBasis, portfolio) {
+    if (sig.kind === "adopt") return { target: (portfolio || 0) * (ADOPT_PCT / 100), beats: null };
+    return targetUsd(sig, unitBasis, portfolio);
+  }
+
   async function fastOpen(sig) {
     if (state.copytrade === false) return;
+    // The fast path IS the whale-fill path. A bot that only has the adopt flag must never take one.
+    if (state.copyFills === false) return;
     if (state.cash == null || state.sizing == null) return;      // no cycle data yet -> can't size
     const positions = store.load();
     let openCopy = 0; for (const p of Object.values(positions)) if (p.source === "copytrade") openCopy++;
@@ -174,7 +187,7 @@ export function startCopyTrade(deps) {
     // the ceiling. The chain gives his exact share count, so copy-check prices his money-in and this
     // path sizes IDENTICALLY to the polled one — a flat unit would buy the same off a $50 dab as off a
     // $50,000 conviction. Below the $1 Polymarket minimum ("the first beat") we simply don't buy.
-    const { target } = targetUsd(sig, unitBasis, state.portfolio);
+    const { target } = sizeFor(sig, unitBasis, state.portfolio);
     if (!(target > 0)) return;
 
     if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return;
@@ -215,8 +228,10 @@ export function startCopyTrade(deps) {
 
     for (const sig of signals) {
       if (!sig.condition_id || !sig.token_id) continue;
+      // ADOPT-ONLY users see ONLY adopt signals. The whale-fill copies (kind "new") are aviv's alone.
+      if (state.copyFills === false && sig.kind !== "adopt") continue;
       if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) continue; // settle-window cooldown
-      const { target } = targetUsd(sig, unitBasis, state.portfolio);
+      const { target } = sizeFor(sig, unitBasis, state.portfolio);
       if (!(target > 0)) continue;
       stats.signals++;
 

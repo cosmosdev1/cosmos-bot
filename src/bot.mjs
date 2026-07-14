@@ -522,6 +522,7 @@ async function maybeStartEngines(settings, pm, cosmos) {
   const wantCopy = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;
   qtState.qtable2 = wantQt;       // engines check these each tick (off => stop trading)
   qtState.copytrade = wantCopy;
+  qtState.copyFills = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;   // may we copy his live FILLS?
   if (wantQt && !engines.qtable2) {
     engines.qtable2 = true;
     const { startQTable2 } = await import("./qtable2.mjs");
