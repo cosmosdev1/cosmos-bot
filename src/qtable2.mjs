@@ -78,6 +78,16 @@ const STALE_MS = N("QTABLE2_MAX_SPOT_AGE_MS", 8000);
 // exactly where the ask is thin. The 24h replay that said "uncapped is worth +$22/day" was fitting that
 // error, not measuring it. Cap restored; do not remove it again without an OUT-OF-SAMPLE test.
 const MAX_EDGE = N("QTABLE2_MAX_EDGE", 1.30);
+// ---- DEEP-CHECK GUARDS (2026-07-15, fleet forensics: -$1,211 on $6,026 over 72h) ----
+// LEADING SIDE ONLY. Calibration by signed d: buying the side spot moved AGAINST ("mean-revert",
+// |d|>=5bps) claimed ~35% and won 17% (-47% ROI); the |d|<2.5bps noise zone was a coin flip sold as
+// 57%. Only the side spot ALREADY favors, by at least this margin, was honestly priced. Kills the two
+// regions that carried -$803 of the -$1,211.
+const LEAD_D = N("QTABLE2_LEAD_D", 0.00025);        // 2.5bps: Up needs d >= +LEAD_D, Down needs d <= -LEAD_D
+// DISAGREEMENT BAND — the 07-09 pause's revival condition that never got built. The model may not
+// claim more than this many points above the market: p - ask <= band. The 60-69c kill zone (claimed
+// 69-79%, won 50%, -$34 in 48h on one account) and every thin-cell P=1.0 buy die here.
+const MAX_DISAGREE = N("QTABLE2_MAX_DISAGREE", 0.10);
 // PERSISTENCE GUARD (the root-cause fix, 2026-07-13): the audit showed the bot entered on sub-second
 // d spikes that reverted before settlement (recorded d disagreed with the settled d in 65/78 trades,
 // overstating P by ~18pp). Require the displacement to have ALREADY HELD PERSIST_S seconds ago — same
@@ -134,7 +144,13 @@ function lookupP(sym, tblFrame, elapsedPct, d, towB) {
   }
   let base = fr.pts[0];
   for (const p of fr.pts) if (Math.abs(p.pct - elapsedPct) < Math.abs(base.pct - elapsedPct)) base = p;
-  return base.surv[gi] ?? null;
+  // Deep-check 2026-07-15: the base layer is RAW 365d frequencies with no n floor — 61-69% of tradable
+  // cells are EXACTLY 0 or 1 (one observation, ever). At |d|>=60bps most lookups fell through the tow
+  // window onto these, served P=1.000, max "edge", and bought tops (the 13-14c 0-for-2 wipeouts live).
+  // A raw certainty cell is a sample-size artifact, not a probability: refuse it.
+  const v = base.surv[gi] ?? null;
+  if (v == null || v <= 0.001 || v >= 0.999) return null;
+  return v;
 }
 
 // ---- Chainlink RTDS: reference buffer + live spot (same source Polymarket resolves on) ----
@@ -316,8 +332,8 @@ export function startQTable2(deps) {
       const pUp = pAbove, pDn = 1 - pAbove;
       const tBook = Date.now();                                        // start of book-fetch + order latency
       const cands = [];
-      if (pUp >= MIN_P) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pUp) && e <= MAX_EDGE) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
-      if (pDn >= MIN_P) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pDn) && e <= MAX_EDGE) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
+      if (pUp >= MIN_P && d >= LEAD_D) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pUp) && e <= MAX_EDGE && (pUp - ask) <= MAX_DISAGREE) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
+      if (pDn >= MIN_P && d <= -LEAD_D) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pDn) && e <= MAX_EDGE && (pDn - ask) <= MAX_DISAGREE) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
       const pick = cands.sort((a, b) => b.edge - a.edge)[0];
       if (!pick) continue;
 
