@@ -275,11 +275,11 @@ export function startCopyTrade(deps) {
     const seenKey = compKey;
     if (seen[seenKey]) return skip("buy-once-ever");
     if (copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
-    const capMax = String(sig.category).toUpperCase() === "SPORTS" ? 94 : MAX_ENTRY_CENTS;   // sports may open to 94c (owner, swisstony)
+    const capMax = String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS;   // sports band 3-99c (owner 2026-07-15)
     const cap = sig.is_pair
       ? Math.min(99, Number(sig.max_entry_cents) || 99)
       : Math.min(capMax, Number(sig.max_entry_cents) || capMax);
-    const floor = sig.is_pair ? 1 : MIN_ENTRY_CENTS;
+    const floor = sig.is_pair ? 1 : (String(sig.category).toUpperCase() === "SPORTS" ? 3 : MIN_ENTRY_CENTS);
     const px = await priceFor(sig.token_id, cap, floor);
     if (px == null) return skip("price out of band (cap " + cap + "c)");
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
@@ -346,11 +346,11 @@ export function startCopyTrade(deps) {
         // hedge, not a directional bet. The 92c cap and 10c floor DON'T apply: a 96c/3c pair is a good
         // arb, and refusing the 96c half would leave us naked on the 3c half. The server has already
         // verified both legs together cost less than the $1 redemption; its max_entry_cents is the cap.
-        const capMax2 = String(sig.category).toUpperCase() === "SPORTS" ? 94 : MAX_ENTRY_CENTS;  // sports may open to 94c (owner, swisstony)
+        const capMax2 = String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS;  // sports band 3-99c (owner 2026-07-15)
         const cap = sig.is_pair
           ? Math.min(99, Number(sig.max_entry_cents) || 99)
           : Math.min(capMax2, Number(sig.max_entry_cents) || capMax2);
-        const floor = sig.is_pair ? 1 : MIN_ENTRY_CENTS;
+        const floor = sig.is_pair ? 1 : (String(sig.category).toUpperCase() === "SPORTS" ? 3 : MIN_ENTRY_CENTS);
         const px = await priceFor(sig.token_id, cap, floor);
         if (px == null) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
