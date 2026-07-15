@@ -21,7 +21,7 @@ import { log, warn } from "./log.mjs";
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const DRY = process.env.COPYTRADE_DRY === "1";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
-const MAX_OPEN = N("COPY_MAX_OPEN", 10);          // blowup fix: 25 -> 10
+const MAX_OPEN = N("COPY_MAX_OPEN", 100);         // owner 2026-07-15: was 10 and froze on dust. The 20%% exposure cap (now dust-free) is the real money guard; this is just a runaway backstop.
 const MIN_ORDER_USD = N("COPY_MIN_USD", 1);       // Polymarket ~$1 min order = "the first beat"
 const MIN_ADD_USD = N("COPY_MIN_ADD_USD", 1);     // smallest scale-in increment worth an order
 const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy within the on-chain settle window
@@ -114,8 +114,21 @@ export function startCopyTrade(deps) {
     while (buyTimes.length && buyTimes[0] < cut) buyTimes.shift();
     return buyTimes.length >= MAX_BUYS_PER_HOUR;
   };
+  // A copytrade position counts against the caps only while it is LIVE. Resolved candle dust (shares
+  // worth $0 that never left the wallet) lingers in the store forever; counting it clogged BOTH the
+  // MAX_OPEN slot count AND the exposure sum, so the copier stopped buying with its caps "full" of
+  // nothing — the same failure that froze qtable. end_date is recorded on every copy; if it is ever
+  // missing, fall back to opened_at + 10d (longer than any market we copy) so a real multi-day
+  // sports/weather leg still counts, but ancient dust does not.
+  const copyLive = (p) => {
+    if (p.source !== "copytrade") return false;
+    const endMs = p.end_date && p.end_date !== "none" ? Date.parse(p.end_date)
+      : p.opened_at ? Date.parse(p.opened_at) + 10 * 24 * 3600e3
+      : Date.now();
+    return !(Number.isFinite(endMs) && endMs < Date.now() - 15 * 60_000);
+  };
   const copyExposure = (positions) => {
-    let s = 0; for (const p of Object.values(positions)) if (p.source === "copytrade") s += Number(p.size_usd) || 0;
+    let s = 0; for (const p of Object.values(positions)) if (copyLive(p)) s += Number(p.size_usd) || 0;
     return s;
   };
 
@@ -183,7 +196,7 @@ export function startCopyTrade(deps) {
     if (state.copyFills === false) return;
     if (state.cash == null || state.sizing == null) return;      // no cycle data yet -> can't size
     const positions = store.load();
-    let openCopy = 0; for (const p of Object.values(positions)) if (p.source === "copytrade") openCopy++;
+    let openCopy = 0; for (const p of Object.values(positions)) if (copyLive(p)) openCopy++;   // dead dust does not fill a slot
     const unitBasis = sizeForSignal(state.sizing, { source: "copytrade", outcome: "Yes" }, state.portfolio, state.deployed) * UNIT_FRACTION;
     if (!(unitBasis > 0)) return;
     const exposureCap = ((state.portfolio || 0) * MAX_EXPOSURE_PCT) / 100;
@@ -224,7 +237,7 @@ export function startCopyTrade(deps) {
     const signals = feed?.signals ?? [];
     if (!signals.length) return;
     const positions = store.load();
-    let openCopy = 0; for (const p of Object.values(positions)) if (p.source === "copytrade") openCopy++;
+    let openCopy = 0; for (const p of Object.values(positions)) if (copyLive(p)) openCopy++;   // dead dust does not fill a slot
     // "smaller amount per trade" (owner): the copy unit is a FRACTION of the dashboard per-trade size
     const unitBasis = sizeForSignal(state.sizing, { source: "copytrade", outcome: "Yes" }, state.portfolio, state.deployed) * UNIT_FRACTION;
     if (!(unitBasis > 0)) return;
