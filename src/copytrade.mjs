@@ -35,7 +35,7 @@ const MIN_ADD_CENTS = N("COPY_MIN_ADD_CENTS_FLOOR", 5);
 // copytrade may hold at most this % of the portfolio in cost basis — the blowup deployed 100% (cash $0.54)
 const MAX_EXPOSURE_PCT = N("COPY_MAX_EXPOSURE_PCT", 20);
 // fleet churned 4.4 buys/min for 3h; a real directional copy has no business firing faster than this
-const MAX_BUYS_PER_HOUR = N("COPY_MAX_BUYS_PER_HOUR", 12);
+const MAX_BUYS_PER_HOUR = N("COPY_MAX_BUYS_PER_HOUR", 30);  // 12 saturated in minutes on a 10-wallet candle roster (deep-check #9); 30 is still ~9x under the blowup churn
 // owner: "smaller amount per trade" — the copy unit is this fraction of the dashboard per-trade size,
 // and the ceiling premium (+1pt) shrinks with it
 const UNIT_FRACTION = N("COPY_UNIT_FRACTION", 0.5);
@@ -116,8 +116,11 @@ export function startCopyTrade(deps) {
     if (mid == null) return null;
     if (mid > capCents) return null;                    // market is above our cap -> don't chase it
     if (mid < floorCents) return null;                  // penny leg -> spread eats any edge; skip
-    const px = Math.min(capCents, Math.round(mid) + 1); // cross toward the ask, capped
-    return px >= 1 ? px : null;
+    // FAK limit = the vetted CAP, not mid+1 (deep-check #5). A FAK's limit price is a CEILING — the fill
+    // happens at the book's actual ask. mid+1 silently died on wide candle books (mid 50c, ask 53c ->
+    // a 51c FAK crosses nothing and the entry is missed even though the server vetted the ask in-band).
+    // Slippage stays bounded: the server set capCents from the ask it verified (+3..5c).
+    return capCents >= 1 ? capCents : null;
   }
   const rateLimited = () => {
     const cut = Date.now() - 3600e3;
@@ -150,9 +153,16 @@ export function startCopyTrade(deps) {
     const tag = `${sig.category} ${sig.outcome} @${priceCents}c · ${kind} $${realUsd.toFixed(2)} · via ${who} ($${Math.round(Number(sig.his_cost_usd) || 0).toLocaleString()} in)`;
     if (DRY) { log(`copytrade DRY would ${kind === "open" ? "OPEN" : "ADD"} ${tag} · ${String(sig.market_question || "").slice(0, 40)}`); recentBuy.set(sig.condition_id, Date.now()); return true; } // DRY returns true so seen/rate-limit apply like a real fill
 
-    const r = await placeWithRetry(pm, { tokenId: sig.token_id, side: "BUY", sizeShares: shares, priceCents, orderType: "FAK" }, 2, 100);
+    // Lock the market BEFORE placing (deep-check #10): fastOpen and the polled tick each load their own
+    // positions snapshot, so without this a sub-second race could double-buy the same signal.
     recentBuy.set(sig.condition_id, Date.now());
-    if (!r.ok) { warn(`copytrade ${kind} failed: ${String(r.error ?? r.err ?? r.status ?? "").slice(0, 120)}`); return false; }
+    const r = await placeWithRetry(pm, { tokenId: sig.token_id, side: "BUY", sizeShares: shares, priceCents, orderType: "FAK" }, 2, 100);
+    if (!r.ok) {
+      // Failed FAK must NOT burn the full 60s cooldown (deep-check #6): on a 5-min candle that lockout
+      // IS the missed entry. Leave a 5s breather, then either path may retry while the market lives.
+      recentBuy.set(sig.condition_id, Date.now() - COOLDOWN_MS + 5_000);
+      warn(`copytrade ${kind} failed: ${String(r.error ?? r.err ?? r.status ?? "").slice(0, 120)}`); return false;
+    }
     stats.fills++;
     try { await cosmos.meter({ ...r.meta, source: "copytrade" }); } catch { /* best-effort */ }
 
@@ -171,7 +181,7 @@ export function startCopyTrade(deps) {
       existing.size_shares += shares;
       existing.copy_orig_shares = Math.max(existing.copy_orig_shares || 0, existing.size_shares);
       existing.copy_his_cost = Number(sig.his_cost_usd) || existing.copy_his_cost;
-      existing.copy_target_usd = Number((existing.copy_target_usd || 0) + realUsd).toFixed?.(2) ?? existing.copy_target_usd;
+      existing.copy_target_usd = Number((Number(existing.copy_target_usd || 0) + realUsd).toFixed(2));   // deep-check #12: precedence bug made this a STRING after the first add
       stats.adds++;
     }
     store.save(positions);
@@ -223,26 +233,44 @@ export function startCopyTrade(deps) {
     // path sizes IDENTICALLY to the polled one — a flat unit would buy the same off a $50 dab as off a
     // $50,000 conviction. Below the $1 Polymarket minimum ("the first beat") we simply don't buy.
     const { target } = sizeFor(sig, unitBasis, state.portfolio);
-    if (!(target > 0)) return;
+    // TRACE EVERY REFUSAL (deep-check forensics): the server logs every verdict, but the bot refused
+    // silently — 38 approved markets got no order in 24h and NOTHING said why. One line per skip.
+    const skip = (why) => log(`copytrade fast-skip ${sig.category} ${sig.outcome}: ${why} · ${String(sig.market_question || "").slice(0, 32)}`);
+    if (!(target > 0)) return skip("beats=0 (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " vs avg $" + Math.round(Number(sig.wallets?.[0]?.avg_trade_usd) || 0) + ")");
 
-    if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return;
-    if (target < MIN_ORDER_USD) return;
-    if (openCopy >= MAX_OPEN) return;
-    if (rateLimited()) return;
+    if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return skip("cooldown");
+    if (target < MIN_ORDER_USD) return skip("target $" + target.toFixed(2) + " < $1 min");
+    if (openCopy >= MAX_OPEN) return skip("MAX_OPEN " + openCopy);
+    if (rateLimited()) return skip("rate limit " + MAX_BUYS_PER_HOUR + "/h");
     const primary = positions[sig.condition_id];
     const sameSide = (p) => p && String(p.outcome).toLowerCase() === String(sig.outcome).toLowerCase();
     const compKey = `${sig.condition_id}#${sig.token_id}`;
-    const key = primary ? (sameSide(primary) ? null : compKey) : sig.condition_id;
-    if (!key || positions[key]) return;                           // already in this side
+    // FAST-PATH TOP-UP (deep-check #4): if we already hold this side and the whale's growing money-in
+    // raised our target above what we hold, ADD the difference NOW. Waiting for the 20s polled loop
+    // meant the 2nd..5th beats of a 5-minute candle never fired — the beat ladder collapsed to
+    // whatever the first clip bought.
+    const mine = primary && sameSide(primary) ? primary : (positions[compKey]?.source === "copytrade" ? positions[compKey] : null);
+    if (mine) {
+      const add = target - (Number(mine.size_usd) || 0);
+      if (add < MIN_ADD_USD) return;                              // fully sized for his current beats (no log: normal steady-state)
+      if (copyExposure(positions) + add > exposureCap) return skip("exposure cap (add $" + add.toFixed(2) + ")");
+      const px = await priceFor(sig.token_id, MAX_ADD_CENTS, MIN_ADD_CENTS);
+      if (px == null) return skip("add price out of band");
+      const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
+      if (ok) buyTimes.push(Date.now());
+      return;
+    }
+    const key = primary ? compKey : sig.condition_id;             // opposite side held -> composite key
+    if (positions[key]) return skip("already hold this side");
     const seenKey = compKey;
-    if (seen[seenKey]) return;                                    // BUY-ONCE-EVER
-    if (copyExposure(positions) + target > exposureCap) return;
+    if (seen[seenKey]) return skip("buy-once-ever");
+    if (copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
     const cap = sig.is_pair
       ? Math.min(99, Number(sig.max_entry_cents) || 99)
       : Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS);
     const floor = sig.is_pair ? 1 : MIN_ENTRY_CENTS;
     const px = await priceFor(sig.token_id, cap, floor);
-    if (px == null) return;
+    if (px == null) return skip("price out of band (cap " + cap + "c)");
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
   }

@@ -111,6 +111,24 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     catch (e) { warn("chainwatch buy:", e.message); }
   }
 
+  // SPLIT FILTER (deep-check #3). A CTF PositionSplit MINTS both outcome tokens to the whale in one tx
+  // ($1 -> Up + Down). That is NOT a market buy — he paid exactly $1 for the pair and expressed no
+  // direction, but each minted leg fired onFill and (with the pair gate relaxed) we bought BOTH legs at
+  // the ask: 53c + 53c = 106c for a $1 redemption, a guaranteed -6c on every split he does. A split
+  // delivers BOTH complements with EQUAL share counts in one tx; a real fill (even a mint-matched one)
+  // delivers only ONE token to him. So buffer a tx's transfers for a beat and drop the equal-sized
+  // multi-token deliveries. Costs ~350ms of latency on ~2-3s total — cheap for never buying a non-trade.
+  const txBuf = new Map(); // `${tx}|${wallet}` -> { w, l, fills, timer }
+  function flushFills(e) {
+    const { w, l, fills } = e;
+    if (fills.length >= 2) {
+      const shs = fills.map((f) => f.shares);
+      const distinct = new Set(fills.map((f) => f.tokenId)).size >= 2;
+      const equal = Math.max(...shs) - Math.min(...shs) <= Math.max(...shs) * 0.01;
+      if (distinct && equal) { log(`chainwatch: ${w.username} SPLIT mint (${fills.length} legs × ${shs[0].toFixed(0)} sh) — not a trade, skipped`); return; }
+    }
+    for (const f of fills) { seenCount++; onFill(w, f.tokenId, f.shares, l); }   // fire-and-forget: never block the socket
+  }
   function handle(l) {
     const key = `${l.transactionHash}#${l.logIndex}`;
     if (done.has(key)) return;
@@ -123,11 +141,10 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     if (!w) return;                                   // not one of ours (shouldn't happen: the node filters)
     const from = "0x" + String(l.topics[2] ?? "").slice(-40).toLowerCase();
     if (byAddr.has(from)) return;                      // whale-to-whale shuffle, not a new position
-    for (const { tokenId, shares } of tokensFromLog(l)) {
-      if (shares <= 0) continue;
-      seenCount++;
-      onFill(w, tokenId, shares, l);                   // fire-and-forget: never block the socket
-    }
+    const k = `${l.transactionHash}|${w.wallet}`;
+    let e = txBuf.get(k);
+    if (!e) { e = { w, l, fills: [], timer: setTimeout(() => { txBuf.delete(k); flushFills(e); }, 350) }; txBuf.set(k, e); }
+    for (const { tokenId, shares } of tokensFromLog(l)) if (shares > 0) e.fills.push({ tokenId, shares });
   }
 
   // BACKFILL THE RECONNECT GAP. A subscription only pushes what happens while you are listening, and
