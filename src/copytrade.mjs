@@ -21,7 +21,7 @@ import { log, warn } from "./log.mjs";
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const DRY = process.env.COPYTRADE_DRY === "1";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
-const MAX_OPEN = N("COPY_MAX_OPEN", 100);         // owner 2026-07-15: was 10 and froze on dust. The 20%% exposure cap (now dust-free) is the real money guard; this is just a runaway backstop.
+const MAX_OPEN = N("COPY_MAX_OPEN", Infinity);    // owner 2026-07-15: NO position-count cap at all. The 20%% exposure cap (dust-free) is the only guard now. Set COPY_MAX_OPEN to re-impose a count limit.
 const MIN_ORDER_USD = N("COPY_MIN_USD", 1);       // Polymarket ~$1 min order = "the first beat"
 const MIN_ADD_USD = N("COPY_MIN_ADD_USD", 1);     // smallest scale-in increment worth an order
 const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy within the on-chain settle window
