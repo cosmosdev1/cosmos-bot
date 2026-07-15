@@ -516,12 +516,17 @@ async function holdingsMap(pm) {
 // switch that reaches the whole fleet. Start each engine the first cycle the server enables it (no
 // restart needed), and mirror the flag into qtState every cycle so turning it OFF stops the engine
 // trading on its next tick - a real kill switch. A local env var still forces one on for testing.
-const engines = { qtable2: false, copytrade: false };
+const engines = { qtable2: false, copytrade: false, cert15: false };
 async function maybeStartEngines(settings, pm, cosmos) {
   const wantQt = process.env.QTABLE2_ENABLED === "1" || settings.qtable2 === true;
   const wantCopy = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;
+  // cert15 (late-candle certainty, 15m ETH/SOL) is FLEET-WIDE BY DEFAULT: the server resolves a
+  // missing bot_settings.cert15 to the CERT15_FLEET flag (default ON). settings.cert15 === false is
+  // the live kill (per-user column or CERT15_FLEET=0 globally).
+  const wantCert = process.env.CERT15_ENABLED === "1" || settings.cert15 === true;
   qtState.qtable2 = wantQt;       // engines check these each tick (off => stop trading)
   qtState.copytrade = wantCopy;
+  qtState.cert15 = wantCert;
   qtState.copyFills = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;   // may we copy his live FILLS?
   if (wantQt && !engines.qtable2) {
     engines.qtable2 = true;
@@ -532,6 +537,11 @@ async function maybeStartEngines(settings, pm, cosmos) {
     engines.copytrade = true;
     const { startCopyTrade } = await import("./copytrade.mjs");
     startCopyTrade({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
+  }
+  if (wantCert && !engines.cert15) {
+    engines.cert15 = true;
+    const { startCert15 } = await import("./cert15.mjs");
+    startCert15({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 }
 
@@ -731,6 +741,11 @@ async function cycle(cosmos, pm) {
       const acted = await copyExitStep(cosmos, pm, positions, pos);
       if (acted) continue;
     }
+    // CERT15 holds to REDEMPTION — NO sell path at all (owner spec 2026-07-15). These are 90-97c
+    // near-certainties resolving within 4 minutes: any TP sell forfeits the last cents to the fee,
+    // and the window is too short for a salvage to beat resolution. Reconcile's dust-guard clears
+    // the rare loser once the candle is 30+ min gone; a winner's shares leave the wallet on redeem.
+    if (pos.source === "cert15") continue;
     // EDGE RULES FIRST, for EVERY position type - sports included. Sports used to skip straight
     // to the server strategy, so the 97c+ lock-in and <=3c salvage never fired on them.
     const edge = await edgeExit(pm, pos);
