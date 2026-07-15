@@ -363,7 +363,7 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
   // Quant take-profits never sell under 99c (per admin spec: the 98.5-99 band; integer ticks make
   // that a fixed 99c ask). A killed FAK just retries - every cycle, forever - and if 99c never
   // fills, resolution redeems at 100c, so holding out costs nothing.
-  const floor = salvage ? 1 : pos.source === "quant" ? HZ("QUANT_TP_CENTS", 99) : Math.max(1, mid - 10);
+  const floor = salvage ? 1 : (pos.source === "quant" || pos.source === "qtable") ? HZ("QUANT_TP_CENTS", 99) : Math.max(1, mid - 10);   // qtable joined the 99c floor (deep-check: mid-10 leaked -$121/72h on TP fills; a killed FAK retries and resolution pays 100c anyway)
   let last = { ok: false, status: 0, body: {} };
   for (let attempt = 0; attempt < 5; attempt++) {
     const bid = await pm.getBestBidCents(pos.token_id);

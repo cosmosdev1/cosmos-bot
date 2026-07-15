@@ -223,6 +223,25 @@ const SERIES = [
   { frame: "1h", sym: "DOGEUSDT", slug: "doge-up-or-down-hourly" },
 ].filter((s) => COINS.includes(s.sym));
 
+// ASK-STABILITY VETO (deep-check 2026-07-15, the main leak at ~-$416/day): only 26.4% of our entries
+// had spot moving WITH our side in the prior 10s (control: 63.7%) — because P is a static table,
+// edge = P/ask crosses 1.15 exactly when informed makers mark the ask DOWN. We were a falling-ask
+// detector. Veto any entry whose ask dropped >= ASK_DROP_VETO within the last ASK_VETO_WINDOW_S:
+// a falling ask means the book knows something the table does not.
+const ASK_DROP_VETO = N("QTABLE2_ASK_DROP_VETO", 0.04);
+const ASK_VETO_WINDOW_S = N("QTABLE2_ASK_VETO_WINDOW_S", 30);
+const askHist = new Map();   // tokenId -> [{t, ask}] (we evaluate candidates every 250ms, so this fills itself)
+function askFalling(tokenId, ask) {
+  const now = Date.now();
+  const h = askHist.get(tokenId) ?? [];
+  h.push({ t: now, ask });
+  while (h.length && h[0].t < now - (ASK_VETO_WINDOW_S + 10) * 1000) h.shift();
+  askHist.set(tokenId, h);
+  let maxPast = null;
+  for (const e of h) if (e.t <= now - 8_000 && (maxPast == null || e.ask > maxPast)) maxPast = e.ask;   // ignore the last 8s (that's the move we ride)
+  return maxPast != null && maxPast - ask >= ASK_DROP_VETO;
+}
+
 // best ASK (what a marketable BUY actually pays), in [0,1], with a two-sided-book spread sanity guard
 async function bestAsk(tokenId) {
   const d = await j(`https://clob.polymarket.com/book?token_id=${tokenId}`, 3000);
@@ -332,8 +351,8 @@ export function startQTable2(deps) {
       const pUp = pAbove, pDn = 1 - pAbove;
       const tBook = Date.now();                                        // start of book-fetch + order latency
       const cands = [];
-      if (pUp >= MIN_P && d >= LEAD_D) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pUp) && e <= MAX_EDGE && (pUp - ask) <= MAX_DISAGREE) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
-      if (pDn >= MIN_P && d <= -LEAD_D) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pDn) && e <= MAX_EDGE && (pDn - ask) <= MAX_DISAGREE) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
+      if (pUp >= MIN_P && d >= LEAD_D) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pUp) && e <= MAX_EDGE && (pUp - ask) <= MAX_DISAGREE && !askFalling(m.tokenUp, ask)) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
+      if (pDn >= MIN_P && d <= -LEAD_D) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pDn) && e <= MAX_EDGE && (pDn - ask) <= MAX_DISAGREE && !askFalling(m.tokenDn, ask)) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
       const pick = cands.sort((a, b) => b.edge - a.edge)[0];
       if (!pick) continue;
 
