@@ -276,7 +276,15 @@ export function startQTable2(deps) {
     let openQt = 0;
     for (const p of Object.values(positions)) {
       if (p.source !== "qtable") continue;
-      const ended = p.end_date && p.end_date !== "none" && Date.parse(p.end_date) < now - 15 * 60_000;
+      // A position's end time, most to least reliable: end_date -> end_ms -> opened_at + a candle's max
+      // life. Older records stored NO end field at all, so `p.end_date` was always undefined, `ended`
+      // was always false, and EVERY qtable position counted as open forever — the engine froze at
+      // MAX_OPEN on pure dust. opened_at is always present, so this recovers those stuck positions too.
+      const endMs = p.end_date && p.end_date !== "none" ? Date.parse(p.end_date)
+        : p.end_ms ? Number(p.end_ms)
+        : p.opened_at ? Date.parse(p.opened_at) + 90 * 60_000
+        : now;                                                 // truly unknowable -> never let it freeze the engine
+      const ended = !Number.isFinite(endMs) || endMs < now - 15 * 60_000;
       if (!ended) openQt++;
     }
 
@@ -344,6 +352,7 @@ export function startQTable2(deps) {
         condition_id: m.cid, token_id: pick.token, outcome: pick.outcome, source: "qtable",
         entry_cents: priceCents, size_usd: orderUsd, size_shares: shares, entry_whales: [],
         market_question: m.question, opened_at: rec.ts,
+        end_ms: m.endMs, end_date: new Date(m.endMs).toISOString(),   // so the MAX_OPEN dust-guard can tell a dead candle from a live one
       };
       store.save(positions);
       appendLedger({ ...rec, ok: true });
