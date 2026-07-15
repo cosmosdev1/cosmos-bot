@@ -43,6 +43,15 @@ const UNIT_FRACTION = N("COPY_UNIT_FRACTION", 0.5);
 // not by the beats. The beats measure how far into a NEW position he is; that says nothing about one he
 // has been sitting in — there is no "20% of his average" to read off it.
 const ADOPT_PCT = N("COPY_ADOPT_PCT", 1);
+// SPORTS adopt TIERS (owner 2026-07-15, swisstony): size by HIS money in the position, and SCALE IN as
+// it grows — if he starts at $80k we hold 1%, when he grows to $125k we top up to 2%, etc.
+//   < $70k: skip · $70-120k: 1% · $120-180k: 2% · $180k+: 3%   (percent OF the portfolio, per trade)
+function sportsAdoptPct(hisUsd) {
+  if (hisUsd >= 180000) return 3;
+  if (hisUsd >= 120000) return 2;
+  if (hisUsd >= 70000) return 1;
+  return 0;                                    // below the floor -> not his conviction, don't copy
+}
 
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
 const LEDGER = `${DATA_DIR}/copytrade-trades.ndjson`;
@@ -186,7 +195,15 @@ export function startCopyTrade(deps) {
     // Without the floor a $76 portfolio sizes an adopt at $0.76, which is below the minimum order, so
     // `if (target < MIN_ORDER_USD) continue` silently drops it. That is not "small", it is NEVER: no
     // account under $100 could ever take an adopt signal, and 13 of them sat unbought while we watched.
-    if (sig.kind === "adopt") return { target: Math.max(MIN_ORDER_USD, (portfolio || 0) * (ADOPT_PCT / 100)), beats: null };
+    if (sig.kind === "adopt") {
+      const port = portfolio || 0;
+      if (String(sig.category).toUpperCase() === "SPORTS") {
+        const pct = sportsAdoptPct(Number(sig.his_cost_usd) || 0);   // tier by his CURRENT money-in
+        if (pct <= 0) return { target: 0, beats: null };             // < $70k -> skip (the loop drops target 0)
+        return { target: Math.max(MIN_ORDER_USD, port * (pct / 100)), beats: null };  // top-up handled by the polled add-path
+      }
+      return { target: Math.max(MIN_ORDER_USD, port * (ADOPT_PCT / 100)), beats: null };  // weather/other: flat 1%
+    }
     return targetUsd(sig, unitBasis, portfolio);
   }
 
