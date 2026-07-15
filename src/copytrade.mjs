@@ -206,16 +206,18 @@ export function startCopyTrade(deps) {
     // Without the floor a $76 portfolio sizes an adopt at $0.76, which is below the minimum order, so
     // `if (target < MIN_ORDER_USD) continue` silently drops it. That is not "small", it is NEVER: no
     // account under $100 could ever take an adopt signal, and 13 of them sat unbought while we watched.
-    if (sig.kind === "adopt") {
-      const port = portfolio || 0;
-      if (String(sig.category).toUpperCase() === "SPORTS") {
-        const pct = sportsAdoptPct(Number(sig.his_cost_usd) || 0);   // tier by his CURRENT money-in
-        if (pct <= 0) return { target: 0, beats: null };             // < $70k -> skip (the loop drops target 0)
-        return { target: Math.max(MIN_ORDER_USD, port * (pct / 100)), beats: null };  // top-up handled by the polled add-path
-      }
-      return { target: Math.max(MIN_ORDER_USD, port * (ADOPT_PCT / 100)), beats: null };  // weather/other: flat 1%
+    const port = portfolio || 0;
+    // SPORTS = THE TIERS ONLY (owner 2026-07-15): swisstony's settings apply to his EXISTING positions
+    // (adopt) AND his live/future entries alike — never the beats. Size purely by his money in the
+    // position: <$30k skip · 30-70k 1% · 70-120k 2% · 120-180k 3% · 180k+ 4% of the portfolio, and the
+    // fast-path top-up escalates us tier by tier as his (now cumulative) money-in grows.
+    if (String(sig.category).toUpperCase() === "SPORTS") {
+      const pct = sportsAdoptPct(Number(sig.his_cost_usd) || 0);
+      if (pct <= 0) return { target: 0, beats: null };
+      return { target: Math.max(MIN_ORDER_USD, port * (pct / 100)), beats: null };
     }
-    return targetUsd(sig, unitBasis, portfolio);
+    if (sig.kind === "adopt") return { target: Math.max(MIN_ORDER_USD, port * (ADOPT_PCT / 100)), beats: null };  // weather/other adopt: flat 1%
+    return targetUsd(sig, unitBasis, portfolio);   // crypto: the beats (5 x 20% of his average)
   }
 
   async function fastOpen(sig) {
@@ -265,9 +267,10 @@ export function startCopyTrade(deps) {
     const seenKey = compKey;
     if (seen[seenKey]) return skip("buy-once-ever");
     if (copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
+    const capMax = String(sig.category).toUpperCase() === "SPORTS" ? 94 : MAX_ENTRY_CENTS;   // sports may open to 94c (owner, swisstony)
     const cap = sig.is_pair
       ? Math.min(99, Number(sig.max_entry_cents) || 99)
-      : Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS);
+      : Math.min(capMax, Number(sig.max_entry_cents) || capMax);
     const floor = sig.is_pair ? 1 : MIN_ENTRY_CENTS;
     const px = await priceFor(sig.token_id, cap, floor);
     if (px == null) return skip("price out of band (cap " + cap + "c)");
@@ -335,9 +338,10 @@ export function startCopyTrade(deps) {
         // hedge, not a directional bet. The 92c cap and 10c floor DON'T apply: a 96c/3c pair is a good
         // arb, and refusing the 96c half would leave us naked on the 3c half. The server has already
         // verified both legs together cost less than the $1 redemption; its max_entry_cents is the cap.
+        const capMax2 = String(sig.category).toUpperCase() === "SPORTS" ? 94 : MAX_ENTRY_CENTS;  // sports may open to 94c (owner, swisstony)
         const cap = sig.is_pair
           ? Math.min(99, Number(sig.max_entry_cents) || 99)
-          : Math.min(MAX_ENTRY_CENTS, Number(sig.max_entry_cents) || MAX_ENTRY_CENTS);
+          : Math.min(capMax2, Number(sig.max_entry_cents) || capMax2);
         const floor = sig.is_pair ? 1 : MIN_ENTRY_CENTS;
         const px = await priceFor(sig.token_id, cap, floor);
         if (px == null) continue;
