@@ -46,7 +46,15 @@ const ADOPT_PCT = N("COPY_ADOPT_PCT", 1);
 // SPORTS adopt TIERS (owner 2026-07-15, swisstony): size by HIS money in the position, and SCALE IN as
 // it grows — if he starts at $80k we hold 1%, when he grows to $125k we top up to 2%, etc.
 //   < $30k: skip · $30-70k: 1% · $70-120k: 2% · $120-180k: 3% · $180k+: 4%   (percent OF the portfolio)
-function sportsAdoptPct(hisUsd) {
+function sportsAdoptPct(hisUsd, who) {
+  // hot2trot runs BIGGER positions (avg ~$82k), so his bands are wider (owner 2026-07-15):
+  if (String(who || "").toLowerCase() === "hot2trot") {
+    if (hisUsd >= 250000) return 4;
+    if (hisUsd >= 160000) return 3;
+    if (hisUsd >= 80000) return 2;
+    if (hisUsd >= 30000) return 1;
+    return 0;
+  }
   if (hisUsd >= 180000) return 4;
   if (hisUsd >= 120000) return 3;
   if (hisUsd >= 70000) return 2;
@@ -212,7 +220,7 @@ export function startCopyTrade(deps) {
     // position: <$30k skip · 30-70k 1% · 70-120k 2% · 120-180k 3% · 180k+ 4% of the portfolio, and the
     // fast-path top-up escalates us tier by tier as his (now cumulative) money-in grows.
     if (String(sig.category).toUpperCase() === "SPORTS") {
-      const pct = sportsAdoptPct(Number(sig.his_cost_usd) || 0);
+      const pct = sportsAdoptPct(Number(sig.his_cost_usd) || 0, sig.wallets?.[0]?.username);
       if (pct <= 0) return { target: 0, beats: null };
       return { target: Math.max(MIN_ORDER_USD, port * (pct / 100)), beats: null };
     }
