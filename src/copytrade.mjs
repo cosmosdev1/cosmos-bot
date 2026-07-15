@@ -45,11 +45,12 @@ const UNIT_FRACTION = N("COPY_UNIT_FRACTION", 0.5);
 const ADOPT_PCT = N("COPY_ADOPT_PCT", 1);
 // SPORTS adopt TIERS (owner 2026-07-15, swisstony): size by HIS money in the position, and SCALE IN as
 // it grows — if he starts at $80k we hold 1%, when he grows to $125k we top up to 2%, etc.
-//   < $70k: skip · $70-120k: 1% · $120-180k: 2% · $180k+: 3%   (percent OF the portfolio, per trade)
+//   < $30k: skip · $30-70k: 1% · $70-120k: 2% · $120-180k: 3% · $180k+: 4%   (percent OF the portfolio)
 function sportsAdoptPct(hisUsd) {
-  if (hisUsd >= 180000) return 3;
-  if (hisUsd >= 120000) return 2;
-  if (hisUsd >= 70000) return 1;
+  if (hisUsd >= 180000) return 4;
+  if (hisUsd >= 120000) return 3;
+  if (hisUsd >= 70000) return 2;
+  if (hisUsd >= 30000) return 1;
   return 0;                                    // below the floor -> not his conviction, don't copy
 }
 
