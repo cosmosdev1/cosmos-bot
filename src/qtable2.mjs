@@ -88,6 +88,15 @@ const LEAD_D = N("QTABLE2_LEAD_D", 0.00025);        // 2.5bps: Up needs d >= +LE
 // claim more than this many points above the market: p - ask <= band. The 60-69c kill zone (claimed
 // 69-79%, won 50%, -$34 in 48h on one account) and every thin-cell P=1.0 buy die here.
 const MAX_DISAGREE = N("QTABLE2_MAX_DISAGREE", 0.10);
+// ENTRY GATE REWORK (owner 2026-07-20, "3 signals in a minute then 0 for 10 hours"): the
+// multiplicative edge floor (>=1.15) and the disagreement cap (<=10pp) CONTRADICT each other above
+// ~50c asks - at a 64c ask the corridor is 0.4pp wide, above ~66c it is empty. That is why the
+// fleet went silent while one env-loosened bot printed all day. The pause research's real finding
+// was that ABSOLUTE divergence of 4-10pp is the profitable set (>=4pp +10.8%/$, n=128; >12pp
+// negative), so the absolute band is now the PRIMARY gate: 4pp <= P-ask <= 10pp. The multiplicative
+// floor is retired (MAX_EDGE stays as the too-good-to-be-true cap). QTABLE2_MIN_DISAGREE tunes it.
+const MIN_DISAGREE = N("QTABLE2_MIN_DISAGREE", 0.04);
+const minDisagreeReq = () => MIN_DISAGREE + edgeBump(); // the Mon-Fri peak window still adds +1pp
 // PERSISTENCE GUARD (the root-cause fix, 2026-07-13): the audit showed the bot entered on sub-second
 // d spikes that reverted before settlement (recorded d disagreed with the settled d in 65/78 trades,
 // overstating P by ~18pp). Require the displacement to have ALREADY HELD PERSIST_S seconds ago — same
@@ -370,8 +379,8 @@ export function startQTable2(deps) {
       const pUp = pAbove, pDn = 1 - pAbove;
       const tBook = Date.now();                                        // start of book-fetch + order latency
       const cands = [];
-      if (pUp >= MIN_P && d >= LEAD_D) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pUp) && e <= MAX_EDGE && (pUp - ask) <= MAX_DISAGREE && !askFalling(m.tokenUp, ask)) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
-      if (pDn >= MIN_P && d <= -LEAD_D) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && e >= edgeReqFor(pDn) && e <= MAX_EDGE && (pDn - ask) <= MAX_DISAGREE && !askFalling(m.tokenDn, ask)) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
+      if (pUp >= MIN_P && d >= LEAD_D) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && (pUp - ask) >= minDisagreeReq() && e <= MAX_EDGE && (pUp - ask) <= MAX_DISAGREE && !askFalling(m.tokenUp, ask)) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
+      if (pDn >= MIN_P && d <= -LEAD_D) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && (pDn - ask) >= minDisagreeReq() && e <= MAX_EDGE && (pDn - ask) <= MAX_DISAGREE && !askFalling(m.tokenDn, ask)) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
       const pick = cands.sort((a, b) => b.edge - a.edge)[0];
       if (!pick) continue;
 
@@ -389,7 +398,7 @@ export function startQTable2(deps) {
       const priceCents = Math.min(97, Math.round(pick.ask * 100) + 1); // cross the ask
       const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(sizeUsd, priceCents));
       const orderUsd = (shares * priceCents) / 100;
-      const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% edge=${pick.edge.toFixed(3)}/req${edgeReqFor(pick.p).toFixed(2)}${inPeakWindow() ? "[peak]" : ""} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
+      const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% gain=${((pick.p - pick.ask) * 100).toFixed(1)}pp (edge ${pick.edge.toFixed(3)})${inPeakWindow() ? "[peak]" : ""} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
       if (orderUsd > state.cash) { done.add(m.cid); continue; }        // no room; re-armed next discover
       if (DRY) { hourlyMark(); log(`qtable2 DRY would BUY ${tag} · hourly ${hourly.length}/${MAX_PER_HOUR} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 36)}`); done.add(m.cid); continue; }
 
@@ -425,7 +434,7 @@ export function startQTable2(deps) {
   }
 
   (async function run() {
-    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${(EDGE + EDGE_BUMP).toFixed(2)}-${MAX_EDGE}@p≥${(MIN_P * 100).toFixed(0)}% (hardened +${(EDGE_BUMP * 100).toFixed(0)}pp; +${(EDGE_BUMP_PEAK * 100).toFixed(0)}pp Mon-Fri 16:00-18:30 ${PEAK_TZ}) · persist ${PERSIST_S}s · ${COINS.join(",")} · max ${MAX_PER_HOUR}/h (rolling, persisted) · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · gain ${(MIN_DISAGREE * 100).toFixed(0)}-${(MAX_DISAGREE * 100).toFixed(0)}pp@p≥${(MIN_P * 100).toFixed(0)}% (hardened +${(EDGE_BUMP * 100).toFixed(0)}pp; +${(EDGE_BUMP_PEAK * 100).toFixed(0)}pp Mon-Fri 16:00-18:30 ${PEAK_TZ}) · persist ${PERSIST_S}s · ${COINS.join(",")} · max ${MAX_PER_HOUR}/h (rolling, persisted) · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const wsCtl = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
