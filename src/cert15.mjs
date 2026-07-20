@@ -24,7 +24,7 @@
 // Spawned by maybeStartEngines() (bot.mjs) when CERT15_ENABLED=1 locally OR the server setting
 // cert15=true (fleet flag CERT15_FLEET, default ON). state.cert15 === false is the live kill switch.
 // DRY: CERT15_DRY=1 logs would-be fills, places nothing.
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync, appendFileSync, writeFileSync } from "node:fs";
 import { log, warn } from "./log.mjs";
 
 // node:20-slim has NO global WebSocket — fall back to the `ws` package (see qtable2.mjs).
@@ -91,6 +91,25 @@ const COINS = WANT.filter((c) => {
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
 const LEDGER = `${DATA_DIR}/cert15-trades.ndjson`;
 function appendLedger(rec) { try { appendFileSync(LEDGER, JSON.stringify(rec) + "\n"); } catch (e) { warn("cert15 ledger:", e?.message); } }
+
+// HOURLY TRADE CAP (owner 2026-07-19, the 10-track rollout: cert15 runs on EVERY track, so every
+// user carries it — capped at 4 trades per rolling 60min). Fill timestamps persist to the volume
+// (like the builder-rotation counter) so a restart cannot reset the window and double the budget.
+// Only REAL entries consume a slot (fills, and DRY would-buys so a dry run shows the cap working);
+// failed FAKs do not — a retry is the same trade, not a new one.
+const MAX_PER_HOUR = N("CERT15_MAX_PER_HOUR", 4);
+const HOURLY_FILE = `${DATA_DIR}/cert15-hourly.json`;
+let hourly = [];
+try { hourly = (JSON.parse(readFileSync(HOURLY_FILE, "utf8")).ts || []).filter((t) => Number.isFinite(t) && t > Date.now() - 3600e3); } catch { /* fresh */ }
+function hourlyCapped() {
+  const cut = Date.now() - 3600e3;
+  while (hourly.length && hourly[0] < cut) hourly.shift();
+  return hourly.length >= MAX_PER_HOUR;
+}
+function hourlyMark() {
+  hourly.push(Date.now());
+  try { writeFileSync(HOURLY_FILE, JSON.stringify({ ts: hourly })); } catch (e) { warn("cert15 hourly:", e?.message); }
+}
 
 // ---- Chainlink RTDS: reference buffer + live spot (the feed Polymarket resolves on) ----
 const hist = {}; // sym -> [{t,v}] last ~35min (covers strike ref + the 300s vol window at any elapsed)
@@ -200,8 +219,8 @@ export function startCert15(deps) {
   const apiRef = {};          // cid -> backfilled window-open strike
   const done = new Set();     // cid -> already ordered / permanently skipped (one trade per candle)
   const fails = new Map();    // cid -> failed order attempts
-  const stats = { signals: 0, orders: 0, fills: 0 };
-  let alive = true;
+  const stats = { signals: 0, orders: 0, fills: 0, capSkips: 0 };
+  let alive = true, lastCapLog = 0;
 
   async function discover() {
     const now = Date.now();
@@ -289,6 +308,14 @@ export function startCert15(deps) {
       const p2 = TABLE.pooled.h[k] / cellN;
       if (p2 < MIN_P) continue;
 
+      // ---- HOURLY CAP (owner 2026-07-19): max 4 entries per rolling hour, persisted ----
+      // Skip WITHOUT done-ing the candle: a slot can free up while this window is still open.
+      if (hourlyCapped()) {
+        stats.capSkips++;
+        if (Date.now() - lastCapLog > 60_000) { lastCapLog = Date.now(); log(`cert15: hourly cap ${hourly.length}/${MAX_PER_HOUR} — signal skipped (${m.question.slice(0, 40)})`); }
+        continue;
+      }
+
       // ---- execution: buy the side that already won, at the ask, capped at 97c ----
       const up = S > strike;
       const pick = up ? { side: "Up", token: m.tokenUp, outcome: m.outUp } : { side: "Down", token: m.tokenDn, outcome: m.outDn };
@@ -308,7 +335,7 @@ export function startCert15(deps) {
       const orderUsd = (shares * priceCents) / 100;          // worst-case (fills at ask <= limit)
       const tag = `${pick.side} 15m ${m.sym} ask ${askC}c z=${z.toFixed(2)} gap=${gapBps.toFixed(1)}bps p2=${(p2 * 100).toFixed(2)}%(n=${cellN}) rem=${remS.toFixed(0)}s`;
       if (orderUsd > state.cash) { done.add(m.cid); continue; } // no room; re-armed on next discover
-      if (DRY) { log(`cert15 DRY would BUY ${tag} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 40)}`); done.add(m.cid); continue; }
+      if (DRY) { hourlyMark(); log(`cert15 DRY would BUY ${tag} · hourly ${hourly.length}/${MAX_PER_HOUR} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 40)}`); done.add(m.cid); continue; }
 
       done.add(m.cid); // ONE trade per candle per bot
       const t0 = Date.now();
@@ -325,6 +352,7 @@ export function startCert15(deps) {
         continue;
       }
       stats.fills++;
+      hourlyMark();                                          // a filled entry consumes an hourly slot
       try { await cosmos.meter({ ...r.meta, source: "cert15" }); } catch { /* best-effort */ }
       positions[m.cid] = {
         condition_id: m.cid, token_id: pick.token, outcome: pick.outcome, source: "cert15",
@@ -341,7 +369,7 @@ export function startCert15(deps) {
   }
 
   (async function run() {
-    log(`cert15: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing (min $1)"} · gates z>=${MIN_Z} AND record>=${(MIN_P * 100).toFixed(1)}%(n>=${MIN_CELL_N}) · gap>=${MIN_GAP_BPS}bps · window ${MIN_REMAIN_S}-${MAX_REMAIN_S}s left · ask ${MIN_CENTS}-${MAX_CENTS}c · ${COINS.map((c) => API_SYM[c]).join("+")} 15m only · hold to redemption · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`cert15: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing (min $1)"} · gates z>=${MIN_Z} AND record>=${(MIN_P * 100).toFixed(1)}%(n>=${MIN_CELL_N}) · gap>=${MIN_GAP_BPS}bps · window ${MIN_REMAIN_S}-${MAX_REMAIN_S}s left · ask ${MIN_CENTS}-${MAX_CENTS}c · ${COINS.map((c) => API_SYM[c]).join("+")} 15m only · max ${MAX_PER_HOUR}/h (rolling, persisted) · hold to redemption · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const wsCtl = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
@@ -355,7 +383,7 @@ export function startCert15(deps) {
         const h = hist[c]; const age = h?.length ? Date.now() - h[h.length - 1].t : Infinity;
         return `${API_SYM[c].toLowerCase()} ${age === Infinity ? "NO FEED ⚠" : (age / 1000).toFixed(1) + "s"}`;
       }).join(" · ");
-      log(`cert15 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills}`);
+      log(`cert15 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills} · hourly ${hourly.filter((t) => t > Date.now() - 3600e3).length}/${MAX_PER_HOUR}${stats.capSkips ? ` (cap-skipped ${stats.capSkips})` : ""}`);
       const staleCoin = COINS.find((c) => { const h = hist[c]; return h?.length && Date.now() - h[h.length - 1].t > WATCHDOG_MS; });
       if (staleCoin && Date.now() - lastKick > WATCHDOG_MS) {
         lastKick = Date.now();
