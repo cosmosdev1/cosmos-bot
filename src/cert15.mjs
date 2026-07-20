@@ -125,9 +125,14 @@ function connectChainlink() {
   let ws, stopped = false;
   const go = () => {
     try { ws = new WSImpl("wss://ws-live-data.polymarket.com", WS_OPTS); } catch { return setTimeout(go, 1500); }
+    // Subscribe TOPIC-WIDE, filter client-side (onmessage drops unknown symbols). Per-symbol filters
+    // are broken server-side: filtered subs match nothing ("ETHUSDT" vs the stream's "ETH/USD"), and
+    // whatever partial flow they produced starved SOL to ~1 tick/5min while ETH ticked at 1Hz — the
+    // watchdog reconnected forever without curing it. Probed 2026-07-20: the no-filter subscribe
+    // streams EVERY symbol at a steady 1 tick/s on the exact prod socket options.
     ws.onopen = () => { ws.send(JSON.stringify({ action: "subscribe", subscriptions:
-      COINS.map((c) => ({ topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: SYM_WS[c] }) })),
-    })); log(`cert15 chainlink: connected (${COINS.map((c) => SYM_WS[c]).join(", ")})`); };
+      [{ topic: "crypto_prices_chainlink", type: "*" }],
+    })); log(`cert15 chainlink: connected, topic-wide (want ${COINS.map((c) => SYM_WS[c]).join(", ")})`); };
     ws.onmessage = (ev) => {
       let m; try { m = JSON.parse(String(ev.data)); } catch { return; }
       const p = m?.payload ?? m; const sym = WS_SYM[String(p?.symbol ?? "").toLowerCase()];

@@ -171,9 +171,11 @@ function connectChainlink() {
   let ws, stopped = false;
   const go = () => {
     try { ws = new WSImpl("wss://ws-live-data.polymarket.com", WS_OPTS); } catch { return setTimeout(go, 1500); }
+    // Topic-wide subscribe, client-side filtering — per-symbol filters are broken server-side (the
+    // root cause of "silently loses 2/3 of its coins"; see cert15.mjs connectChainlink, probed 2026-07-20).
     ws.onopen = () => { ws.send(JSON.stringify({ action: "subscribe", subscriptions:
-      COINS.map((c) => ({ topic: "crypto_prices_chainlink", type: "*", filters: JSON.stringify({ symbol: SYM_WS[c] }) })),
-    })); log(`qtable2 chainlink: connected (${COINS.map((c) => SYM_WS[c]).join(", ")})`); };
+      [{ topic: "crypto_prices_chainlink", type: "*" }],
+    })); log(`qtable2 chainlink: connected, topic-wide (want ${COINS.map((c) => SYM_WS[c]).join(", ")})`); };
     ws.onmessage = (ev) => {
       let m; try { m = JSON.parse(String(ev.data)); } catch { return; }
       const p = m?.payload ?? m; const sym = WS_SYM[String(p?.symbol ?? "").toLowerCase()];
