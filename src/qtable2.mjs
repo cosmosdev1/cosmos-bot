@@ -12,7 +12,7 @@
 // Spawned from main() ONLY when QTABLE2_ENABLED=1 (per-deployment gate — set as a Fly secret on ONE
 // user's app; every other bot leaves the flag unset and never even imports this file). Runs as a fast
 // ~250ms side-loop next to the 30s cycle. DRY: QTABLE2_DRY=1 logs would-be fills, places nothing.
-import { readFileSync, appendFileSync } from "node:fs";
+import { readFileSync, appendFileSync, writeFileSync } from "node:fs";
 import { log, warn } from "./log.mjs";
 
 // The bot runs on node:20-slim, which has NO global WebSocket. Without this the Chainlink RTDS feed
@@ -125,6 +125,23 @@ const COINS = Object.keys(TABLE.coins);
 const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
 const LEDGER = `${DATA_DIR}/qtable2-trades.ndjson`;
 function appendLedger(rec) { try { appendFileSync(LEDGER, JSON.stringify(rec) + "\n"); } catch (e) { warn("qtable2 ledger:", e?.message); } }
+
+// HOURLY TRADE CAP (owner 2026-07-20: same 4-per-rolling-60min budget as cert15 — the edge engine
+// runs for every user, so bound its burst rate). Timestamps persist to the volume so a restart
+// cannot reset the window. Fills and DRY would-buys consume a slot; failed FAKs do not.
+const MAX_PER_HOUR = N("QTABLE2_MAX_PER_HOUR", 4);
+const HOURLY_FILE = `${DATA_DIR}/qtable2-hourly.json`;
+let hourly = [];
+try { hourly = (JSON.parse(readFileSync(HOURLY_FILE, "utf8")).ts || []).filter((t) => Number.isFinite(t) && t > Date.now() - 3600e3); } catch { /* fresh */ }
+function hourlyCapped() {
+  const cut = Date.now() - 3600e3;
+  while (hourly.length && hourly[0] < cut) hourly.shift();
+  return hourly.length >= MAX_PER_HOUR;
+}
+function hourlyMark() {
+  hourly.push(Date.now());
+  try { writeFileSync(HOURLY_FILE, JSON.stringify({ ts: hourly })); } catch (e) { warn("qtable2 hourly:", e?.message); }
+}
 
 // ---- table lookup (tow-aware; ported from lib/qtable.ts) ----
 function towBucket(ms, buckets) {
@@ -262,8 +279,8 @@ export function startQTable2(deps) {
   const apiRef = {};          // cid -> backfilled window-open reference
   const done = new Set();     // cid -> already ordered / permanently skipped this run
   const fails = new Map();    // cid -> failed order attempts
-  const stats = { signals: 0, orders: 0, fills: 0 };
-  let alive = true;
+  const stats = { signals: 0, orders: 0, fills: 0, capSkips: 0 };
+  let alive = true, lastCapLog = 0;
 
   async function discover() {
     const now = Date.now();
@@ -358,6 +375,13 @@ export function startQTable2(deps) {
       const pick = cands.sort((a, b) => b.edge - a.edge)[0];
       if (!pick) continue;
 
+      // HOURLY CAP: skip WITHOUT done-ing the market — a slot can free up while the edge holds.
+      if (hourlyCapped()) {
+        stats.capSkips++;
+        if (Date.now() - lastCapLog > 60_000) { lastCapLog = Date.now(); log(`qtable2: hourly cap ${hourly.length}/${MAX_PER_HOUR} — signal skipped (${m.question.slice(0, 36)})`); }
+        continue;
+      }
+
       stats.signals++;
       const bookMs = Date.now() - tBook;                               // book-fetch + decision latency
       // sizing: fixed $ if QTABLE2_STAKE_USD>0, else the account's dashboard % (e.g. 3% flat), floored at $2
@@ -367,7 +391,7 @@ export function startQTable2(deps) {
       const orderUsd = (shares * priceCents) / 100;
       const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% edge=${pick.edge.toFixed(3)}/req${edgeReqFor(pick.p).toFixed(2)}${inPeakWindow() ? "[peak]" : ""} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
       if (orderUsd > state.cash) { done.add(m.cid); continue; }        // no room; re-armed next discover
-      if (DRY) { log(`qtable2 DRY would BUY ${tag} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 36)}`); done.add(m.cid); continue; }
+      if (DRY) { hourlyMark(); log(`qtable2 DRY would BUY ${tag} · hourly ${hourly.length}/${MAX_PER_HOUR} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 36)}`); done.add(m.cid); continue; }
 
       done.add(m.cid); // one shot per market
       const t0 = Date.now();
@@ -384,6 +408,7 @@ export function startQTable2(deps) {
         continue;
       }
       stats.fills++;
+      hourlyMark();                                          // a filled entry consumes an hourly slot
       try { await cosmos.meter({ ...r.meta, source: "qtable" }); } catch { /* best-effort */ }
       positions[m.cid] = {
         condition_id: m.cid, token_id: pick.token, outcome: pick.outcome, source: "qtable",
@@ -400,7 +425,7 @@ export function startQTable2(deps) {
   }
 
   (async function run() {
-    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${(EDGE + EDGE_BUMP).toFixed(2)}-${MAX_EDGE}@p≥${(MIN_P * 100).toFixed(0)}% (hardened +${(EDGE_BUMP * 100).toFixed(0)}pp; +${(EDGE_BUMP_PEAK * 100).toFixed(0)}pp Mon-Fri 16:00-18:30 ${PEAK_TZ}) · persist ${PERSIST_S}s · ${COINS.join(",")} · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
+    log(`qtable2: engine ON · ${STAKE > 0 ? "$" + STAKE + "/trade" : "dashboard % sizing"} · edge ${(EDGE + EDGE_BUMP).toFixed(2)}-${MAX_EDGE}@p≥${(MIN_P * 100).toFixed(0)}% (hardened +${(EDGE_BUMP * 100).toFixed(0)}pp; +${(EDGE_BUMP_PEAK * 100).toFixed(0)}pp Mon-Fri 16:00-18:30 ${PEAK_TZ}) · persist ${PERSIST_S}s · ${COINS.join(",")} · max ${MAX_PER_HOUR}/h (rolling, persisted) · tick ${TICK_MS}ms${DRY ? " · DRY RUN" : ""}`);
     const wsCtl = connectChainlink();
     await discover().catch(() => {});
     const di = setInterval(() => discover().catch(() => {}), 15_000);
@@ -416,7 +441,7 @@ export function startQTable2(deps) {
         const h = hist[c]; const age = h?.length ? Date.now() - h[h.length - 1].t : Infinity;
         return `${API_SYM[c].toLowerCase()} ${age === Infinity ? "NO FEED ⚠" : (age / 1000).toFixed(1) + "s"}`;
       }).join(" · ");
-      log(`qtable2 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills}`);
+      log(`qtable2 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills} · hourly ${hourly.filter((t) => t > Date.now() - 3600e3).length}/${MAX_PER_HOUR}${stats.capSkips ? ` (cap-skipped ${stats.capSkips})` : ""}`);
       const staleCoin = COINS.find((c) => { const h = hist[c]; return h?.length && Date.now() - h[h.length - 1].t > WATCHDOG_MS; });
       if (staleCoin && Date.now() - lastKick > WATCHDOG_MS) {
         lastKick = Date.now();
