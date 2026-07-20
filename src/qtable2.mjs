@@ -126,10 +126,10 @@ const DATA_DIR = (process.env.COSMOS_DATA_DIR || ".").replace(/\/$/, "");
 const LEDGER = `${DATA_DIR}/qtable2-trades.ndjson`;
 function appendLedger(rec) { try { appendFileSync(LEDGER, JSON.stringify(rec) + "\n"); } catch (e) { warn("qtable2 ledger:", e?.message); } }
 
-// HOURLY TRADE CAP (owner 2026-07-20: same 4-per-rolling-60min budget as cert15 — the edge engine
-// runs for every user, so bound its burst rate). Timestamps persist to the volume so a restart
-// cannot reset the window. Fills and DRY would-buys consume a slot; failed FAKs do not.
-const MAX_PER_HOUR = N("QTABLE2_MAX_PER_HOUR", 4);
+// HOURLY TRADE CAP (owner 2026-07-20: 3 per rolling 60min for the fleet-live rollout — one notch
+// under cert15's 4). Timestamps persist to the volume so a restart cannot reset the window.
+// Fills and DRY would-buys consume a slot; failed FAKs do not.
+const MAX_PER_HOUR = N("QTABLE2_MAX_PER_HOUR", 3);
 const HOURLY_FILE = `${DATA_DIR}/qtable2-hourly.json`;
 let hourly = [];
 try { hourly = (JSON.parse(readFileSync(HOURLY_FILE, "utf8")).ts || []).filter((t) => Number.isFinite(t) && t > Date.now() - 3600e3); } catch { /* fresh */ }
