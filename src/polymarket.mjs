@@ -39,7 +39,9 @@ const ERC20_BALANCE_ABI = [{
 // COSMOS_BUILDER_CODE may override to another VALID code (ops flexibility); an invalid or zero
 // value falls back to the default — it never disables attribution.
 const ZERO32 = "0x" + "0".repeat(64);
-const DEFAULT_BUILDER_CODE = "0x4ddc9c090a1adb966274f26284e0e0f686b6828ec71299a1dc310ebea4bb8166"; // Cosmos's Polymarket builder code (public, safe to ship)
+// Cosmos's Polymarket builder code (public, safe to ship). Rotated 2026-07-20 after the builder
+// account migration — fees now settle to the new builder wallet 0xb1a0303affadd68a63a128ac1c3f02811239e45e.
+const DEFAULT_BUILDER_CODE = "0xbb05bc9c71cb8e40ba9a0fab6e58bcac9df3cb53fb0b2553628b3c2bde5d6bf7";
 const envCode = (process.env.COSMOS_BUILDER_CODE || "").trim();
 const BUILDER_CODE = /^0x[0-9a-fA-F]{64}$/.test(envCode) && envCode !== ZERO32 ? envCode : DEFAULT_BUILDER_CODE;
 const builderOn = true;

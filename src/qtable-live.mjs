@@ -43,7 +43,7 @@ const log = (...a) => console.log(stamp(), ...a);
 // (deposit wallets) when Polymarket returns "maker address not allowed, please use the deposit wallet
 // flow" — the clob-client-v2 SDK already builds the ERC-7739-wrapped POLY_1271 signature. Force a type
 // with QTL_SIG_TYPE=0|1|2|3 to skip detection.
-const BUILDER_CODE = "0x4ddc9c090a1adb966274f26284e0e0f686b6828ec71299a1dc310ebea4bb8166";
+const BUILDER_CODE = "0xbb05bc9c71cb8e40ba9a0fab6e58bcac9df3cb53fb0b2553628b3c2bde5d6bf7"; // new builder account 2026-07-20
 const SIG_NAMES = { 0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE", 3: "POLY_1271" };
 const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has to be the address of the API/i;
 async function makeTrader(key, funderAddr) {
