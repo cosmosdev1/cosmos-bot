@@ -339,7 +339,9 @@ export function startCert15(deps) {
       const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(sizeUsd, priceCents));
       const orderUsd = (shares * priceCents) / 100;          // worst-case (fills at ask <= limit)
       const tag = `${pick.side} 15m ${m.sym} ask ${askC}c z=${z.toFixed(2)} gap=${gapBps.toFixed(1)}bps p2=${(p2 * 100).toFixed(2)}%(n=${cellN}) rem=${remS.toFixed(0)}s`;
-      if (orderUsd > state.cash) { done.add(m.cid); continue; } // no room; re-armed on next discover
+      // No room right now. Do NOT done() it (same fix as qtable2): `done` is never pruned, so
+      // done-ing here permanently burned the candle even after cash freed up.
+      if (orderUsd > state.cash) continue;
       if (DRY) { hourlyMark(); log(`cert15 DRY would BUY ${tag} · hourly ${hourly.length}/${MAX_PER_HOUR} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 40)}`); done.add(m.cid); continue; }
 
       done.add(m.cid); // ONE trade per candle per bot
