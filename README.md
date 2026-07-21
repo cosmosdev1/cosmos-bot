@@ -7,7 +7,44 @@ which meters usage ($0.09 / order) and enforces your daily limit.
 This repo is intentionally **separate** from the main Cosmos app: it's the only piece that touches
 your private key, so it ships and is reviewed on its own.
 
-## Install
+## Install (one line, nothing to build)
+
+Your Cosmos dashboard bakes your token into the command. Nothing else to install — the script
+brings the Fly CLI with it, creates a small server in Stockholm, stores your three values as Fly
+secrets, and deploys.
+
+**Windows** (search your computer for *PowerShell*, paste, Enter):
+
+```powershell
+$env:POLYMARKET_PRIVATE_KEY="0x…"
+$env:POLYMARKET_FUNDER="0x…"
+$env:COSMOS_TOKEN="csk_…"; irm https://try-cosmos.com/bot/fly.ps1 | iex
+```
+
+**macOS / Linux** (open *Terminal*, paste, Enter):
+
+```sh
+POLYMARKET_PRIVATE_KEY="0x…" \
+POLYMARKET_FUNDER="0x…" \
+COSMOS_TOKEN="csk_…" sh -c "$(curl -fsSL https://try-cosmos.com/bot/fly.sh)"
+```
+
+`POLYMARKET_FUNDER` must be the address on your Polymarket **profile** page
+(`polymarket.com/profile/0x…`), **not** the deposit address. That mix-up is the single most common
+reason a bot never trades.
+
+Prefer not to touch a terminal? The setup page gives you a personalized prompt to paste into
+Claude, which walks you through it. Your private key never goes into that chat.
+
+## It updates itself
+
+You never reinstall. The container is a thin launcher: it clones the bot at runtime and re-checks
+this repo **every 10 minutes**, so a new strategy, a changed gate, or a fixed bug reaches your bot
+automatically, with no action from you. Open positions and local state live on a persistent volume
+and survive every update.
+
+<details>
+<summary>Local development (running from source)</summary>
 
 ```sh
 git clone https://github.com/cosmosdev1/cosmos-bot.git
@@ -17,8 +54,9 @@ npm run setup      # enter your Cosmos token + Polymarket keys + per-trade %
 npm start
 ```
 
-Requires **Node.js 18+** (https://nodejs.org). One-line installers are in `install.ps1` /
-`install.sh` (set your repo URL inside them first).
+Requires **Node.js 18+** (https://nodejs.org). For a self-hosted long-running install, use
+`install.ps1` / `install.sh`, which wrap the bot in the same auto-update launcher loop.
+</details>
 
 ## Run it 24/7 (computer can be off)
 
