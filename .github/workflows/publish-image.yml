@@ -1,0 +1,46 @@
+# Publishes the generic self-updating launcher image to GHCR: ghcr.io/cosmosdev1/cosmos-bot:latest
+#
+# The image is a thin launcher (Dockerfile + entrypoint.sh): at runtime it clones the latest bot
+# code and self-updates every 10 min, so the image itself almost never changes - it only needs a
+# rebuild when the Dockerfile or entrypoint.sh change. That's exactly what `paths:` below matches.
+#
+# Installer v2 (try-cosmos.com/bot/fly.ps1 / fly.sh) deploys THIS image with `fly machine run` -
+# no git, no clone, no build on the user's machine.
+#
+# ONE-TIME SETUP (owner, after the first successful run of this workflow):
+#   The GHCR package is created PRIVATE by default, and users' Fly machines pull it with NO auth -
+#   a private package means every install fails with a 404/denied at `fly machine run`.
+#   Make it public once: github.com/cosmosdev1 -> Packages -> cosmos-bot -> Package settings ->
+#   Danger Zone -> Change visibility -> Public. It stays public across future pushes.
+name: publish-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - entrypoint.sh
+      - .github/workflows/publish-image.yml
+  workflow_dispatch: {} # manual re-publish (e.g. right after merging this workflow)
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/cosmosdev1/cosmos-bot:latest
