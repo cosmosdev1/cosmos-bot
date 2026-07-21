@@ -546,15 +546,23 @@ const engineOn = (envKey, serverFlag) =>
 const engineReason = (envKey, serverFlag) =>
   process.env[envKey] === "0" ? `${envKey}=0 (local)` : serverFlag === false ? "server flag off" : "";
 async function maybeStartEngines(settings, pm, cosmos) {
-  const wantQt = engineOn("QTABLE2_ENABLED", settings.qtable2);
-  const wantCopy = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;
-  const wantCert = engineOn("CERT15_ENABLED", settings.cert15);
+  // THE MASTER STOP APPLIES TO THE ENGINES TOO (fixed 2026-07-21). qtable2 and cert15 are their own
+  // ~250ms side-loops that discover markets straight from gamma and place orders themselves - they
+  // never pass through cycle(). The dashboard Stop switch returned from cycle() BELOW this function,
+  // so it stopped entries/exits but left both engines buying: verified in production, user 3076894b
+  // paused at 21:00 and their bot still placed 5 real BUYs (21:12, 21:17, 21:24, 21:38, 21:45), and
+  // four other users the same. Spending money after an explicit Stop is the worst class of bug we
+  // can ship, so the stop is now folded into the flags the engines actually read.
+  const stopped = settings.bot_enabled === false;
+  const wantQt = engineOn("QTABLE2_ENABLED", settings.qtable2) && !stopped;
+  const wantCopy = (process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true) && !stopped;
+  const wantCert = engineOn("CERT15_ENABLED", settings.cert15) && !stopped;
   // Announce every transition. A silently-disabled engine is the failure this whole block exists to
   // prevent: without these lines the only symptom is "the bot stopped trading" with no explanation.
   for (const [name, want, reason] of [
-    ["qtable2", wantQt, engineReason("QTABLE2_ENABLED", settings.qtable2)],
-    ["cert15", wantCert, engineReason("CERT15_ENABLED", settings.cert15)],
-    ["copytrade", wantCopy, settings.copytrade === true ? "" : "server flag off"],
+    ["qtable2", wantQt, stopped ? "you pressed Stop in the dashboard" : engineReason("QTABLE2_ENABLED", settings.qtable2)],
+    ["cert15", wantCert, stopped ? "you pressed Stop in the dashboard" : engineReason("CERT15_ENABLED", settings.cert15)],
+    ["copytrade", wantCopy, stopped ? "you pressed Stop in the dashboard" : settings.copytrade === true ? "" : "server flag off"],
   ]) {
     if (qtState[name] !== undefined && qtState[name] !== want) {
       log(want ? `engine ${name}: ENABLED` : `engine ${name}: DISABLED - ${reason || "server flag off"} (it will stop trading)`);
@@ -591,6 +599,12 @@ async function cycle(cosmos, pm) {
   // --- MASTER STOP: the dashboard Start/Stop switch. When stopped, the bot trades nothing
   // (no entries, no exits) but stays connected and re-checks every cycle, so Start resumes it. ---
   if (settings.bot_enabled === false) {
+    // BELT AND BRACES on top of the engine flags above: the engines also refuse to trade when
+    // state.cash is null (they cannot size a trade without a balance). Clearing it here means that
+    // even if a future edit forgets to gate an engine on `stopped`, a paused bot still cannot spend.
+    // Without this the engines kept sizing off the last balance read before the pause.
+    qtState.cash = null;
+    qtState.sizing = null;
     const open = Object.keys(store.load()).length;
     log(`paused · start the bot from your Cosmos dashboard${open ? ` · ${open} open position(s) NOT being managed` : ""}`);
     return;
