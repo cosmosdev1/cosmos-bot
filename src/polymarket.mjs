@@ -3,6 +3,9 @@
 // region), then reports it to Cosmos for $0.09 metering. Written against @polymarket/clob-client-v2
 // (Polymarket's CLOB V2 client — the old clob-client signs an order version V2 now rejects).
 import { ClobClient, Side, OrderType, AssetType, Chain, SignatureTypeV2, createL1Headers } from "@polymarket/clob-client-v2";
+import { readFileSync as _rfs, writeFileSync as _wfs, mkdirSync as _mkd } from "node:fs";
+import { homedir as _home } from "node:os";
+import { join as _pjoin } from "node:path";
 import { createWalletClient, createPublicClient, http, fallback } from "viem";
 import { polygon } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
@@ -39,12 +42,75 @@ const ERC20_BALANCE_ABI = [{
 // COSMOS_BUILDER_CODE may override to another VALID code (ops flexibility); an invalid or zero
 // value falls back to the default — it never disables attribution.
 const ZERO32 = "0x" + "0".repeat(64);
-// Cosmos's Polymarket builder code (public, safe to ship). Rotated 2026-07-20 after the builder
-// account migration — fees now settle to the new builder wallet 0xb1a0303affadd68a63a128ac1c3f02811239e45e.
+// Cosmos's Polymarket builder code (public, safe to ship). Updated 2026-07-20 after the account
+// migration -> fees now land in the NEW builder wallet 0xb1a0303affadd68a63a128ac1c3f02811239e45e.
 const DEFAULT_BUILDER_CODE = "0xbb05bc9c71cb8e40ba9a0fab6e58bcac9df3cb53fb0b2553628b3c2bde5d6bf7";
 const envCode = (process.env.COSMOS_BUILDER_CODE || "").trim();
 const BUILDER_CODE = /^0x[0-9a-fA-F]{64}$/.test(envCode) && envCode !== ZERO32 ? envCode : DEFAULT_BUILDER_CODE;
 const builderOn = true;
+// AFFILIATE ROTATION (owner 2026-07-16): when this user was referred by an active affiliate, the server
+// sends the affiliate's builder code and every 5th order carries IT instead of Cosmos's — 4/5 Cosmos,
+// 1/5 affiliate = the affiliate's ~20% share, paid by Polymarket directly to their account (never via
+// Cosmos). The counter persists to disk so restarts don't reset the cadence.
+// COSMOS_DATA_DIR when set (Fly mounts /data — keep that); otherwise a FIXED per-user dir
+// (~/.cosmos), NOT the cwd: a bot relaunched from a different directory (or a host whose working
+// dir is wiped on restart) would silently reset the 1-in-5 cadence and over/under-serve the
+// affiliate's share. The home dir survives restarts everywhere.
+const ROT_DIR = process.env.COSMOS_DATA_DIR
+  ? process.env.COSMOS_DATA_DIR.replace(/\/$/, "")
+  : _pjoin(_home(), ".cosmos");
+try { _mkd(ROT_DIR, { recursive: true }); } catch { /* rotSave stays best-effort */ }
+const ROT_FILE = _pjoin(ROT_DIR, "builder-rotation.json");
+let rotN = 0; try { rotN = Number(JSON.parse(_rfs(ROT_FILE, "utf8")).n) || 0; } catch { /* fresh */ }
+function rotSave() { try { _wfs(ROT_FILE, JSON.stringify({ n: rotN })); } catch { /* best-effort */ } }
+const AFF_EVERY = 5;
+
+// ---- ACTUAL-FILL extraction (2026-07-19) ----
+// The CLOB's POST /order response (clob-client-v2 OrderResponse: { success, errorMsg, orderID,
+// transactionsHashes, tradeIDs, status, takingAmount, makingAmount }) reports what actually MATCHED,
+// as maker/taker asset amounts:
+//   BUY : maker asset = USDC   -> makingAmount = $ spent,      takingAmount = shares received
+//   SELL: maker asset = shares -> makingAmount = shares sold,  takingAmount = $ received
+// A FAK's price is only a CEILING and its size only a REQUEST — the real fill is routinely smaller
+// and better-priced (a "97c" order really filled 3.96 sh @ 49c; a sell ledgered $132 vs $242 real).
+// Returns:
+//   { shares, priceCents }  something matched (partial or full) — shares filled + avg price in cents
+//   { shares: 0 }           fill fields present and zero: the FAK was killed with NOTHING filled
+//   null                    no readable fill info in the response (caller falls back + flags it)
+// Units are validated, never assumed: the amounts are documented as human-decimal strings, but if a
+// raw read violates the hard invariants (filled ≤ requested, price inside 0-100c) we retry the read
+// as 1e6 base units; if neither interpretation is sane we return null rather than guess.
+function extractFill(resp, side, reqShares) {
+  const t = Number(resp?.takingAmount), m = Number(resp?.makingAmount);
+  if (!Number.isFinite(t) || !Number.isFinite(m)) return null;
+  if (t === 0 && m === 0) return { shares: 0 };
+  for (const div of [1, 1e6]) {
+    const shares = (side === "SELL" ? m : t) / div;   // the shares leg of the fill
+    const usd = (side === "SELL" ? t : m) / div;      // the USDC leg of the fill
+    if (!(shares > 0) || !(usd > 0)) continue;
+    const priceC = (usd / shares) * 100;
+    if (shares <= reqShares * 1.001 && priceC >= 0.1 && priceC <= 100.5) {
+      const sh = Math.round(shares * 100) / 100;      // 2dp — matches Polymarket's share precision
+      // Sub-0.005-share dust = effectively nothing filled — but only trust that verdict from the
+      // primary human-units reading. In the 1e6 fallback a "dust" result is more likely a misparse,
+      // and misreading a REAL fill as zero would make the caller retry into a double-buy: fall
+      // through to null (fill_unknown) instead, which never re-fires an order.
+      if (!(sh > 0)) { if (div === 1) return { shares: 0 }; continue; }
+      return { shares: sh, priceCents: Math.round(priceC * 100) / 100 };
+    }
+  }
+  return null;
+}
+
+// The audit-relevant slice of the CLOB's order response, reported to the server via meter() so
+// bot_orders.polymarket_response lets fills be audited server-side (orderID + tx hashes + the
+// taking/making amounts are the reconciliation gold). Only these fields — never the whole client
+// object — and the server caps the stored payload at ~4KB on top.
+function trimClobResp(resp) {
+  if (!resp || typeof resp !== "object") return null;
+  const { success, errorMsg, error, orderID, status, takingAmount, makingAmount, transactionsHashes, tradeIDs } = resp;
+  return { success, errorMsg, error, orderID, status, takingAmount, makingAmount, transactionsHashes, tradeIDs };
+}
 
 export async function makePolymarket(config) {
   // viem signer (CLOB V2 is viem-based). Signing is local — no RPC needed.
@@ -161,10 +227,19 @@ export async function makePolymarket(config) {
   // wallets) needs the FUNDER-bound key; everything else uses the EOA-bound key.
   // When a builder code is configured, builderConfig makes the client auto-stamp it onto every
   // order (the SDK applies it at order-build time), so Polymarket collects Cosmos's builder fee.
-  const mkClientFor = (t, c) => {
+  const mkClientFor = (t, c, code = BUILDER_CODE) => {
     const o = { host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient, creds: c, signatureType: t, funderAddress: funder };
-    if (builderOn) o.builderConfig = { builderCode: BUILDER_CODE };
+    if (builderOn) o.builderConfig = { builderCode: code };
     return new ClobClient(o);
+  };
+  // Affiliate client is built lazily and rebuilt whenever the code or the signature type changes
+  // (the deposit-wallet recovery can flip sigType at order time).
+  let affCode = null, affClient = null, affSig = null, affCreds = null;
+  const getAffClient = () => {
+    if (!affCode) return null;
+    const c = sigType === SignatureTypeV2.POLY_1271 && depositCreds ? depositCreds : creds;
+    if (!affClient || affSig !== sigType || affCreds !== c) { affClient = mkClientFor(sigType, c, affCode); affSig = sigType; affCreds = c; }
+    return affClient;
   };
   if (sigType === SignatureTypeV2.POLY_1271) await deriveForFunder();
   let client = sigType === SignatureTypeV2.POLY_1271 && depositCreds ? mkClientFor(sigType, depositCreds) : mkClient(sigType);
@@ -178,6 +253,14 @@ export async function makePolymarket(config) {
     sigTypeName: SIG_NAMES[sigType],
     walletKind, // what the funder's bytecode says it is
     builderFee: builderOn, // whether a builder fee is being attached to orders
+
+    // AFFILIATE ROTATION: server-controlled. null/invalid clears it (all orders -> Cosmos code).
+    setAffiliateCode(code) {
+      const v = String(code || "").trim();
+      const ok = /^0x[0-9a-fA-F]{64}$/.test(v) && v !== ZERO32 && v.toLowerCase() !== BUILDER_CODE.toLowerCase();
+      const next = ok ? v : null;
+      if (next !== affCode) { affCode = next; affClient = null; }
+    },
 
     // Free USDC (cash) on the FUNDER/proxy wallet, for position sizing. On-chain balanceOf FIRST
     // (authoritative, never stale, always the funder - not the signer-EOA-derived proxy the CLOB
@@ -334,22 +417,62 @@ export async function makePolymarket(config) {
         return { ok: false, status: 400, body: { polymarket: { error: "size below sellable minimum (dust)" } }, meta: { market: tokenId, side: side.toLowerCase(), size: 0, price: priceCents } };
       }
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
-      const meta = { market: tokenId, side: side.toLowerCase(), size, price: priceCents };
-      const attempt = async () => {
+      // ROTATION: order 5, 10, 15... carries the affiliate's builder code (when one is set).
+      rotN++; rotSave();
+      const wantAff = Boolean(getAffClient()) && rotN % AFF_EVERY === 0;
+      // attempt(useAffiliate): resolves the client AND the code together, so meta.builder_code_used
+      // always reports the code the order ACTUALLY carried (audit #9) — even after a deposit-wallet
+      // recovery flips the signature type, or when getAffClient() has no client and we fall back.
+      const attempt = async (useAffiliate) => {
+        const affC = useAffiliate ? getAffClient() : null;
+        const c = affC || client;                                  // no aff client -> Cosmos client
+        const meta = { market: tokenId, side: side.toLowerCase(), size, price: priceCents, builder_code_used: affC ? affCode : BUILDER_CODE };
         try {
-          const resp = await client.createAndPostOrder(
+          const resp = await c.createAndPostOrder(
             { tokenID: tokenId, price, side: side === "SELL" ? Side.SELL : Side.BUY, size },
             undefined, // options: let the client resolve tickSize + negRisk per market
             ot,
           );
-          // V2 returns { error, status } on failure (throwOnError is off by default).
-          if (resp && resp.error) return { ok: false, status: resp.status ?? 400, body: { polymarket: resp }, meta };
+          // V2 returns { error, status } on failure (throwOnError is off by default); the CLOB can
+          // also answer 200 with success:false — both mean the placement itself failed, nothing filled.
+          // rejected:true = the CLOB ANSWERED and said "not accepted" — the one failure class where a
+          // re-post (affiliate fallback below) is provably safe, because no order sits on the book.
+          if (resp && (resp.error || resp.success === false)) return { ok: false, rejected: true, status: resp.status ?? 400, body: { polymarket: resp }, meta };
+          // RECORD THE FILL, NOT THE INTENT (2026-07-19). `size`/`priceCents` above are the REQUEST —
+          // the FAK cap and the shares we asked for. Every downstream ledger (bot_orders via the meter
+          // meta, copy_trades via copyReport) must see what MATCHED instead. Keep the request on new
+          // keys (audit trail; harmless extra keys server-side), overwrite size/price with the actual
+          // fill, and turn a zero-fill kill into ok:false so no phantom trade is ever recorded.
+          meta.req_size = size;               // shares we ASKED for
+          meta.limit_price = priceCents;      // the FAK cap we signed (cents)
+          const fill = resp ? extractFill(resp, side, size) : null;
+          if (!fill) {
+            meta.fill_unknown = true;         // response carried no readable fill info — report the request, flagged, never guessed
+          } else if (!(fill.shares > 0)) {
+            // FAK killed in full: the order placed NOTHING. Report it as a failure (status 400 — the
+            // same class callers already treat as a FAK kill: placeWithRetry retries, entries burn
+            // after their 4xx budget) so ledgers and metering never record a phantom trade.
+            // Deliberately NOT rejected:true — the order WAS accepted (and killed by the book, a
+            // FINAL verdict on this price/size); the builder code was never the problem, so the
+            // affiliate fallback must not fire the same doomed order again on the Cosmos code.
+            return { ok: false, status: 400, body: { polymarket: { ...resp, error: "FAK killed: nothing filled" } }, meta: { ...meta, size: 0 } };
+          } else {
+            meta.size = fill.shares;          // shares that actually filled (partials included)
+            meta.price = fill.priceCents;     // average fill price in cents, not the limit cap
+          }
+          // Carry the CLOB's own answer (orderID, tx hashes, taking/making amounts) into the meta so
+          // meter() reports it and the server can audit fills against what we ledgered (the orders
+          // route used to store null here). Trimmed to the audit fields — never the whole client blob.
+          meta.polymarket_response = trimClobResp(resp);
           return { ok: true, status: 200, body: { polymarket: resp }, meta };
         } catch (e) {
+          // A THROW is transport-level (timeout, connection reset, DNS, signing) — the request may
+          // have reached the CLOB and the order may be LIVE even though we never saw the answer.
+          // Deliberately NOT rejected:true: re-posting here (affiliate fallback) could double-fill.
           return { ok: false, status: 400, body: { polymarket: { error: e?.message ?? "order failed" } }, meta };
         }
       };
-      let r = await attempt();
+      let r = await attempt(wantAff);
       // DEPOSIT-WALLET AUTO-RECOVERY: "maker address not allowed, please use the deposit wallet flow"
       // means this account is Polymarket's NEW kind and needs POLY_1271 + a FUNDER-bound API key.
       // Detection can miss it (an empty/undeployed deposit wallet probes $0), so recover at order time:
@@ -360,8 +483,25 @@ export async function makePolymarket(config) {
         const dc = await deriveForFunder();
         sigType = SignatureTypeV2.POLY_1271;
         client = mkClientFor(sigType, dc || creds);
-        r = await attempt();
+        affClient = null;                       // rebuilt with the new sigType on the next rotation hit
+        r = await attempt(wantAff);
         if (r.ok) console.log("[polymarket] ✓ POLY_1271 (deposit wallet) works — using it from now on");
+      }
+      // AFFILIATE FALLBACK (audit #4): if the AFFILIATE-coded order was REJECTED (an invalid/
+      // unregistered code), retry ONCE with the Cosmos client so the referred user's order still
+      // fills — the affiliate simply forfeits this slot.
+      // GATED on r.rejected (deep-check fix): only a DEFINITIVE CLOB rejection — the API answered
+      // with an error, so the order provably never landed on the book — may re-post. Two failure
+      // classes must NEVER reach this retry, and neither carries rejected:true:
+      //   * a thrown timeout/network error — the order may have been ACCEPTED without us seeing the
+      //     answer; re-posting would risk a silent double-fill of real money;
+      //   * "FAK killed: nothing filled" — the order WAS accepted and killed by the book, a final
+      //     verdict on this price/size that has nothing to do with the builder code; re-posting
+      //     just fires the same doomed order twice.
+      if (!r.ok && wantAff && r.rejected && !DEPOSIT_ERR.test(JSON.stringify(r.body ?? ""))) {
+        const r2 = await attempt(false);
+        if (r2.ok) console.log("[polymarket] affiliate builder code rejected — order placed on the Cosmos code instead");
+        r = r2;
       }
       return r;
     },

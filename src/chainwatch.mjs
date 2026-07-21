@@ -95,11 +95,20 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
   }
 
   // A whale's position just grew. Ask the server whether we may copy it — every rule lives there.
+  // BOUNDED RETRY (owner 2026-07-19, "never miss an event"): a transient copy-check failure (network
+  // blip, cold start, 5xx) used to DROP the fill from the fast path entirely — the cron's slow path
+  // would re-find it ~6min later, which on a pre-game window entry can be the whole edge. Retry the
+  // check up to 3 times with short backoff; a real REFUSAL (res.ok === false) is final, not retried.
   async function onFill(w, tokenId, shares, l) {
     const t0 = Date.now();
     let res;
-    try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); }
-    catch (e) { warn("chainwatch check:", e.message); return; }
+    for (let a = 0; ; a++) {
+      try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); break; }
+      catch (e) {
+        if (a >= 2) { warn(`chainwatch check failed ${a + 1}x (giving up; slow path covers):`, e.message); return; }
+        await new Promise((r) => setTimeout(r, 400 * (a + 1)));
+      }
+    }
     const ms = Date.now() - t0;
     if (!res?.ok) {
       log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> SKIP (${res?.reason ?? "no"}) · ${ms}ms`);

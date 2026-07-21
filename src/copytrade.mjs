@@ -43,6 +43,19 @@ const UNIT_FRACTION = N("COPY_UNIT_FRACTION", 0.5);
 // not by the beats. The beats measure how far into a NEW position he is; that says nothing about one he
 // has been sitting in — there is no "20% of his average" to read off it.
 const ADOPT_PCT = N("COPY_ADOPT_PCT", 1);
+// RETRY BOUND (owner 2026-07-19, "retry on failure — never miss an event"). A failed sports buy
+// retries on every pass (the failed-FAK 5s breather + the 20s poll re-serving the signal), which is
+// the never-miss half; THIS is the bound: only while the pre-game window is still open. Polymarket
+// sets a game market's endDate to KICKOFF, so "minutes to end_date" IS "minutes to kickoff" for
+// timed games (futures carry a resolution date days out and pass trivially). Under the bound the
+// entry is abandoned — the shopping window is 10-30min pre-kickoff, and a fill chased inside the
+// last 10 minutes buys a live-game line, not the pre-game book. Applies to sports opens AND adds.
+const SPORTS_MIN_LEFT_MIN = N("COPY_SPORTS_MIN_LEFT_MIN", 10);
+function sportsWindowClosed(sig) {
+  if (String(sig.category).toUpperCase() !== "SPORTS" || !sig.end_date) return false;
+  const leftMin = (Date.parse(sig.end_date) - Date.now()) / 60_000;
+  return Number.isFinite(leftMin) && leftMin < SPORTS_MIN_LEFT_MIN;
+}
 // SPORTS adopt TIERS (owner 2026-07-15, swisstony): size by HIS money in the position, and SCALE IN as
 // it grows — if he starts at $80k we hold 1%, when he grows to $125k we top up to 2%, etc.
 //   < $30k: skip · $30-70k: 1% · $70-120k: 2% · $120-180k: 3% · $180k+: 4%   (percent OF the portfolio)
@@ -174,30 +187,37 @@ export function startCopyTrade(deps) {
     stats.fills++;
     try { await cosmos.meter({ ...r.meta, source: "copytrade" }); } catch { /* best-effort */ }
 
+    // ACTUAL FILL (2026-07-19): placeOrder now reports what MATCHED — a FAK cap routinely fills fewer
+    // shares at a better price than the cap (a "97c" order really filled 3.96 sh @ 49c). Track and
+    // ledger the FILL; fall back to the request only when the response carried no fill info.
+    const fillShares = Number(r.meta?.size) > 0 ? Number(r.meta.size) : shares;
+    const fillCents = Number(r.meta?.price) > 0 ? Number(r.meta.price) : priceCents;
+    const fillUsd = Number(((fillShares * fillCents) / 100).toFixed(2));
+
     const nowIso = new Date().toISOString();
     if (kind === "open") {
       positions[key] = {
         condition_id: sig.condition_id, token_id: sig.token_id, outcome: sig.outcome, source: "copytrade",
-        entry_cents: priceCents, size_usd: realUsd, size_shares: shares, entry_whales: [],
+        entry_cents: fillCents, size_usd: fillUsd, size_shares: fillShares, entry_whales: [],
         market_question: sig.market_question || "", opened_at: nowIso, end_date: sig.end_date || undefined,
         copy_wallet: (sig.wallets?.[0]?.wallet || "").toLowerCase(), copy_category: sig.category,
-        copy_orig_shares: shares, copy_seq: 0, copy_his_cost: Number(sig.his_cost_usd) || 0, copy_target_usd: Number(orderUsd.toFixed(2)),
+        copy_orig_shares: fillShares, copy_seq: 0, copy_his_cost: Number(sig.his_cost_usd) || 0, copy_target_usd: fillUsd,
       };
       stats.opens++;
     } else {
-      existing.size_usd = Number((existing.size_usd + realUsd).toFixed(2));
-      existing.size_shares += shares;
+      existing.size_usd = Number((existing.size_usd + fillUsd).toFixed(2));
+      existing.size_shares += fillShares;
       existing.copy_orig_shares = Math.max(existing.copy_orig_shares || 0, existing.size_shares);
       existing.copy_his_cost = Number(sig.his_cost_usd) || existing.copy_his_cost;
-      existing.copy_target_usd = Number((Number(existing.copy_target_usd || 0) + realUsd).toFixed(2));   // deep-check #12: precedence bug made this a STRING after the first add
+      existing.copy_target_usd = Number((Number(existing.copy_target_usd || 0) + fillUsd).toFixed(2));   // deep-check #12: precedence bug made this a STRING after the first add
       stats.adds++;
     }
     store.save(positions);
-    state.cash -= realUsd; state.deployed += realUsd;
-    const rec = { ts: nowIso, cid: sig.condition_id, cat: sig.category, outcome: sig.outcome, kind, wallet: (sig.wallets?.[0]?.wallet || "").toLowerCase(), price_cents: priceCents, shares, size_usd: Number(realUsd.toFixed(2)), his_cost_usd: Number(sig.his_cost_usd) || 0 };
+    state.cash -= fillUsd; state.deployed += fillUsd;
+    const rec = { ts: nowIso, cid: sig.condition_id, cat: sig.category, outcome: sig.outcome, kind, wallet: (sig.wallets?.[0]?.wallet || "").toLowerCase(), price_cents: fillCents, shares: fillShares, size_usd: fillUsd, his_cost_usd: Number(sig.his_cost_usd) || 0 };
     appendLedger(rec);
     // per-user admin ledger (only trades opened after activation ever reach here)
-    cosmos.copyReport({ wallet: rec.wallet, condition_id: sig.condition_id, outcome: sig.outcome, category: sig.category, action: "BUY", shares, price_cents: priceCents, size_usd: rec.size_usd, his_cost_usd: rec.his_cost_usd, market_question: sig.market_question }).catch(() => {});
+    cosmos.copyReport({ wallet: rec.wallet, condition_id: sig.condition_id, outcome: sig.outcome, category: sig.category, action: "BUY", shares: fillShares, price_cents: fillCents, size_usd: rec.size_usd, his_cost_usd: rec.his_cost_usd, market_question: sig.market_question }).catch(() => {});
     log(`copytrade ${kind === "open" ? "OPEN" : "ADD "} ${tag} ✓ · ${String(sig.market_question || "").slice(0, 36)}`);
     return true;
   }
@@ -220,7 +240,11 @@ export function startCopyTrade(deps) {
     // position: <$30k skip · 30-70k 1% · 70-120k 2% · 120-180k 3% · 180k+ 4% of the portfolio, and the
     // fast-path top-up escalates us tier by tier as his (now cumulative) money-in grows.
     if (String(sig.category).toUpperCase() === "SPORTS") {
-      const pct = sportsAdoptPct(Number(sig.his_cost_usd) || 0, sig.wallets?.[0]?.username);
+      // TRACKS (owner 2026-07-16): the server now resolves each wallet's tier % from copy_wallets.tier_rules
+    // and stamps it on the signal — per-wallet sizing is DATA, not code. The hardcoded bands below remain
+    // only as a fallback for signals emitted by a pre-tracks server.
+    const srvPct = Number(sig.tier_pct_resolved);
+    const pct = Number.isFinite(srvPct) && sig.tier_pct_resolved != null ? srvPct : sportsAdoptPct(Number(sig.his_cost_usd) || 0, sig.wallets?.[0]?.username);
       if (pct <= 0) return { target: 0, beats: null };
       return { target: Math.max(MIN_ORDER_USD, port * (pct / 100)), beats: null };
     }
@@ -247,6 +271,7 @@ export function startCopyTrade(deps) {
     // silently — 38 approved markets got no order in 24h and NOTHING said why. One line per skip.
     const skip = (why) => log(`copytrade fast-skip ${sig.category} ${sig.outcome}: ${why} · ${String(sig.market_question || "").slice(0, 32)}`);
     if (!(target > 0)) return skip("beats=0 (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " vs avg $" + Math.round(Number(sig.wallets?.[0]?.avg_trade_usd) || 0) + ")");
+    if (sportsWindowClosed(sig)) return skip(`pre-game window closed (<${SPORTS_MIN_LEFT_MIN}m to kickoff)`);
 
     if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return skip("cooldown");
     if (target < MIN_ORDER_USD) return skip("target $" + target.toFixed(2) + " < $1 min");
@@ -305,6 +330,7 @@ export function startCopyTrade(deps) {
       // ADOPT-ONLY users see ONLY adopt signals. The whale-fill copies (kind "new") are aviv's alone.
       if (state.copyFills === false && sig.kind !== "adopt") continue;
       if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) continue; // settle-window cooldown
+      if (sportsWindowClosed(sig)) continue;              // retry bound: never buy inside the last 10min pre-kickoff
       const { target } = sizeFor(sig, unitBasis, state.portfolio);
       if (!(target > 0)) continue;
       stats.signals++;
