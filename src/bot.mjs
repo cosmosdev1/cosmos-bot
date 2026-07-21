@@ -988,7 +988,12 @@ function maybeSelfUpdate() {
   if (Date.now() - lastUpdateCheck < SELF_UPDATE_MS) return;
   lastUpdateCheck = Date.now();
   try {
-    execSync("git fetch --depth 1 origin main", { stdio: "ignore", timeout: 20000 });
+    // Honour COSMOS_BOT_REF like entrypoint.sh does. This was hardcoded to `main`, which made
+    // version pinning a LIE: a user who pinned a reviewed tag still got auto-updated to main by
+    // this watchdog. Pinning is the main way a security-conscious user can audit the code they run,
+    // so it has to actually hold. A pinned ref is immutable, so the fetch simply finds nothing new.
+    const ref = (process.env.COSMOS_BOT_REF || "main").replace(/[^A-Za-z0-9._/-]/g, "");
+    execSync(`git fetch --depth 1 origin ${ref}`, { stdio: "ignore", timeout: 20000 });
     const local = execSync("git rev-parse HEAD", { timeout: 5000 }).toString().trim();
     const remote = execSync("git rev-parse FETCH_HEAD", { timeout: 5000 }).toString().trim();
     if (local && remote && local !== remote) {
