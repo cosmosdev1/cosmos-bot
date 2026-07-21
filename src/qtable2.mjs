@@ -32,7 +32,7 @@ const MIN_D = 0.0005, MIN_ELAPSED = 10, MAX_ELAPSED = 95, MIN_REMAIN_S = 90;
 // Tiered entry — RECALIBRATED 2026-07-13 from the 78-trade live audit: the 35-54% band lost money
 // under every rule-set tested (0/2 even with the persistence guard), so the default floor is back at
 // 55%. The tier machinery stays env-enabled (QTABLE2_MIN_P=0.35 re-opens the mid band).
-const MIN_P = N("QTABLE2_MIN_P", 0.55);         // absolute floor — never trade a side below this model prob
+const MIN_P = N("QTABLE2_MIN_P", 0.60);         // absolute floor - never trade a side below this model prob (owner 2026-07-21: 60%)
 const HIGH_P = N("QTABLE2_HIGH_P", 0.55);       // p >= HIGH_P uses EDGE; MIN_P..HIGH_P uses the stricter EDGE_MID
 const EDGE_MID = N("QTABLE2_EDGE_MID", 1.18);   // required edge (P/ask) on the mid band (if re-opened)
 
@@ -87,7 +87,11 @@ const LEAD_D = N("QTABLE2_LEAD_D", 0.00025);        // 2.5bps: Up needs d >= +LE
 // DISAGREEMENT BAND — the 07-09 pause's revival condition that never got built. The model may not
 // claim more than this many points above the market: p - ask <= band. The 60-69c kill zone (claimed
 // 69-79%, won 50%, -$34 in 48h on one account) and every thin-cell P=1.0 buy die here.
-const MAX_DISAGREE = N("QTABLE2_MAX_DISAGREE", 0.10);
+// Raised 0.10 -> 0.14 alongside the 8pp floor (owner 2026-07-21): an 8pp floor under a 10pp cap
+// leaves only a 2pp-wide corridor, which is the same self-contradiction that silenced the fleet for
+// 10 hours on 07-20. 8-14pp keeps a workable band while staying under the >12pp region the pause
+// research found unprofitable at the far end.
+const MAX_DISAGREE = N("QTABLE2_MAX_DISAGREE", 0.14);
 // ENTRY GATE REWORK (owner 2026-07-20, "3 signals in a minute then 0 for 10 hours"): the
 // multiplicative edge floor (>=1.15) and the disagreement cap (<=10pp) CONTRADICT each other above
 // ~50c asks - at a 64c ask the corridor is 0.4pp wide, above ~66c it is empty. That is why the
@@ -95,7 +99,11 @@ const MAX_DISAGREE = N("QTABLE2_MAX_DISAGREE", 0.10);
 // was that ABSOLUTE divergence of 4-10pp is the profitable set (>=4pp +10.8%/$, n=128; >12pp
 // negative), so the absolute band is now the PRIMARY gate: 4pp <= P-ask <= 10pp. The multiplicative
 // floor is retired (MAX_EDGE stays as the too-good-to-be-true cap). QTABLE2_MIN_DISAGREE tunes it.
-const MIN_DISAGREE = N("QTABLE2_MIN_DISAGREE", 0.04);
+// 8pp (owner 2026-07-21). The research band was 4-10pp; the owner runs the stricter end - 8pp edge
+// with a 60% probability floor - so the engine only takes divergences the years-long fit is most
+// confident about. Fewer trades, higher bar. Widen back to 0.04 with QTABLE2_MIN_DISAGREE if the
+// volume proves too thin.
+const MIN_DISAGREE = N("QTABLE2_MIN_DISAGREE", 0.08);
 const minDisagreeReq = () => MIN_DISAGREE + edgeBump(); // the Mon-Fri peak window still adds +1pp
 // PERSISTENCE GUARD (the root-cause fix, 2026-07-13): the audit showed the bot entered on sub-second
 // d spikes that reverted before settlement (recorded d disagreed with the settled d in 65/78 trades,
