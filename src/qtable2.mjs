@@ -174,7 +174,20 @@ function lookupP(sym, tblFrame, elapsedPct, d, towB) {
   if (towB != null && fr.tow && fr.tow[towB]?.length) {
     let best = null;
     for (const r of fr.tow[towB]) if (best == null || Math.abs(r.pct - elapsedPct) < Math.abs(best.pct - elapsedPct)) best = r;
-    if (best) { const j = gi - best.g0; if (j >= 0 && j < best.p.length) return best.p[j] / 1000; }
+    if (best) {
+      const j = gi - best.g0;
+      if (j >= 0 && j < best.p.length) {
+        const tv = best.p[j] / 1000;
+        // SAME CERTAINTY REFUSAL AS THE BASE LAYER (added 2026-07-21). The guard below was only ever
+        // applied to fr.pts, so any lookup that RESOLVED on the tow layer bypassed it completely and
+        // could serve P=1.000 from a cell with ~one observation. That is a sample-size artifact, not
+        // a probability, and buying it is precisely the failure the engine was paused for on 07-09
+        // (thin-cell P=1.0 -> max apparent edge -> buy the top -> 0-for-2 wipeouts). A refused tow
+        // cell now falls through to the base layer, which applies the same test again.
+        const n = Number(best.n);
+        if (tv > 0.001 && tv < 0.999 && (!Number.isFinite(n) || n >= TOW_MIN_N)) return tv;
+      }
+    }
   }
   let base = fr.pts[0];
   for (const p of fr.pts) if (Math.abs(p.pct - elapsedPct) < Math.abs(base.pct - elapsedPct)) base = p;
@@ -266,13 +279,33 @@ const SERIES = [
 // a falling ask means the book knows something the table does not.
 const ASK_DROP_VETO = N("QTABLE2_ASK_DROP_VETO", 0.04);
 const ASK_VETO_WINDOW_S = N("QTABLE2_ASK_VETO_WINDOW_S", 30);
+// OFF BY DEFAULT (0) ON PURPOSE. The intent was an observations floor on time-of-week cells, but
+// measuring the shipped tables shows `n` is NOT a per-cell sample count: it is uniform across all
+// 5050 rows per coin/frame (~21 on 5m, ~7 on 15m), i.e. structural. Any floor above ~21 would
+// reject 100% of tow lookups and silently disable the whole time-of-week layer fleet-wide - exactly
+// the class of invisible change we spent today removing. The real guard is the certainty refusal
+// below, which is what the 07-09 pause was actually about. Set QTABLE2_TOW_MIN_N only if the table
+// format later gains a true per-cell count.
+const TOW_MIN_N = N("QTABLE2_TOW_MIN_N", 0);
 const askHist = new Map();   // tokenId -> [{t, ask}] (we evaluate candidates every 250ms, so this fills itself)
-function askFalling(tokenId, ask) {
+// RECORDING IS SEPARATE FROM CHECKING (fixed 2026-07-21). askFalling() used to append to askHist as
+// a side effect of being called - and it was the LAST term of an && chain, so it only ever ran on
+// ticks where every other gate had already passed. The history therefore never accumulated the
+// 8s-old samples the veto needs, maxPast stayed null, and the guard returned false every single
+// time. This is the guard built to stop the documented main leak (-$416/day of adverse selection:
+// only 26.4% of entries had spot moving with our side, vs a 63.7% control), so it being inert was
+// expensive. recordAsk() is now called the moment an ask is known, on every tick, unconditionally.
+function recordAsk(tokenId, ask) {
+  if (ask == null) return;
   const now = Date.now();
   const h = askHist.get(tokenId) ?? [];
   h.push({ t: now, ask });
   while (h.length && h[0].t < now - (ASK_VETO_WINDOW_S + 10) * 1000) h.shift();
   askHist.set(tokenId, h);
+}
+function askFalling(tokenId, ask) {
+  const now = Date.now();
+  const h = askHist.get(tokenId) ?? [];
   let maxPast = null;
   for (const e of h) if (e.t <= now - 8_000 && (maxPast == null || e.ask > maxPast)) maxPast = e.ask;   // ignore the last 8s (that's the move we ride)
   return maxPast != null && maxPast - ask >= ASK_DROP_VETO;
@@ -395,8 +428,8 @@ export function startQTable2(deps) {
       const pUp = pAbove, pDn = 1 - pAbove;
       const tBook = Date.now();                                        // start of book-fetch + order latency
       const cands = [];
-      if (pUp >= MIN_P && d >= LEAD_D) { const ask = await bestAsk(m.tokenUp); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && (pUp - ask) >= minDisagreeReq() && e <= MAX_EDGE && (pUp - ask) <= MAX_DISAGREE && !askFalling(m.tokenUp, ask)) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
-      if (pDn >= MIN_P && d <= -LEAD_D) { const ask = await bestAsk(m.tokenDn); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && (pDn - ask) >= minDisagreeReq() && e <= MAX_EDGE && (pDn - ask) <= MAX_DISAGREE && !askFalling(m.tokenDn, ask)) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
+      if (pUp >= MIN_P && d >= LEAD_D) { const ask = await bestAsk(m.tokenUp); recordAsk(m.tokenUp, ask); const e = ask ? pUp / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && (pUp - ask) >= minDisagreeReq() && e <= MAX_EDGE && (pUp - ask) <= MAX_DISAGREE && !askFalling(m.tokenUp, ask)) cands.push({ side: "Up", token: m.tokenUp, outcome: m.outUp, p: pUp, ask, edge: e }); }
+      if (pDn >= MIN_P && d <= -LEAD_D) { const ask = await bestAsk(m.tokenDn); recordAsk(m.tokenDn, ask); const e = ask ? pDn / ask : 0; if (ask != null && ask >= MIN_PRICE && ask <= MAX_PRICE && (pDn - ask) >= minDisagreeReq() && e <= MAX_EDGE && (pDn - ask) <= MAX_DISAGREE && !askFalling(m.tokenDn, ask)) cands.push({ side: "Down", token: m.tokenDn, outcome: m.outDn, p: pDn, ask, edge: e }); }
       const pick = cands.sort((a, b) => b.edge - a.edge)[0];
       if (!pick) continue;
 
