@@ -26,18 +26,18 @@ secrets, and deploys.
 **Windows** (search your computer for *PowerShell*, paste, Enter):
 
 ```powershell
-$env:POLYMARKET_PRIVATE_KEY="0x…"
-$env:POLYMARKET_FUNDER="0x…"
 $env:COSMOS_TOKEN="csk_…"; irm https://try-cosmos.com/bot/fly.ps1 | iex
 ```
 
 **macOS / Linux** (open *Terminal*, paste, Enter):
 
 ```sh
-POLYMARKET_PRIVATE_KEY="0x…" \
-POLYMARKET_FUNDER="0x…" \
 COSMOS_TOKEN="csk_…" sh -c "$(curl -fsSL https://try-cosmos.com/bot/fly.sh)"
 ```
+
+The command carries **only your Cosmos token**. The script then asks for your private key and your
+address on your own machine, **with the typing hidden**, so the key never lands in your shell
+history.
 
 `POLYMARKET_FUNDER` must be the address on your Polymarket **profile** page
 (`polymarket.com/profile/0x…`), **not** the deposit address. That mix-up is the single most common
@@ -52,17 +52,17 @@ You never reinstall. The container is a thin launcher: it clones this repo at ru
 it **every 10 minutes**, so a new strategy, a changed gate, or a fixed bug reaches your bot
 automatically. Open positions and local state live on a persistent volume and survive every update.
 
-**That also means the code you audited can be replaced.** If you want the version you reviewed to
-be the version that keeps running, pin it to a commit SHA — the launcher then checks that exact
-commit out and **disables auto-updating entirely** for that machine:
+**That also means the code you audited can be replaced.** To keep running the version you reviewed,
+pin to a release tag:
 
 ```sh
-fly secrets set COSMOS_BOT_REF=<full-40-char-commit-sha> --app <your-app>
+fly secrets set COSMOS_BOT_REF=v2026.07.21 --app <your-app>
 ```
 
-Use the full 40-character SHA (GitHub cannot serve an abbreviated one). If the commit can't be
-fetched the bot refuses to start rather than silently falling back to `main`. To resume automatic
-updates: `fly secrets unset COSMOS_BOT_REF --app <your-app>`.
+Your bot then runs that exact commit and stops taking updates. **Release tags are cut from a
+reviewed commit and are never moved** — check [the tag list](https://github.com/cosmosdev1/cosmos-bot/tags)
+and see what a tag points at before trusting it. A full 40-character commit SHA works the same way.
+Resume updates with `fly secrets unset COSMOS_BOT_REF --app <your-app>`.
 
 <details>
 <summary>Local development (running from source)</summary>
