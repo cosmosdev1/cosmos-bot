@@ -1,8 +1,18 @@
 # Cosmos bot
 
 Trades Cosmos insider signals automatically through **your own** Polymarket keys. Your wallet key
-never leaves your machine — the bot signs orders locally and routes them through the Cosmos relay,
-which meters usage ($0.09 / order) and enforces your daily limit.
+never leaves your machine — the bot signs orders locally and posts them straight to Polymarket.
+
+**What it costs.** A **0.9% Polymarket builder fee** is attached to each fill; that is Cosmos's
+payment for the signal feed, it is taken out of the trade itself, and there is no card and no
+subscription. Roughly 1 in 5 orders instead carries the builder code of whoever referred you — it
+is the same 0.9%, just split differently, and it costs you nothing extra. Your server costs about
+$1–2/month, paid to Fly, not to us. (The legacy `$0.09/order` metering is dormant and unused.)
+
+**What the bot can do with your key.** It signs orders locally, so the key never reaches Cosmos —
+but signing orders and moving funds are the same capability, so read the source before you trust
+it, and consider pinning a reviewed commit (see below). Fund the wallet with an amount you would be
+comfortable losing.
 
 This repo is intentionally **separate** from the main Cosmos app: it's the only piece that touches
 your private key, so it ships and is reviewed on its own.
@@ -36,12 +46,23 @@ reason a bot never trades.
 Prefer not to touch a terminal? The setup page gives you a personalized prompt to paste into
 Claude, which walks you through it. Your private key never goes into that chat.
 
-## It updates itself
+## It updates itself — unless you pin it
 
-You never reinstall. The container is a thin launcher: it clones the bot at runtime and re-checks
-this repo **every 10 minutes**, so a new strategy, a changed gate, or a fixed bug reaches your bot
-automatically, with no action from you. Open positions and local state live on a persistent volume
-and survive every update.
+You never reinstall. The container is a thin launcher: it clones this repo at runtime and re-checks
+it **every 10 minutes**, so a new strategy, a changed gate, or a fixed bug reaches your bot
+automatically. Open positions and local state live on a persistent volume and survive every update.
+
+**That also means the code you audited can be replaced.** If you want the version you reviewed to
+be the version that keeps running, pin it to a commit SHA — the launcher then checks that exact
+commit out and **disables auto-updating entirely** for that machine:
+
+```sh
+fly secrets set COSMOS_BOT_REF=<full-40-char-commit-sha> --app <your-app>
+```
+
+Use the full 40-character SHA (GitHub cannot serve an abbreviated one). If the commit can't be
+fetched the bot refuses to start rather than silently falling back to `main`. To resume automatic
+updates: `fly secrets unset COSMOS_BOT_REF --app <your-app>`.
 
 <details>
 <summary>Local development (running from source)</summary>

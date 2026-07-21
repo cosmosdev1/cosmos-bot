@@ -993,6 +993,10 @@ function maybeSelfUpdate() {
     // this watchdog. Pinning is the main way a security-conscious user can audit the code they run,
     // so it has to actually hold. A pinned ref is immutable, so the fetch simply finds nothing new.
     const ref = (process.env.COSMOS_BOT_REF || "main").replace(/[^A-Za-z0-9._/-]/g, "");
+    // PINNED to a commit SHA -> never self-update. The whole point of pinning is that the code a
+    // user reviewed is the code that keeps running; auto-updating a pinned machine would make the
+    // audit meaningless. The launcher enforces the same rule.
+    if (/^[0-9a-fA-F]{7,40}$/.test(ref)) return;
     execSync(`git fetch --depth 1 origin ${ref}`, { stdio: "ignore", timeout: 20000 });
     const local = execSync("git rev-parse HEAD", { timeout: 5000 }).toString().trim();
     const remote = execSync("git rev-parse FETCH_HEAD", { timeout: 5000 }).toString().trim();
