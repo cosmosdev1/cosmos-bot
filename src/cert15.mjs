@@ -273,7 +273,7 @@ export function startCert15(deps) {
       const endMs = p.end_ms ? Number(p.end_ms)
         : p.end_date && p.end_date !== "none" ? Date.parse(p.end_date)
         : p.opened_at ? Date.parse(p.opened_at) + 20 * 60_000
-        : now;
+        : 0;   // unknowable -> ENDED (see qtable2.mjs: `now` pinned a MAX_OPEN slot forever)
       if (Number.isFinite(endMs) && endMs >= now - 15 * 60_000) openC++;
     }
 

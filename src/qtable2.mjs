@@ -288,8 +288,13 @@ export function startQTable2(deps) {
   const apiRef = {};          // cid -> backfilled window-open reference
   const done = new Set();     // cid -> already ordered / permanently skipped this run
   const fails = new Map();    // cid -> failed order attempts
-  const stats = { signals: 0, orders: 0, fills: 0, capSkips: 0 };
+  // WHY-NOT-TRADING telemetry (owner 2026-07-21). tick() has several silent early exits; when one of
+  // them latched, the only visible symptom was frozen counters on a status line whose other numbers
+  // are produced by unrelated timers (discover / the price socket), so a dead engine looked healthy
+  // for 10 hours. Every exit now names itself, and `lastTickAt` proves the loop is actually running.
+  const stats = { signals: 0, orders: 0, fills: 0, capSkips: 0, noCash: 0 };
   let alive = true, lastCapLog = 0;
+  let lastTickAt = 0, lastExit = "starting";
 
   async function discover() {
     const now = Date.now();
@@ -329,8 +334,10 @@ export function startQTable2(deps) {
   // qtable.mjs): the in-window candle set is tiny (1–2 markets), and it avoids the store clobber a
   // concurrent load/save would cause.
   async function tick() {
-    if (state.qtable2 === false) return;                     // server turned the engine off -> stop trading
-    if (state.cash == null || state.sizing == null) return;  // no cycle data yet (first 30s after boot)
+    lastTickAt = Date.now();
+    if (state.qtable2 === false) { lastExit = "ENGINE OFF (server flag)"; return; }
+    if (state.cash == null || state.sizing == null) { lastExit = "no cycle data yet"; return; }
+    lastExit = "evaluating";
     const now = Date.now();
     const positions = store.load();
     // openQt counts only LIVE qtable positions. Dead ones (market already ended; worthless loser dust
@@ -346,7 +353,8 @@ export function startQTable2(deps) {
       const endMs = p.end_date && p.end_date !== "none" ? Date.parse(p.end_date)
         : p.end_ms ? Number(p.end_ms)
         : p.opened_at ? Date.parse(p.opened_at) + 90 * 60_000
-        : now;                                                 // truly unknowable -> never let it freeze the engine
+        : 0;   // truly unknowable -> treat as ENDED. `now` (the old value) made `endMs < now-15min`
+               // false, so such a row counted as open FOREVER and silently pinned a MAX_OPEN slot.
       const ended = !Number.isFinite(endMs) || endMs < now - 15 * 60_000;
       if (!ended) openQt++;
     }
@@ -357,7 +365,7 @@ export function startQTable2(deps) {
       if (remaining > m.frameMs) continue;                    // window not started
       if (done.has(m.cid)) continue;
       if (positions[m.cid]) { done.add(m.cid); markets.delete(m.cid); continue; }
-      if (openQt >= MAX_OPEN) return;
+      if (openQt >= MAX_OPEN) { lastExit = `MAX_OPEN reached (${openQt}/${MAX_OPEN} qtable positions open)`; return; }
       const strike = strikeFor(m); if (strike == null) continue;
       const S = spot[m.sym]; if (!S) continue;
       const h = hist[m.sym]; const spotAge = h?.length ? now - h[h.length - 1].t : Infinity;
@@ -399,7 +407,10 @@ export function startQTable2(deps) {
       const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(sizeUsd, priceCents));
       const orderUsd = (shares * priceCents) / 100;
       const tag = `${pick.side} ${m.frame} ${m.sym} @ ${priceCents}c P=${(pick.p * 100).toFixed(0)}% gain=${((pick.p - pick.ask) * 100).toFixed(1)}pp (edge ${pick.edge.toFixed(3)})${inPeakWindow() ? "[peak]" : ""} d=${(d * 100).toFixed(3)}% t=${elapsed.toFixed(0)}%`;
-      if (orderUsd > state.cash) { done.add(m.cid); continue; }        // no room; re-armed next discover
+      // No room right now. Do NOT done() it: `done` is never pruned, so done-ing here permanently
+      // burned the market for the life of the process even after cash freed up (the old comment
+      // claimed "re-armed next discover", but discover() only touches `markets`, never `done`).
+      if (orderUsd > state.cash) { stats.noCash++; continue; }
       if (DRY) { hourlyMark(); log(`qtable2 DRY would BUY ${tag} · hourly ${hourly.length}/${MAX_PER_HOUR} · spotAge=${spotAge}ms book=${bookMs}ms · ${m.question.slice(0, 36)}`); done.add(m.cid); continue; }
 
       done.add(m.cid); // one shot per market
@@ -450,7 +461,10 @@ export function startQTable2(deps) {
         const h = hist[c]; const age = h?.length ? Date.now() - h[h.length - 1].t : Infinity;
         return `${API_SYM[c].toLowerCase()} ${age === Infinity ? "NO FEED ⚠" : (age / 1000).toFixed(1) + "s"}`;
       }).join(" · ");
-      log(`qtable2 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills} · hourly ${hourly.filter((t) => t > Date.now() - 3600e3).length}/${MAX_PER_HOUR}${stats.capSkips ? ` (cap-skipped ${stats.capSkips})` : ""}`);
+      // `tick` = how long ago the evaluation loop last ran. If that number grows, the loop is wedged
+      // or dead - which no other field on this line can reveal (they are fed by other timers).
+      const tickAge = lastTickAt ? ((Date.now() - lastTickAt) / 1000).toFixed(1) + "s" : "NEVER";
+      log(`qtable2 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills} · hourly ${hourly.filter((t) => t > Date.now() - 3600e3).length}/${MAX_PER_HOUR}${stats.capSkips ? ` (cap-skipped ${stats.capSkips})` : ""}${stats.noCash ? ` (no-cash ${stats.noCash})` : ""} · tick ${tickAge} · ${lastExit}`);
       const staleCoin = COINS.find((c) => { const h = hist[c]; return h?.length && Date.now() - h[h.length - 1].t > WATCHDOG_MS; });
       if (staleCoin && Date.now() - lastKick > WATCHDOG_MS) {
         lastKick = Date.now();

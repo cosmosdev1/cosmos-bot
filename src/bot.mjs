@@ -436,10 +436,14 @@ async function copyExitStep(cosmos, pm, positions, pos) {
   const r = await marketableSell(cosmos, pm, full ? pos : { ...pos, size_shares: chunk }, "TAKE_PROFIT");
   if (r.ok) {
     const sold = full ? pos.size_shares : chunk;
+    // ACTUAL FILL (2026-07-19): the FAK's meta now carries what really SOLD and at what average price
+    // — ledger that, not the shares/ask we aimed at (a sell once recorded $132 proceeds vs $242 real).
+    const soldShares = Number(r.meta?.size) > 0 ? Number(r.meta.size) : sold;
+    const soldCents = Number(r.meta?.price) > 0 ? Number(r.meta.price) : (r.sellPrice ?? r.mid ?? cur ?? 0);
     pos.copy_seq = Number(d.seq) || (pos.copy_seq ?? 0) + 1;
-    if (!full) pos.size_shares -= chunk;
+    if (!full) pos.size_shares = Math.max(0, pos.size_shares - soldShares); // subtract what FILLED; reconcile re-syncs anyway
     store.save(positions);
-    cosmos.copyReport({ wallet: pos.copy_wallet, condition_id: pos.condition_id, outcome: pos.outcome, category: pos.copy_category, action: "SELL", shares: sold, price_cents: r.sellPrice ?? r.mid ?? cur ?? 0, size_usd: Number(((sold * (r.sellPrice ?? r.mid ?? cur ?? 0)) / 100).toFixed(2)), market_question: pos.market_question }).catch(() => {});
+    cosmos.copyReport({ wallet: pos.copy_wallet, condition_id: pos.condition_id, outcome: pos.outcome, category: pos.copy_category, action: "SELL", shares: soldShares, price_cents: soldCents, size_usd: Number(((soldShares * soldCents) / 100).toFixed(2)), market_question: pos.market_question }).catch(() => {});
     log(`COPY mirror-sell ${full ? "ALL" : chunk + " shares (" + Math.round(fraction * 100) + "%)"} ${pos.outcome} @ ~${r.sellPrice ?? r.mid}c · ${d.reason || ""}`);
   } else if (!r.held) {
     warn("copy mirror-sell failed (will retry next cycle):", r.status);
@@ -516,18 +520,52 @@ async function holdingsMap(pm) {
 // switch that reaches the whole fleet. Start each engine the first cycle the server enables it (no
 // restart needed), and mirror the flag into qtState every cycle so turning it OFF stops the engine
 // trading on its next tick - a real kill switch. A local env var still forces one on for testing.
+// The COMMIT this bot is actually running (owner 2026-07-21). The old value was a hand-maintained
+// string ("engine-arm-1") that drifted dozens of commits behind reality, so we had no way to tell a
+// bot stuck on old code from a current one - and a bot whose `git fetch` is blocked looks perfectly
+// healthy in telemetry while trading last month's strategy. Resolved once at boot; "unknown" when
+// the source isn't a git checkout (a non-launcher install), which is itself the signal we want.
+const BUILD_SHA = (() => {
+  try {
+    return execSync("git rev-parse --short HEAD", { cwd: new URL("..", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), stdio: ["ignore", "pipe", "ignore"] })
+      .toString().trim().slice(0, 12) || "unknown";
+  } catch { return "unknown"; }
+})();
+
 const engines = { qtable2: false, copytrade: false, cert15: false };
+// ENGINE DEFAULTS ARE PINNED **ON** IN THE BOT (owner 2026-07-21). Previously qtable2/cert15 were
+// opt-IN from the server (`settings.X === true`), so a single missing/incorrect server env var
+// resolved 31 of 33 fleet bots to `false` and every tick silently no-op'd for 10+ hours - with no
+// log line anywhere. The strict-equality opt-in also meant ANY degraded account response (missing
+// key, 5xx-fallback defaults, a pre-migration column) disabled trading fleet-wide by accident.
+// Now: ON unless something EXPLICITLY says off - `settings.X === false` (per-user column or the
+// server's global kill switch) or a local `X_ENABLED=0`. Fail-open, not fail-silent.
+// copytrade is deliberately NOT pinned: it stays opt-in (benched 2026-07-13, owner-only).
+const engineOn = (envKey, serverFlag) =>
+  process.env[envKey] === "0" ? false : process.env[envKey] === "1" ? true : serverFlag !== false;
+const engineReason = (envKey, serverFlag) =>
+  process.env[envKey] === "0" ? `${envKey}=0 (local)` : serverFlag === false ? "server flag off" : "";
 async function maybeStartEngines(settings, pm, cosmos) {
-  const wantQt = process.env.QTABLE2_ENABLED === "1" || settings.qtable2 === true;
+  const wantQt = engineOn("QTABLE2_ENABLED", settings.qtable2);
   const wantCopy = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;
-  // cert15 (late-candle certainty, 15m ETH/SOL) is FLEET-WIDE BY DEFAULT: the server resolves a
-  // missing bot_settings.cert15 to the CERT15_FLEET flag (default ON). settings.cert15 === false is
-  // the live kill (per-user column or CERT15_FLEET=0 globally).
-  const wantCert = process.env.CERT15_ENABLED === "1" || settings.cert15 === true;
+  const wantCert = engineOn("CERT15_ENABLED", settings.cert15);
+  // Announce every transition. A silently-disabled engine is the failure this whole block exists to
+  // prevent: without these lines the only symptom is "the bot stopped trading" with no explanation.
+  for (const [name, want, reason] of [
+    ["qtable2", wantQt, engineReason("QTABLE2_ENABLED", settings.qtable2)],
+    ["cert15", wantCert, engineReason("CERT15_ENABLED", settings.cert15)],
+    ["copytrade", wantCopy, settings.copytrade === true ? "" : "server flag off"],
+  ]) {
+    if (qtState[name] !== undefined && qtState[name] !== want) {
+      log(want ? `engine ${name}: ENABLED` : `engine ${name}: DISABLED - ${reason || "server flag off"} (it will stop trading)`);
+    }
+  }
   qtState.qtable2 = wantQt;       // engines check these each tick (off => stop trading)
   qtState.copytrade = wantCopy;
   qtState.cert15 = wantCert;
   qtState.copyFills = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;   // may we copy his live FILLS?
+  // AFFILIATE ROTATION: the server resolves this user's referrer -> active affiliate -> builder code.
+  try { pm.setAffiliateCode?.(settings.affiliate_code || null); } catch { /* advisory */ }
   if (wantQt && !engines.qtable2) {
     engines.qtable2 = true;
     const { startQTable2 } = await import("./qtable2.mjs");
@@ -678,7 +716,7 @@ async function cycle(cosmos, pm) {
     const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, portfolioValue, deployed);
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
     cosmos.reportHealth({
-      build: "engine-arm-1", // bump on behavior changes so the admin can SEE who runs which code
+      build: BUILD_SHA, // the real commit this bot is running, so stale-code bots are visible
       sig_type: pm.sigTypeName ?? null,
       wallet_kind: pm.walletKind ?? null,
       onchain_usd: bd.onchain == null ? null : Number(bd.onchain.toFixed(2)),
