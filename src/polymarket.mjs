@@ -65,6 +65,55 @@ let rotN = 0; try { rotN = Number(JSON.parse(_rfs(ROT_FILE, "utf8")).n) || 0; } 
 function rotSave() { try { _wfs(ROT_FILE, JSON.stringify({ n: rotN })); } catch { /* best-effort */ } }
 const AFF_EVERY = 5;
 
+// ============================================================================
+// LOCAL RISK CAP (2026-07-22) — the last line of defence against a COMPROMISED
+// COSMOS SERVER. Cosmos never holds the key, but the bot polls Cosmos for signals,
+// sizing and exit advice. If that server is breached it could tell every bot to
+// "buy 10% of portfolio of a 1c longshot" and drain the fleet. Every BUY in the
+// entire codebase — every engine, present and future — funnels through placeOrder
+// below, so this is the ONE choke point where a hard bound belongs.
+//
+// It uses ZERO server-supplied values: the portfolio basis is the bot's OWN
+// on-chain USDC + Polymarket position value (cached from getBalanceUsd/
+// getPortfolioValue, which read the chain and Polymarket's data-api — never
+// Cosmos), and the limits are constants compiled into the git-pulled src/. The
+// env overrides can only LOWER a cap, never raise it, so a hostile server that
+// also set env vars (it can't — those live on the user's own Fly machine) still
+// couldn't widen these. A lying server can still pick a bad market, but each hit
+// costs at most one clamped fill, and the rolling governor bounds the bleed per
+// hour and per day regardless of how the loss is realised (counted on BUYS, never
+// reduced by sells — so attacker-driven exits can't free the budget to buy again).
+const capPct = (env, hard) => { const v = Number(process.env[env]); return Number.isFinite(v) && v > 0 ? Math.min(v, hard) : hard; };
+const MAX_TRADE_PCT = capPct("COSMOS_MAX_TRADE_PCT", 8);    // one fill: <=8% of portfolio (legit max ~6%; the "10%" attack is impossible)
+const MAX_HOUR_PCT  = capPct("COSMOS_MAX_HOUR_PCT", 40);    // rolling 60min buy-volume ceiling
+const MAX_DAY_PCT   = capPct("COSMOS_MAX_DAY_PCT", 100);    // rolling 24h buy-volume ceiling
+const MAX_HOUR_BUYS = Math.min(Number(process.env.COSMOS_MAX_HOUR_BUYS) || 45, 45); // count backstop (legit peak ~38: copy 30 + qt 4 + cert 4)
+const MIN_FLOOR_USD = 2;                                    // never clamp a fill below the ~$1-2 min order — sub-$50 accounts must still trade
+let lastLocalPortfolio = 0;                                 // set ONLY by getBalanceUsd/getPortfolioValue (chain + Polymarket)
+const setLocalPortfolio = (v) => { if (Number.isFinite(v) && v > 0) lastLocalPortfolio = v; };
+const SPEND_FILE = _pjoin(ROT_DIR, "risk-ledger.json");
+let spendLog = []; try { spendLog = (JSON.parse(_rfs(SPEND_FILE, "utf8")).buys || []).filter((b) => b && Number.isFinite(b.t)); } catch { /* fresh */ }
+function spendSave() { try { _wfs(SPEND_FILE, JSON.stringify({ buys: spendLog.slice(-400) })); } catch { /* best-effort */ } }
+function spendWindow(sinceMs) { const cut = Date.now() - sinceMs; return spendLog.filter((b) => b.t >= cut).reduce((s, b) => s + (b.usd || 0), 0); }
+// Returns {shares, capped, reason} — the shares actually allowed for this BUY (0 = refuse). Portfolio
+// unknown (a cold boot before the first balance read) -> allow ONLY the $ floor, never an unbounded order.
+function riskClampBuy(sizeShares, price) {
+  const port = lastLocalPortfolio;
+  const wantUsd = sizeShares * price;
+  const perFillUsd = port > 0 ? Math.max(MIN_FLOOR_USD, (port * MAX_TRADE_PCT) / 100) : MIN_FLOOR_USD;
+  // rolling governors (buy-volume, never reduced by sells) + count backstop
+  const hourCap = port > 0 ? (port * MAX_HOUR_PCT) / 100 : MIN_FLOOR_USD;
+  const dayCap  = port > 0 ? (port * MAX_DAY_PCT) / 100 : MIN_FLOOR_USD;
+  const hourSpent = spendWindow(3600e3), daySpent = spendWindow(86400e3);
+  const hourBuys = spendLog.filter((b) => b.t >= Date.now() - 3600e3).length;
+  if (hourBuys >= MAX_HOUR_BUYS) return { shares: 0, capped: true, reason: `hourly buy-count cap (${hourBuys}/${MAX_HOUR_BUYS})` };
+  const roomUsd = Math.min(perFillUsd, Math.max(0, hourCap - hourSpent), Math.max(0, dayCap - daySpent));
+  if (roomUsd < MIN_FLOOR_USD) return { shares: 0, capped: true, reason: `rolling buy-volume cap (h ${hourSpent.toFixed(0)}/${hourCap.toFixed(0)} · d ${daySpent.toFixed(0)}/${dayCap.toFixed(0)})` };
+  if (wantUsd <= roomUsd) return { shares: sizeShares, capped: false, reason: "" };
+  return { shares: Math.floor((roomUsd / price) * 100) / 100, capped: true, reason: `per-fill/${MAX_TRADE_PCT}% clamp $${wantUsd.toFixed(0)}->$${roomUsd.toFixed(0)}` };
+}
+function riskRecordBuy(usd) { spendLog.push({ t: Date.now(), usd }); if (spendLog.length > 500) spendLog = spendLog.slice(-400); spendSave(); }
+
 // ---- ACTUAL-FILL extraction (2026-07-19) ----
 // The CLOB's POST /order response (clob-client-v2 OrderResponse: { success, errorMsg, orderID,
 // transactionsHashes, tradeIDs, status, takingAmount, makingAmount }) reports what actually MATCHED,
@@ -303,7 +352,7 @@ export async function makePolymarket(config) {
       } catch { clob = null; }
       lastBalanceBreakdown = { onchain, clob };
       const best = Math.max(onchain ?? 0, clob ?? 0);
-      if (best >= 0.01) { lastGoodBalance = best; return best; }
+      if (best >= 0.01) { lastGoodBalance = best; setLocalPortfolio((lastGoodValue || 0) + best); return best; }
       return lastGoodBalance ?? 0; // never collapse sizing to 0 on a transient failure
     },
     balanceBreakdown: () => lastBalanceBreakdown,
@@ -318,7 +367,7 @@ export async function makePolymarket(config) {
         if (r.ok) {
           const arr = await r.json();
           const v = Array.isArray(arr) ? Number(arr[0]?.value) : Number(arr?.value);
-          if (Number.isFinite(v) && v >= 0.01) { lastGoodValue = v; return v; }
+          if (Number.isFinite(v) && v >= 0.01) { lastGoodValue = v; setLocalPortfolio(v + (lastGoodBalance || 0)); return v; }
         }
       } catch { /* fall through to last-good */ }
       return lastGoodValue;
@@ -412,9 +461,21 @@ export async function makePolymarket(config) {
       // SELL never exceeds the wallet balance; never round a sub-1-share holding UP to 1 (that caused
       // "sell 1.0 but only hold 0.48"). A size that rounds to 0 is un-sellable dust -> report it so
       // the caller stops retrying (it settles on its own at resolution).
-      const size = Math.floor(sizeShares * 100) / 100;
+      let size = Math.floor(sizeShares * 100) / 100;
       if (!(size > 0)) {
         return { ok: false, status: 400, body: { polymarket: { error: "size below sellable minimum (dust)" } }, meta: { market: tokenId, side: side.toLowerCase(), size: 0, price: priceCents } };
+      }
+      // LOCAL RISK CAP — BUYS ONLY (sells must always be allowed: never trap open money). Clamps the
+      // shares to the per-fill %-of-portfolio ceiling and the rolling hour/day buy-volume governors,
+      // all computed from the bot's OWN portfolio, never from Cosmos. A hostile server cannot widen it.
+      if (side === "BUY") {
+        const rc = riskClampBuy(size, price);
+        if (rc.shares <= 0) {
+          console.warn(`[risk] BUY refused: ${rc.reason} · token ${String(tokenId).slice(0, 12)} · portfolio $${lastLocalPortfolio.toFixed(0)}`);
+          return { ok: false, status: 400, body: { polymarket: { error: `local risk cap: ${rc.reason}` } }, meta: { market: tokenId, side: "buy", size: 0, price: priceCents, risk_capped: true } };
+        }
+        if (rc.capped) { console.warn(`[risk] BUY clamped: ${rc.reason} · token ${String(tokenId).slice(0, 12)}`); size = Math.floor(rc.shares * 100) / 100; }
+        if (!(size > 0)) return { ok: false, status: 400, body: { polymarket: { error: "local risk cap: clamped to dust" } }, meta: { market: tokenId, side: "buy", size: 0, price: priceCents, risk_capped: true } };
       }
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
       // ROTATION: order 5, 10, 15... carries the affiliate's builder code (when one is set).
@@ -459,6 +520,9 @@ export async function makePolymarket(config) {
           } else {
             meta.size = fill.shares;          // shares that actually filled (partials included)
             meta.price = fill.priceCents;     // average fill price in cents, not the limit cap
+            // Record the REALISED buy $ in the rolling risk ledger (actual fill, not the request) so
+            // the hour/day governors bound true deployed capital. BUYS only; sells never count.
+            if (side === "BUY") riskRecordBuy((fill.shares || 0) * ((fill.priceCents || priceCents) / 100));
           }
           // Carry the CLOB's own answer (orderID, tx hashes, taking/making amounts) into the meta so
           // meter() reports it and the server can audit fills against what we ledgered (the orders
