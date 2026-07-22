@@ -29,6 +29,14 @@ const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy w
 // whale keeps adding we follow him up — scale-ins are capped only by the sanity ceiling.
 const MAX_ENTRY_CENTS = N("COPY_MAX_ENTRY_CENTS", 92); // new positions
 const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a position we already hold
+// ADD CEILING for scan-adopted signals (owner model 2026-07-22): an add must respect the same
+// ±20c-of-his-entry band as the open. Tier restamps arrive with no price check server-side, so
+// without this a whale growing his position while the price ran to 90c would have every bot
+// topping up at up to the flat 97c add cap - precisely the chase the band exists to prevent.
+const addCapFor = (sig) => {
+  const hisC = Number(sig.his_entry_cents);
+  return sig.kind === "adopt" && Number.isFinite(hisC) && hisC > 0 ? Math.min(MAX_ADD_CENTS, hisC + 20) : MAX_ADD_CENTS;
+};
 // ---- POST-BLOWUP GUARDS (2026-07-13 forensics; each one maps to a proven loss channel) ----
 const MIN_ENTRY_CENTS = N("COPY_MIN_ENTRY_CENTS", 10); // no penny legs: 1c spread at 3c = 33%/round-trip
 const MIN_ADD_CENTS = N("COPY_MIN_ADD_CENTS_FLOOR", 5);
@@ -289,7 +297,7 @@ export function startCopyTrade(deps) {
       const add = target - (Number(mine.size_usd) || 0);
       if (add < MIN_ADD_USD) return;                              // fully sized for his current beats (no log: normal steady-state)
       if (copyExposure(positions) + add > exposureCap) return skip("exposure cap (add $" + add.toFixed(2) + ")");
-      const px = await priceFor(sig.token_id, MAX_ADD_CENTS, MIN_ADD_CENTS);
+      const px = await priceFor(sig.token_id, addCapFor(sig), MIN_ADD_CENTS);
       if (px == null) return skip("add price out of band");
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
       if (ok) buyTimes.push(Date.now());
@@ -349,8 +357,9 @@ export function startCopyTrade(deps) {
         if (add < MIN_ADD_USD) continue;                                // no ratio transition worth an order
         if (rateLimited()) continue;
         if (copyExposure(positions) + add > exposureCap) continue;      // copytrade never exceeds its slice
-        // ALREADY IN: he's reinforcing, so we follow him up — the 92c entry cap does NOT apply here.
-        const px = await priceFor(sig.token_id, MAX_ADD_CENTS, MIN_ADD_CENTS);
+        // ALREADY IN: he's reinforcing, so we follow him up — but an adopt add stays inside the
+        // ±20c-of-his-entry band (addCapFor); only non-adopt whale-fill adds ride to the flat cap.
+        const px = await priceFor(sig.token_id, addCapFor(sig), MIN_ADD_CENTS);
         if (px == null) continue;
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
         if (ok) buyTimes.push(Date.now());
