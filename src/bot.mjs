@@ -1063,6 +1063,21 @@ async function main() {
   // by maybeStartEngines() from the SERVER's account settings (see cycle()), which also makes turning
   // the server flag off a live kill switch. A local env var still forces one on, for local testing.
 
+  // CYCLE-WEDGE GUARD (2026-07-22). `await cycle()` can hang forever on a fetch that never settles
+  // (Node fetch has no default timeout) - and because maybeSelfUpdate() runs INSIDE this loop, a hung
+  // cycle doesn't just stop trading and heartbeats, it silently breaks the 10-minute fleet-update
+  // guarantee too. All network calls now carry timeouts, but this interval is the hard promise: if a
+  // full cycle hasn't COMPLETED in 10 minutes, exit so the launcher relaunches us clean.
+  let lastCycleDone = Date.now();
+  setInterval(() => {
+    if (Date.now() - lastCycleDone > Number(process.env.COSMOS_CYCLE_WEDGE_MS || 600_000)) {
+      if (process.env.COSMOS_LAUNCHER === "1") {
+        err(`cycle WEDGED: no completed cycle for ${Math.round((Date.now() - lastCycleDone) / 1000)}s - exiting for a launcher restart`);
+        process.exit(1);
+      }
+      err(`cycle WEDGED for ${Math.round((Date.now() - lastCycleDone) / 1000)}s and no launcher present - bot is effectively DEAD until restarted`);
+    }
+  }, 60_000).unref?.();
   // eslint-disable-next-line no-constant-condition
   while (true) {
     maybeSelfUpdate(); // pull + relaunch on a new commit (throttled to every SELF_UPDATE_MS)
@@ -1071,6 +1086,7 @@ async function main() {
     } catch (e) {
       err("cycle:", e.message);
     }
+    lastCycleDone = Date.now();
     await sleep((config.pollSeconds ?? 30) * 1000);
   }
 }

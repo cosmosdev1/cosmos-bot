@@ -215,7 +215,7 @@ export function startQTable(deps) {
         if (f >= 5 || (typeof r.status === "number" && r.status >= 400 && r.status < 500 && f >= 3)) { done.add(cid); tracked.delete(cid); }
         continue;
       }
-      try { await cosmos.meter({ ...r.meta, source: "qtable" }); } catch { /* best-effort */ }
+      cosmos.meter({ ...r.meta, source: "qtable" }).catch(() => {}); // fire-and-forget: the trading loop must NEVER block on the metering relay (a hung await here froze tick() for 12.5h on 07-21)
       positions[cid] = {
         condition_id: cid, token_id: token, outcome, source: "qtable",
         entry_cents: priceCents, size_usd: orderUsd, size_shares: shares, entry_whales: [],

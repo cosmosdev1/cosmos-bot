@@ -140,8 +140,8 @@ export async function makePolymarket(config) {
     if (depositCreds) return depositCreds;
     try {
       const mkH = async () => createL1Headers(walletClient, 137, 0, undefined, funder);
-      let jj = await fetch(`${CLOB_HOST}/auth/api-key`, { method: "POST", headers: await mkH() }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-      if (!jj?.apiKey) jj = await fetch(`${CLOB_HOST}/auth/derive-api-key`, { headers: await mkH() }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      let jj = await fetch(`${CLOB_HOST}/auth/api-key`, { method: "POST", headers: await mkH(), signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      if (!jj?.apiKey) jj = await fetch(`${CLOB_HOST}/auth/derive-api-key`, { headers: await mkH(), signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
       depositCreds = jj?.apiKey ? { key: jj.apiKey, secret: jj.secret, passphrase: jj.passphrase } : null;
     } catch { depositCreds = null; }
     console.log(depositCreds ? "[polymarket] ✓ API key bound to the deposit wallet (POLY_1271 ready)" : "[polymarket] ⚠ could not derive a deposit-wallet API key");
@@ -314,7 +314,7 @@ export async function makePolymarket(config) {
     // many pages). Returns the number, or the last-good value on a transient failure, or null.
     async getPortfolioValue() {
       try {
-        const r = await fetch(`${DATA_API}/value?user=${encodeURIComponent(funder)}`);
+        const r = await fetch(`${DATA_API}/value?user=${encodeURIComponent(funder)}`, { signal: AbortSignal.timeout(10_000) });
         if (r.ok) {
           const arr = await r.json();
           const v = Array.isArray(arr) ? Number(arr[0]?.value) : Number(arr?.value);
@@ -329,7 +329,7 @@ export async function makePolymarket(config) {
     // check it up front and surface it clearly instead of blindly firing orders into a wall.
     async geoblock() {
       try {
-        const res = await fetch("https://polymarket.com/api/geoblock");
+        const res = await fetch("https://polymarket.com/api/geoblock", { signal: AbortSignal.timeout(10_000) });
         if (!res.ok) return { ok: false, status: res.status };
         const d = await res.json();
         return { ok: true, blocked: Boolean(d?.blocked), ip: d?.ip ?? null, country: d?.country ?? null, region: d?.region ?? null };
@@ -341,7 +341,7 @@ export async function makePolymarket(config) {
     // Market end date (ISO) for a condition id - the horizon stop's capital-lock input.
     async getMarketEndDate(conditionId) {
       try {
-        const res = await fetch(`${GAMMA}/markets?condition_ids=${encodeURIComponent(conditionId)}`);
+        const res = await fetch(`${GAMMA}/markets?condition_ids=${encodeURIComponent(conditionId)}`, { signal: AbortSignal.timeout(10_000) });
         const arr = await res.json();
         const m = Array.isArray(arr) ? arr[0] : null;
         return m?.endDate ?? null;
@@ -355,7 +355,7 @@ export async function makePolymarket(config) {
       const key = `${conditionId}:${outcome}`.toLowerCase();
       if (tokenCache.has(key)) return tokenCache.get(key);
       try {
-        const res = await fetch(`${GAMMA}/markets?condition_ids=${encodeURIComponent(conditionId)}`);
+        const res = await fetch(`${GAMMA}/markets?condition_ids=${encodeURIComponent(conditionId)}`, { signal: AbortSignal.timeout(10_000) });
         const arr = await res.json();
         const m = Array.isArray(arr) ? arr[0] : null;
         if (!m) return null;
@@ -518,7 +518,7 @@ export async function makePolymarket(config) {
         // rows (redeemable - auto-claimed at $1, nothing to manage) are skipped.
         const out = [];
         for (let pg = 0; pg < 4; pg++) {
-          const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=0&sortBy=CURRENT&sortDirection=DESC&limit=500&offset=${pg * 500}`);
+          const res = await fetch(`${DATA_API}/positions?user=${encodeURIComponent(funder)}&sizeThreshold=0&sortBy=CURRENT&sortDirection=DESC&limit=500&offset=${pg * 500}`, { signal: AbortSignal.timeout(10_000) });
           if (!res.ok) return pg === 0 ? null : out;
           const arr = await res.json();
           if (!Array.isArray(arr)) return pg === 0 ? null : out;

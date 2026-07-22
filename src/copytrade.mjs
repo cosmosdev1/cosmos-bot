@@ -185,7 +185,7 @@ export function startCopyTrade(deps) {
       warn(`copytrade ${kind} failed: ${String(r.error ?? r.err ?? r.status ?? "").slice(0, 120)}`); return false;
     }
     stats.fills++;
-    try { await cosmos.meter({ ...r.meta, source: "copytrade" }); } catch { /* best-effort */ }
+    cosmos.meter({ ...r.meta, source: "copytrade" }).catch(() => {}); // fire-and-forget: the trading loop must NEVER block on the metering relay (a hung await here froze tick() for 12.5h on 07-21)
 
     // ACTUAL FILL (2026-07-19): placeOrder now reports what MATCHED — a FAK cap routinely fills fewer
     // shares at a better price than the cap (a "97c" order really filled 3.96 sh @ 49c). Track and

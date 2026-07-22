@@ -360,7 +360,7 @@ export function startCert15(deps) {
       }
       stats.fills++;
       hourlyMark();                                          // a filled entry consumes an hourly slot
-      try { await cosmos.meter({ ...r.meta, source: "cert15" }); } catch { /* best-effort */ }
+      cosmos.meter({ ...r.meta, source: "cert15" }).catch(() => {}); // fire-and-forget: the trading loop must NEVER block on the metering relay (a hung await here froze tick() for 12.5h on 07-21)
       positions[m.cid] = {
         condition_id: m.cid, token_id: pick.token, outcome: pick.outcome, source: "cert15",
         entry_cents: askC, size_usd: orderUsd, size_shares: shares, entry_whales: [],

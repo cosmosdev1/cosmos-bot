@@ -4,7 +4,11 @@ export function makeCosmos(config) {
   const headers = { Authorization: `Bearer ${config.cosmosToken}`, "Content-Type": "application/json" };
 
   async function getJSON(path) {
-    const res = await fetch(`${base}${path}`, { headers });
+    // HARD TIMEOUT (2026-07-22). Node fetch has NO default timeout: a half-open connection makes the
+    // await hang FOREVER - it neither resolves nor rejects, so try/catch cannot save the caller. This
+    // froze qtable2's tick() fleet-wide for 12.5h (meter() hung right after a fill; every restart
+    // "fixed" it for one burst). Every network call in this file now carries an abort signal.
+    const res = await fetch(`${base}${path}`, { headers, signal: AbortSignal.timeout(10_000) });
     const d = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(d.error || `GET ${path} -> ${res.status}`);
     return d;
@@ -25,6 +29,7 @@ export function makeCosmos(config) {
       const res = await fetch(`${base}/api/v1/positions/advice`, {
         method: "POST",
         headers,
+        signal: AbortSignal.timeout(15_000), // exits protect open money - a hung advice call must fail into the HOLD fallback, not freeze the loop
         body: JSON.stringify({
           condition_id: pos.condition_id,
           outcome: pos.outcome,
@@ -44,6 +49,7 @@ export function makeCosmos(config) {
       const res = await fetch(`${base}/api/v1/positions/advice`, {
         method: "POST",
         headers,
+        signal: AbortSignal.timeout(20_000), // batch exit advice: same rule - time out into fail-safe HOLD
         body: JSON.stringify({
           positions: positions.map((p) => ({
             condition_id: p.condition_id, outcome: p.outcome, entry_cents: p.entry_cents, whales: p.entry_whales || [],
@@ -93,7 +99,7 @@ export function makeCosmos(config) {
           end: pos.end_date ?? "",
           side: pos.outcome ?? "",
         });
-        const res = await fetch(`${base}/api/v1/quant-exit?${s}`, { headers });
+        const res = await fetch(`${base}/api/v1/quant-exit?${s}`, { headers, signal: AbortSignal.timeout(10_000) });
         const d = await res.json().catch(() => ({}));
         if (!res.ok) return null;
         return d; // { ok, modelP, tauMin, asset, strike, family }
@@ -111,7 +117,7 @@ export function makeCosmos(config) {
     // (new-only, category lock, runway, pair cost, entry band) and upserts the signal. ~200ms.
     copyWallets: () => getJSON("/api/v1/copy-wallets"), // { wallets: [{ wallet, username, category }] }
     async copyCheck({ wallet, token_id, shares }) {
-      const r = await fetch(`${base}/api/v1/copy-check`, { method: "POST", headers, body: JSON.stringify({ wallet, token_id, shares }) });
+      const r = await fetch(`${base}/api/v1/copy-check`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify({ wallet, token_id, shares }) });
       return r.json(); // { ok: true, signal } | { ok: false, reason }
     },
 
@@ -125,7 +131,7 @@ export function makeCosmos(config) {
     // Report a copy fill (BUY on entry/scale-in, SELL on a mirror step) to the per-user admin ledger.
     // Fire-and-forget: never blocks or breaks the copy loop.
     async copyReport(trade) {
-      try { await fetch(`${base}/api/v1/copy-trade`, { method: "POST", headers, body: JSON.stringify({ trade }) }); } catch { /* observability only */ }
+      try { await fetch(`${base}/api/v1/copy-trade`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify({ trade }) }); } catch { /* observability only */ }
     },
 
     // Report a placed order to Cosmos: records the $0.09 fee and returns whether the daily
@@ -133,7 +139,7 @@ export function makeCosmos(config) {
     // by the bot — Cosmos never touches keys or funds.
     async meter(meta) {
       try {
-        const res = await fetch(`${base}/api/v1/orders`, { method: "POST", headers, body: JSON.stringify({ meta }) });
+        const res = await fetch(`${base}/api/v1/orders`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify({ meta }) });
         const d = await res.json().catch(() => ({}));
         return { ok: res.ok, paused: Boolean(d.paused), spent_today: d.spent_today, daily_limit: d.daily_limit };
       } catch {
@@ -145,7 +151,7 @@ export function makeCosmos(config) {
     // orders are sized as they are. Fire-and-forget: never blocks or breaks a cycle.
     async reportHealth(health) {
       try {
-        await fetch(`${base}/api/v1/bot-health`, { method: "POST", headers, body: JSON.stringify(health) });
+        await fetch(`${base}/api/v1/bot-health`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify(health) });
       } catch { /* observability only - ignore */ }
     },
   };

@@ -13,7 +13,7 @@
 // user's app; every other bot leaves the flag unset and never even imports this file). Runs as a fast
 // ~250ms side-loop next to the 30s cycle. DRY: QTABLE2_DRY=1 logs would-be fills, places nothing.
 import { readFileSync, appendFileSync, writeFileSync } from "node:fs";
-import { log, warn } from "./log.mjs";
+import { log, warn, err } from "./log.mjs";
 
 // The bot runs on node:20-slim, which has NO global WebSocket. Without this the Chainlink RTDS feed
 // silently retries forever (the reconnect catch swallows the ReferenceError) and the engine never gets
@@ -146,7 +146,7 @@ function appendLedger(rec) { try { appendFileSync(LEDGER, JSON.stringify(rec) + 
 // HOURLY TRADE CAP (owner 2026-07-20: 3 per rolling 60min for the fleet-live rollout — one notch
 // under cert15's 4). Timestamps persist to the volume so a restart cannot reset the window.
 // Fills and DRY would-buys consume a slot; failed FAKs do not.
-const MAX_PER_HOUR = N("QTABLE2_MAX_PER_HOUR", 3);
+const MAX_PER_HOUR = N("QTABLE2_MAX_PER_HOUR", 4);   // owner 2026-07-22: 4 signals/hour per user
 const HOURLY_FILE = `${DATA_DIR}/qtable2-hourly.json`;
 let hourly = [];
 try { hourly = (JSON.parse(readFileSync(HOURLY_FILE, "utf8")).ts || []).filter((t) => Number.isFinite(t) && t > Date.now() - 3600e3); } catch { /* fresh */ }
@@ -470,7 +470,7 @@ export function startQTable2(deps) {
       }
       stats.fills++;
       hourlyMark();                                          // a filled entry consumes an hourly slot
-      try { await cosmos.meter({ ...r.meta, source: "qtable" }); } catch { /* best-effort */ }
+      cosmos.meter({ ...r.meta, source: "qtable" }).catch(() => {}); // fire-and-forget: the trading loop must NEVER block on the metering relay (a hung await here froze tick() for 12.5h on 07-21)
       positions[m.cid] = {
         condition_id: m.cid, token_id: pick.token, outcome: pick.outcome, source: "qtable",
         entry_cents: priceCents, size_usd: orderUsd, size_shares: shares, entry_whales: [],
@@ -506,6 +506,21 @@ export function startQTable2(deps) {
       // or dead - which no other field on this line can reveal (they are fed by other timers).
       const tickAge = lastTickAt ? ((Date.now() - lastTickAt) / 1000).toFixed(1) + "s" : "NEVER";
       log(`qtable2 … tracking ${markets.size} · ${feeds} · signals ${stats.signals} · orders ${stats.orders} · fills ${stats.fills} · hourly ${hourly.filter((t) => t > Date.now() - 3600e3).length}/${MAX_PER_HOUR}${stats.capSkips ? ` (cap-skipped ${stats.capSkips})` : ""}${stats.noCash ? ` (no-cash ${stats.noCash})` : ""} · tick ${tickAge} · ${lastExit}`);
+      // TICK-WEDGE BACKSTOP (2026-07-22, the "works one cycle then stops" fix). tick() is awaited in
+      // the run loop; an await inside it that never settles (a hung fetch with no timeout) freezes the
+      // loop FOREVER while every other timer keeps painting a healthy status line - the fleet sat dead
+      // 12.5h with feeds at 1.4s and "evaluating" on screen. All known calls now carry timeouts, but
+      // this guard makes ANY future hang self-heal: if the loop hasn't completed a pass in 5 minutes,
+      // exit and let the launcher relaunch us (state persists in /data; the fleet contract is that the
+      // launcher always restarts a dead bot). Without a launcher (bare local run), warn loudly instead.
+      const wedgeMs = N("QTABLE2_TICK_WEDGE_MS", 300_000);
+      if (lastTickAt && Date.now() - lastTickAt > wedgeMs) {
+        if (process.env.COSMOS_LAUNCHER === "1") {
+          err(`qtable2 WEDGED: no tick for ${Math.round((Date.now() - lastTickAt) / 1000)}s - exiting so the launcher restarts us on fresh connections`);
+          process.exit(1);
+        }
+        warn(`qtable2 WEDGED: no tick for ${Math.round((Date.now() - lastTickAt) / 1000)}s and no launcher to restart us - trading is DEAD until this process is restarted`);
+      }
       const staleCoin = COINS.find((c) => { const h = hist[c]; return h?.length && Date.now() - h[h.length - 1].t > WATCHDOG_MS; });
       if (staleCoin && Date.now() - lastKick > WATCHDOG_MS) {
         lastKick = Date.now();
