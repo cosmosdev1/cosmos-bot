@@ -47,7 +47,7 @@ const MAX_EXPOSURE_PCT = N("COPY_MAX_EXPOSURE_PCT", 20);
 // $13.76 + $11.04 in two esports handicaps = 46% of a $54 account against a 1% tier). No single copy
 // market may exceed this % of the portfolio, full stop — a hard ceiling above the tier bands (max 4%)
 // that catches beats over-sizing, a stale high tier restamp, and any accumulation bug at once.
-const MAX_POSITION_PCT = N("COPY_MAX_POSITION_PCT", 8);
+const MAX_POSITION_PCT = N("COPY_MAX_POSITION_PCT", 5);
 // fleet churned 4.4 buys/min for 3h; a real directional copy has no business firing faster than this
 const MAX_BUYS_PER_HOUR = N("COPY_MAX_BUYS_PER_HOUR", 30);  // 12 saturated in minutes on a 10-wallet candle roster (deep-check #9); 30 is still ~9x under the blowup churn
 // owner: "smaller amount per trade" — the copy unit is this fraction of the dashboard per-trade size,

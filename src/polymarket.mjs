@@ -85,7 +85,7 @@ const AFF_EVERY = 5;
 // hour and per day regardless of how the loss is realised (counted on BUYS, never
 // reduced by sells — so attacker-driven exits can't free the budget to buy again).
 const capPct = (env, hard) => { const v = Number(process.env[env]); return Number.isFinite(v) && v > 0 ? Math.min(v, hard) : hard; };
-const MAX_TRADE_PCT = capPct("COSMOS_MAX_TRADE_PCT", 8);    // one fill: <=8% of portfolio (legit max ~6%; the "10%" attack is impossible)
+const MAX_TRADE_PCT = capPct("COSMOS_MAX_TRADE_PCT", 5);    // one fill: <=5% of portfolio (owner 2026-07-22)
 const MAX_HOUR_PCT  = capPct("COSMOS_MAX_HOUR_PCT", 40);    // rolling 60min buy-volume ceiling
 const MAX_DAY_PCT   = capPct("COSMOS_MAX_DAY_PCT", 100);    // rolling 24h buy-volume ceiling
 const MAX_HOUR_BUYS = Math.min(Number(process.env.COSMOS_MAX_HOUR_BUYS) || 45, 45); // count backstop (legit peak ~38: copy 30 + qt 4 + cert 4)
