@@ -1,0 +1,9 @@
+{
+  "payload": {
+    "halt": false,
+    "reason": "",
+    "max_trade_pct": null,
+    "ts": 1784716323
+  },
+  "sig": "3vDOvSOLArCpc5VRYcy/WUNFhAIVH7yLF3/1RUZAxRy7gz7jgMz8zoS+59tzCicWw0Wd5be0N1V7a8PfCNm2BA=="
+}

@@ -10,3 +10,7 @@ fly.toml
 # QTABLE live-test key file — NEVER commit
 qtable-live.env
 *.env
+
+# fleet kill-switch OFFLINE private key — never commit
+fleet-priv.pem
+*.pem

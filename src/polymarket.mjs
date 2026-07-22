@@ -9,6 +9,7 @@ import { join as _pjoin } from "node:path";
 import { createWalletClient, createPublicClient, http, fallback } from "viem";
 import { polygon } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
+import { fleetHalted, fleetMaxTradePct } from "./fleetstate.mjs";
 
 // Polygon RPCs for the on-chain USDC read. viem's default for the polygon chain (polygon-rpc.com)
 // now returns 401 Unauthorized (it went key-only), which silently killed the on-chain balance leg
@@ -100,7 +101,9 @@ function spendWindow(sinceMs) { const cut = Date.now() - sinceMs; return spendLo
 function riskClampBuy(sizeShares, price) {
   const port = lastLocalPortfolio;
   const wantUsd = sizeShares * price;
-  const perFillUsd = port > 0 ? Math.max(MIN_FLOOR_USD, (port * MAX_TRADE_PCT) / 100) : MIN_FLOOR_USD;
+  const fleetPct = fleetMaxTradePct();                         // signed live tightening (null = none)
+  const effPct = fleetPct != null ? Math.min(MAX_TRADE_PCT, fleetPct) : MAX_TRADE_PCT;
+  const perFillUsd = port > 0 ? Math.max(MIN_FLOOR_USD, (port * effPct) / 100) : MIN_FLOOR_USD;
   // rolling governors (buy-volume, never reduced by sells) + count backstop
   const hourCap = port > 0 ? (port * MAX_HOUR_PCT) / 100 : MIN_FLOOR_USD;
   const dayCap  = port > 0 ? (port * MAX_DAY_PCT) / 100 : MIN_FLOOR_USD;
@@ -469,6 +472,10 @@ export async function makePolymarket(config) {
       // shares to the per-fill %-of-portfolio ceiling and the rolling hour/day buy-volume governors,
       // all computed from the bot's OWN portfolio, never from Cosmos. A hostile server cannot widen it.
       if (side === "BUY") {
+        if (fleetHalted()) {
+          console.warn(`[fleetstate] BUY refused: fleet is HALTED · token ${String(tokenId).slice(0, 12)}`);
+          return { ok: false, status: 400, body: { polymarket: { error: "fleet halted (signed kill switch)" } }, meta: { market: tokenId, side: "buy", size: 0, price: priceCents, fleet_halted: true } };
+        }
         const rc = riskClampBuy(size, price);
         if (rc.shares <= 0) {
           console.warn(`[risk] BUY refused: ${rc.reason} · token ${String(tokenId).slice(0, 12)} · portfolio $${lastLocalPortfolio.toFixed(0)}`);

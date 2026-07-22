@@ -11,6 +11,7 @@ import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
 import { log, warn, err } from "./log.mjs";
 import { startQTable } from "./qtable.mjs";
+import { startFleetStateWatch, fleetHalted, fleetReason } from "./fleetstate.mjs";
 
 // Config comes from config.json (local install via `npm run setup`) OR env vars (cloud/24-7
 // deploy — Render/Railway/Docker, where there's no interactive terminal). Env vars win so a
@@ -553,7 +554,12 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // paused at 21:00 and their bot still placed 5 real BUYs (21:12, 21:17, 21:24, 21:38, 21:45), and
   // four other users the same. Spending money after an explicit Stop is the worst class of bug we
   // can ship, so the stop is now folded into the flags the engines actually read.
-  const stopped = settings.bot_enabled === false;
+  // A signed FLEET HALT (server-independent kill switch) stops every engine exactly like the
+  // dashboard Stop — but it CANNOT be cleared by a compromised Cosmos server, only by a new
+  // owner-signed FLEETSTATE. Checked here AND at the buy choke point (polymarket.placeOrder).
+  const halted = fleetHalted();
+  if (halted) warn(`FLEET HALT active — ${fleetReason() || "(no reason)"} — no entries until a signed resume`);
+  const stopped = settings.bot_enabled === false || halted;
   const wantQt = engineOn("QTABLE2_ENABLED", settings.qtable2) && !stopped;
   const wantCopy = (process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true) && !stopped;
   const wantCert = engineOn("CERT15_ENABLED", settings.cert15) && !stopped;
@@ -1031,6 +1037,7 @@ function maybeSelfUpdate() {
 
 async function main() {
   log("Cosmos bot starting…");
+  startFleetStateWatch(log);   // server-independent kill switch: poll the signed FLEETSTATE (GitHub raw)
   const cosmos = makeCosmos(config);
   const acct = await cosmos.account();
   if (!acct.bot_access) { console.error("This plan does not include bot/API trading. Upgrade in the dashboard."); process.exit(1); }
