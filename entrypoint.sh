@@ -47,7 +47,14 @@ export COSMOS_LAUNCHER=1  # tells the bot a restarter is present, so its self-up
 
 BOT_PID=""
 start_bot() {
-  npm install --omit=dev --no-audit --no-fund --silent || true
+  # SUPPLY CHAIN (security sweep 2026-07-22): npm ci against the committed lockfile, with lifecycle
+  # scripts DISABLED. This install runs next to POLYMARKET_PRIVATE_KEY in process.env after every
+  # 10-minute auto-pull - with scripts enabled, a compromised transitive dependency's postinstall
+  # would execute inside every bot in the fleet within one update window. Our deps (viem, ws,
+  # @polymarket/clob-client-v2) are pure JS and need no build scripts; ws's optional native addons
+  # are skipped harmlessly. npm install remains only as the fallback for a lock desync, so a bad
+  # lockfile can never brick the fleet - it logs loudly instead.
+  npm ci --omit=dev --ignore-scripts --no-audit --no-fund --silent     || { echo "[launcher] npm ci failed (lock desync?) - falling back to npm install"; npm install --omit=dev --ignore-scripts --no-audit --no-fund --silent || true; }
   node src/bot.mjs &
   BOT_PID=$!
   echo "[launcher] bot started (pid $BOT_PID) @ $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
