@@ -12,6 +12,7 @@ import * as store from "./store.mjs";
 import { log, warn, err } from "./log.mjs";
 import { startQTable } from "./qtable.mjs";
 import { startFleetStateWatch, fleetHalted, fleetReason } from "./fleetstate.mjs";
+import { drawdownCheck } from "./drawdown.mjs";
 
 // Config comes from config.json (local install via `npm run setup`) OR env vars (cloud/24-7
 // deploy — Render/Railway/Docker, where there's no interactive terminal). Env vars win so a
@@ -58,7 +59,7 @@ const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 // Live cycle state shared with the qtable fast loop (updated every 30s cycle; the 5s loop reads it).
-const qtState = { cash: null, portfolio: 0, deployed: 0, sizing: null };
+const qtState = { cash: null, portfolio: 0, deployed: 0, sizing: null, ddHalt: false };
 
 // Hard floor per trade: Polymarket's ~$1 minimum order. Any computed size below this is bumped up
 // to $1 (e.g. 3% of a $10 balance = $0.30 still trades at $1), as long as there's room.
@@ -559,7 +560,7 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // owner-signed FLEETSTATE. Checked here AND at the buy choke point (polymarket.placeOrder).
   const halted = fleetHalted();
   if (halted) warn(`FLEET HALT active — ${fleetReason() || "(no reason)"} — no entries until a signed resume`);
-  const stopped = settings.bot_enabled === false || halted;
+  const stopped = settings.bot_enabled === false || halted || qtState.ddHalt === true;
   const wantQt = engineOn("QTABLE2_ENABLED", settings.qtable2) && !stopped;
   const wantCopy = (process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true) && !stopped;
   const wantCert = engineOn("CERT15_ENABLED", settings.cert15) && !stopped;
@@ -710,6 +711,12 @@ async function cycle(cosmos, pm) {
   const positionsValue = Math.max(Number(pmValue) || 0, deployed);
   const portfolioValue = balance + positionsValue;
   qtState.cash = balance; qtState.portfolio = portfolioValue; qtState.deployed = deployed;
+  // PER-ACCOUNT DRAWDOWN BREAKER (server-independent): halt THIS bot's entries while its own portfolio
+  // is >30% below its rolling 12h high. Exits keep running. Re-evaluated every cycle; latches until a
+  // real recovery. This is the individual case of the fleet rule and needs no server.
+  const dd = drawdownCheck(portfolioValue);
+  qtState.ddHalt = dd.halt;
+  if (dd.halt) warn(`DRAWDOWN BREAKER: portfolio $${portfolioValue.toFixed(0)} is ${(dd.dd * 100).toFixed(0)}% below the 12h high $${dd.high.toFixed(0)} — entries halted until recovery`);
   const feed = await cosmos.signals().catch((e) => {
     // Surface WHY the feed failed - especially the builder-guard 403, which tells the user
     // exactly what happened and how to fix it. Silence here looked like "0 signals" for no reason.
