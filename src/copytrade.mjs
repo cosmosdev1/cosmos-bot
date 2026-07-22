@@ -42,6 +42,12 @@ const MIN_ENTRY_CENTS = N("COPY_MIN_ENTRY_CENTS", 10); // no penny legs: 1c spre
 const MIN_ADD_CENTS = N("COPY_MIN_ADD_CENTS_FLOOR", 5);
 // copytrade may hold at most this % of the portfolio in cost basis — the blowup deployed 100% (cash $0.54)
 const MAX_EXPOSURE_PCT = N("COPY_MAX_EXPOSURE_PCT", 20);
+// PER-POSITION CEILING (2026-07-22, owner incident). The total-exposure cap alone let ONE market
+// balloon to 25x its tier target and ~32% of a portfolio when the scale-in kept adding (owner held
+// $13.76 + $11.04 in two esports handicaps = 46% of a $54 account against a 1% tier). No single copy
+// market may exceed this % of the portfolio, full stop — a hard ceiling above the tier bands (max 4%)
+// that catches beats over-sizing, a stale high tier restamp, and any accumulation bug at once.
+const MAX_POSITION_PCT = N("COPY_MAX_POSITION_PCT", 8);
 // fleet churned 4.4 buys/min for 3h; a real directional copy has no business firing faster than this
 const MAX_BUYS_PER_HOUR = N("COPY_MAX_BUYS_PER_HOUR", 30);  // 12 saturated in minutes on a 10-wallet candle roster (deep-check #9); 30 is still ~9x under the blowup churn
 // owner: "smaller amount per trade" — the copy unit is this fraction of the dashboard per-trade size,
@@ -274,7 +280,7 @@ export function startCopyTrade(deps) {
     // the ceiling. The chain gives his exact share count, so copy-check prices his money-in and this
     // path sizes IDENTICALLY to the polled one — a flat unit would buy the same off a $50 dab as off a
     // $50,000 conviction. Below the $1 Polymarket minimum ("the first beat") we simply don't buy.
-    const { target } = sizeFor(sig, unitBasis, state.portfolio);
+    let { target } = sizeFor(sig, unitBasis, state.portfolio);
     // TRACE EVERY REFUSAL (deep-check forensics): the server logs every verdict, but the bot refused
     // silently — 38 approved markets got no order in 24h and NOTHING said why. One line per skip.
     const skip = (why) => log(`copytrade fast-skip ${sig.category} ${sig.outcome}: ${why} · ${String(sig.market_question || "").slice(0, 32)}`);
@@ -292,10 +298,13 @@ export function startCopyTrade(deps) {
     // raised our target above what we hold, ADD the difference NOW. Waiting for the 20s polled loop
     // meant the 2nd..5th beats of a 5-minute candle never fired — the beat ladder collapsed to
     // whatever the first clip bought.
+    const posCeil = ((state.portfolio || 0) * MAX_POSITION_PCT) / 100;   // hard ceiling for THIS market
     const mine = primary && sameSide(primary) ? primary : (positions[compKey]?.source === "copytrade" ? positions[compKey] : null);
     if (mine) {
-      const add = target - (Number(mine.size_usd) || 0);
-      if (add < MIN_ADD_USD) return;                              // fully sized for his current beats (no log: normal steady-state)
+      const held = Number(mine.size_usd) || 0;
+      // Never let one position grow past the per-position ceiling, whatever the target says.
+      let add = Math.min(target, posCeil) - held;
+      if (add < MIN_ADD_USD) return;                              // at/over the ceiling or fully sized (steady-state)
       if (copyExposure(positions) + add > exposureCap) return skip("exposure cap (add $" + add.toFixed(2) + ")");
       const px = await priceFor(sig.token_id, addCapFor(sig), MIN_ADD_CENTS);
       if (px == null) return skip("add price out of band");
@@ -307,6 +316,8 @@ export function startCopyTrade(deps) {
     if (positions[key]) return skip("already hold this side");
     const seenKey = compKey;
     if (seen[seenKey]) return skip("buy-once-ever");
+    target = Math.min(target, posCeil);                          // per-position ceiling on the opening clip too
+    if (target < MIN_ORDER_USD) return skip("per-position cap below $1 min");
     if (copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
     const capMax = String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS;   // sports band 3-99c (owner 2026-07-15)
     const cap = sig.is_pair
@@ -339,7 +350,7 @@ export function startCopyTrade(deps) {
       if (state.copyFills === false && sig.kind !== "adopt") continue;
       if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) continue; // settle-window cooldown
       if (sportsWindowClosed(sig)) continue;              // retry bound: never buy inside the last 10min pre-kickoff
-      const { target } = sizeFor(sig, unitBasis, state.portfolio);
+      let { target } = sizeFor(sig, unitBasis, state.portfolio);
       if (!(target > 0)) continue;
       stats.signals++;
 
@@ -352,9 +363,10 @@ export function startCopyTrade(deps) {
       if (primary?.source === "copytrade" && sameSide(primary)) mine = primary;
       else if (positions[compKey]?.source === "copytrade") mine = positions[compKey];
 
+      const posCeil = ((state.portfolio || 0) * MAX_POSITION_PCT) / 100;   // per-position ceiling (owner incident 2026-07-22)
       if (mine) {
-        const add = target - (Number(mine.size_usd) || 0);
-        if (add < MIN_ADD_USD) continue;                                // no ratio transition worth an order
+        const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
+        if (add < MIN_ADD_USD) continue;                                // at the ceiling or no transition worth an order
         if (rateLimited()) continue;
         if (copyExposure(positions) + add > exposureCap) continue;      // copytrade never exceeds its slice
         // ALREADY IN: he's reinforcing, so we follow him up — but an adopt add stays inside the
@@ -364,7 +376,8 @@ export function startCopyTrade(deps) {
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
         if (ok) buyTimes.push(Date.now());
       } else {
-        if (target < MIN_ORDER_USD) continue;                           // first beat not reached
+        target = Math.min(target, posCeil);                             // per-position ceiling on the opening clip
+        if (target < MIN_ORDER_USD) continue;                           // first beat not reached (or capped below $1)
         if (openCopy >= MAX_OPEN) continue;
         if (rateLimited()) continue;
         // pick the store key: free primary slot -> cid; primary holds the OPPOSITE side -> composite key
