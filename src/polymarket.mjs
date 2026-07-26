@@ -8,7 +8,7 @@ import { homedir as _home } from "node:os";
 import { join as _pjoin } from "node:path";
 import { createWalletClient, createPublicClient, http, fallback } from "viem";
 import { polygon } from "viem/chains";
-import { privateKeyToAccount } from "viem/accounts";
+import { makeSigner } from "./signer.mjs";
 import { fleetHalted, fleetMaxTradePct } from "./fleetstate.mjs";
 
 // Polygon RPCs for the on-chain USDC read. viem's default for the polygon chain (polygon-rpc.com)
@@ -169,10 +169,13 @@ function trimClobResp(resp) {
 }
 
 export async function makePolymarket(config) {
-  // viem signer (CLOB V2 is viem-based). Signing is local — no RPC needed.
-  const account = privateKeyToAccount(config.polymarket.privateKey);
+  // viem signer (CLOB V2 is viem-based). COSMOS_SIGNER=local (default) keeps the key in this
+  // process exactly as before; COSMOS_SIGNER=turnkey signs remotely inside the user's own enclave
+  // sub-organization, policy-limited to Polymarket orders only. Everything downstream is unchanged
+  // either way - the ClobClient just needs a viem account. See src/signer.mjs.
+  const { account, address, mode: signerMode } = await makeSigner(config);
   const walletClient = createWalletClient({ account, chain: polygon, transport: http() });
-  const address = account.address;
+  if (signerMode !== "local") console.log(`[polymarket] signer: ${signerMode} (${address})`);
   const funder = config.polymarket.funderAddress || address;
   const publicClient = createPublicClient({ chain: polygon, transport: fallback(RPC_URLS.map((u) => http(u))) });
   let lastGoodBalance = null; // last non-zero cash read, so a transient RPC/API blip never sizes off $0
