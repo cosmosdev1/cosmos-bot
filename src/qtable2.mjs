@@ -442,8 +442,8 @@ export function startQTable2(deps) {
 
       stats.signals++;
       const bookMs = Date.now() - tBook;                               // book-fetch + decision latency
-      // sizing: fixed $ if QTABLE2_STAKE_USD>0, else the account's dashboard % (e.g. 3% flat), floored at $2
-      const sizeUsd = STAKE > 0 ? STAKE : Math.max(2, sizeForSignal(state.sizing, { source: "qtable", outcome: pick.outcome }, state.portfolio, state.deployed));
+      // sizing: fixed $ if QTABLE2_STAKE_USD>0, else the account's dashboard % (e.g. 3% flat), floored at the $1 min order
+      const sizeUsd = STAKE > 0 ? STAKE : Math.max(1, sizeForSignal(state.sizing, { source: "qtable", outcome: pick.outcome }, state.portfolio, state.deployed));
       const priceCents = Math.min(97, Math.round(pick.ask * 100) + 1); // cross the ask
       const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(sizeUsd, priceCents));
       const orderUsd = (shares * priceCents) / 100;

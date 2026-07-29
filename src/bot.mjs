@@ -6,6 +6,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { randomUUID } from "node:crypto";
+import { withSignContext } from "./remote-signer.mjs";
 import { makeCosmos } from "./cosmos.mjs";
 import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
@@ -84,14 +86,22 @@ const entryFails = new Map(); // condition_id -> 4xx count (in-memory; a restart
 // so a single kill must never become a missed entry or a missed stop (mirrors the crypto_bot rule).
 // We retry ONLY while ok:false (a complete kill, nothing filled), so a partial/full fill never
 // re-fires and can't over-trade.
+// COSMOS CLOUD: this call is ONE economic decision, so it carries ONE triggerId for its whole retry
+// loop. The platform gate keys idempotency on (intent + triggerId), so these retries collapse to a
+// single reservation and can never double-fill. In local mode the context is simply unused.
 async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
-  let r;
-  for (let i = 0; i < attempts; i++) {
-    r = await pm.placeOrder(args);
-    if (r.ok) return r;
-    if (i < attempts - 1) await sleep(cooldownMs);
-  }
-  return r; // last failure
+  return withSignContext({ triggerId: randomUUID(), conditionId: args.conditionId || "" }, async () => {
+    let r;
+    for (let i = 0; i < attempts; i++) {
+      r = await pm.placeOrder(args);
+      if (r.ok) return r;
+      // A definitive cloud refusal (duplicate / signature cap / halt) cannot change on a re-post.
+      // Retrying it wastes the loop and, on paths that re-price, real signature money.
+      if (r.cloudDefinitive) { warn(`[cloud] entry refused (${r.cloudCode}) — not retrying`); return r; }
+      if (i < attempts - 1) await sleep(cooldownMs);
+    }
+    return r; // last failure
+  });
 }
 
 // Per-trade USD from the dashboard sizing config (synced from /api/v1/account each cycle).
@@ -258,7 +268,13 @@ async function edgeExit(pm, pos) {
   // QUANT (crypto/stocks math engine) positions hold out for 99c - each extra cent on a
   // near-certain bet is real yield, and an unfilled 99c costs nothing (resolution pays 100).
   // Everything else locks from 97c. Env: QUANT_TP_CENTS.
-  const tpC = pos.source === "quant" || pos.source === "qtable" ? HZ("QUANT_TP_CENTS", 99) : pos.source === "weather" ? HZ("WEATHER_TP_CENTS", 98) : 97;
+  // ONE-SHOT (hosted, owner 2026-07-29): copy positions take profit at 98c and have NO salvage stop.
+  // The exit is the whale's own selling (half out at -50% from his peak, the rest when he is gone);
+  // a 3c salvage would spend a signature to sell something already near worthless, and the owner
+  // explicitly accepted that downside in exchange for the cheaper, whale-driven exit.
+  const ONESHOT_COPY = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "") && pos.source === "copytrade";
+  const tpC = ONESHOT_COPY ? HZ("COPY_ONESHOT_TP_CENTS", 98)
+    : pos.source === "quant" || pos.source === "qtable" ? HZ("QUANT_TP_CENTS", 99) : pos.source === "weather" ? HZ("WEATHER_TP_CENTS", 98) : 97;
   // A take-profit must actually PROFIT: the trigger is the mid, but the fill is the BID. A 97c-entry
   // whose mid hits 98 with a 95c bid used to "lock the win" at -2c (audited: repeated tiny losses).
   // Require the executable bid (or mid when no bid was read) to clear entry+1; otherwise hold -
@@ -267,8 +283,8 @@ async function edgeExit(pm, pos) {
   const exec = bid ?? cur;
   if (cur != null && cur >= tpC && exec != null && exec >= minExec) return { cur, action: "TAKE_PROFIT", reason: `reached ${cur}c (exec ${exec}c) - locking the win` };
   if (bid != null && bid >= tpC && bid >= minExec) return { cur, action: "TAKE_PROFIT", reason: `best bid ${bid}c - locking the win` };
-  if (cur != null && cur <= 3) return { cur, action: "STOP_LOSS", reason: `reached ${cur}c - salvaging before zero` };
-  if (bid != null && bid <= 3 && (cur == null || cur <= 10)) return { cur, action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
+  if (!ONESHOT_COPY && cur != null && cur <= 3) return { cur, action: "STOP_LOSS", reason: `reached ${cur}c - salvaging before zero` };
+  if (!ONESHOT_COPY && bid != null && bid <= 3 && (cur == null || cur <= 10)) return { cur, action: "STOP_LOSS", reason: `best bid ${bid}c - salvaging before zero` };
   if (cur == null && bid == null) return { cur, action: "HOLD", reason: "book gone - resolution pays out automatically" };
   return { cur, action: null };
 }
@@ -360,6 +376,20 @@ async function decideExit(cosmos, pm, settings, pos, curFromEdge, aiVerdict) {
 // in our favour anyway. The caller re-runs this every cycle until reconcile confirms the holding is
 // actually gone, so a momentary empty book is retried until it fills.
 async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
+  // COSMOS CLOUD: one exit decision = one triggerId, same contract as placeWithRetry.
+  //
+  // NOTE the loop below RE-PRICES on every attempt, so each attempt is a genuinely different order:
+  // a different idempotency key and, hosted, a different PAID enclave signature. The platform caps a
+  // trade at 2 signatures (gate.ts MAX_SIGNATURES_PER_TRADE), so attempt 3 onward is refused with
+  // `trade_signature_cap` — which is why stopping on a definitive refusal matters here more than
+  // anywhere else. Consequence worth knowing: if both signed sells fail to fill, this position
+  // cannot be sold again until the 24h window rolls (the cap counts only SIGNED orders in the last
+  // 24h, so denials and kills never lock a position out).
+  return withSignContext({ triggerId: randomUUID(), conditionId: pos.condition_id || "" },
+    () => marketableSellInner(cosmos, pm, pos, action));
+}
+
+async function marketableSellInner(cosmos, pm, pos, action = "STOP_LOSS") {
   const mid = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
   const salvage = action !== "TAKE_PROFIT"; // stop-loss / edge-salvage may dump; take-profit may not
   // Quant take-profits never sell under 99c (per admin spec: the 98.5-99 band; integer ticks make
@@ -381,6 +411,9 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
     sellPrice = Math.max(1, Math.min(99, Math.round(sellPrice)));
     const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
     if (r.ok) { try { await cosmos.meter({ ...r.meta, source: pos.source ?? null }); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
+    // Definitive cloud refusal: every further attempt re-prices into another paid signature that the
+    // gate will refuse anyway. Stop and let the caller retry on a later cycle.
+    if (r.cloudDefinitive) { warn(`[cloud] exit refused (${r.cloudCode}) — not repricing`); return { mid, sellPrice, ...r }; }
     last = r;
     if (attempt < 4) await sleep(200);
   }

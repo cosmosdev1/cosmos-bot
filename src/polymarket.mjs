@@ -547,7 +547,17 @@ export async function makePolymarket(config) {
           // A THROW is transport-level (timeout, connection reset, DNS, signing) — the request may
           // have reached the CLOB and the order may be LIVE even though we never saw the answer.
           // Deliberately NOT rejected:true: re-posting here (affiliate fallback) could double-fill.
-          return { ok: false, status: 400, body: { polymarket: { error: e?.message ?? "order failed" } }, meta };
+          //
+          // COSMOS CLOUD: a hosted signature refused by the platform gate throws from inside
+          // createAndPostOrder, so without these two fields it is indistinguishable from a network
+          // blip and every retry layer above would re-post it. Carry the verdict up instead — a
+          // definitive refusal (duplicate, signature cap, halt) must stop the loop, because
+          // marketableSell re-prices per attempt and each re-post is a fresh PAID signature.
+          return {
+            ok: false, status: 400,
+            cloudCode: e?.cloudCode, cloudDefinitive: Boolean(e?.definitive),
+            body: { polymarket: { error: e?.message ?? "order failed" } }, meta,
+          };
         }
       };
       let r = await attempt(wantAff);

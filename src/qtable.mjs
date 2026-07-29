@@ -201,7 +201,7 @@ export function startQTable(deps) {
 
       const token = dec.side === "A" ? m.tokenA : m.tokenB;
       const outcome = dec.side === "A" ? m.outA : m.outB;
-      const sizeUsd = Math.max(2, sizeForSignal(state.sizing, { source: "qtable", outcome }, state.portfolio, state.deployed));
+      const sizeUsd = Math.max(1, sizeForSignal(state.sizing, { source: "qtable", outcome }, state.portfolio, state.deployed));
       const priceCents = Math.min(98, dec.price + 1);           // marketable: cross the ask
       const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(sizeUsd, priceCents));
       const orderUsd = (shares * priceCents) / 100;

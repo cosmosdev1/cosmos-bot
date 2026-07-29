@@ -113,7 +113,49 @@ function saveSeen(s) { try { writeFileSync(SEEN_FILE, JSON.stringify(s)); } catc
 // beyond his own average we keep following up to the ceiling (unit + 1pt).
 // Two same-side whales stack (each contributes its own beats). 0 => cannot size / first beat not reached.
 const BEATS = N("COPY_BEATS", 5);                 // 5 beats -> 20% each
+
+// ---------------------------------------------------------------------------------------------
+// ONE-SHOT MODE (hosted/Turnkey accounts only — owner 2026-07-29).
+//
+// Hosted execution pays Turnkey PER SIGNATURE, so the 5-beat ladder in + 10-step ladder out (~8-15
+// signatures per position) costs several times the 0.9% builder fee it earns. One-shot collapses a
+// position to ONE buy and at most two sells.
+//
+// Because we can no longer follow him up, tier-based sizing cannot work: he typically opens in a low
+// tier and stacks, so we would systematically under-size the best positions. Instead we wait until he
+// reaches the 2% tier — a real commitment — and then take OUR standard risk, a flat % of OUR
+// portfolio. His later stacking is deliberately ignored: we are already at our intended size.
+//
+// OFF by default: self-hosted bots keep the beat ladder byte-for-byte. Flip COSMOS_ONESHOT=1 (and
+// flip it back once Turnkey Enterprise pricing makes per-signature cost negligible).
+// ---------------------------------------------------------------------------------------------
+const ONESHOT = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "");
+const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position
+// TESTING VALUE (owner 2026-07-29): $2 so the prove-out can trade small. The PRODUCTION floor is $5,
+// because a signature costs ~$0.05 and a $5 position round-trips ~$10 of volume, which is roughly
+// where the 0.9% builder fee covers it. At $2 every trade loses money. RAISE THIS BACK TO 5 (or set
+// COPY_ONESHOT_MIN_USD=5) before any real user runs one-shot mode.
+const ONESHOT_MIN_USD = N("COPY_ONESHOT_MIN_USD", 2);
+const ONESHOT_TIER = N("COPY_ONESHOT_TIER", 2);        // enter only once he reaches this tier
+
+function oneShotTarget(sig, portfolio) {
+  const none = { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
+  // `tier_pct_resolved` is the server's resolved band for his CURRENT money-in, so `>= 2` is exactly
+  // "he has crossed the 2% tier threshold". A whale with no such tier never qualifies and is skipped.
+  const tier = Number(sig.tier_pct_resolved) || 0;
+  if (!(tier >= ONESHOT_TIER)) return none;
+  if (!(portfolio > 0)) return none;
+  // The per-position ceiling WINS over the $5 floor: on a small portfolio we trade under $5 rather
+  // than breach the 5% cap (which the hosted risk gate would reject outright as `order_too_large`).
+  // A $75 portfolio therefore trades ~$3.75, a $150 one trades $5, a $200 one trades $6.
+  const capUsd = (portfolio * MAX_POSITION_PCT) / 100;
+  const target = Math.min(Math.max((portfolio * ONESHOT_PCT) / 100, ONESHOT_MIN_USD), capUsd);
+  if (target < MIN_ORDER_USD) return none;             // below Polymarket's minimum -> no trade
+  return { target, ceiling: target, beats: 1, beatUsd: target };
+}
+
 function targetUsd(sig, unit, portfolio) {
+  if (ONESHOT) return oneShotTarget(sig, portfolio);
   const step = 1 / BEATS;                          // 0.20 of his average = 0.20 of our size
   // THE $1 BEAT FLOOR (owner 2026-07-14). Polymarket will not accept an order under ~$1, so a beat
   // worth $0.30 is not a small trade — it is NO trade. The ratio alone made the big whales uncopyable:
@@ -306,6 +348,7 @@ export function startCopyTrade(deps) {
     const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // hard ceiling for THIS market
     const mine = primary && sameSide(primary) ? primary : (positions[compKey]?.source === "copytrade" ? positions[compKey] : null);
     if (mine) {
+      if (ONESHOT) return;      // one-shot: we are already in, and we never follow him up
       const held = Number(mine.size_usd) || 0;
       // Never let one position grow past the per-position ceiling, whatever the target says.
       let add = Math.min(target, posCeil) - held;
@@ -371,6 +414,7 @@ export function startCopyTrade(deps) {
       // Same $1 floor as the fast path: 5% of a sub-$20 portfolio is below the exchange minimum.
       const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // per-position ceiling (owner incident 2026-07-22)
       if (mine) {
+        if (ONESHOT) continue;    // one-shot: we are already in, and we never follow him up
         const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
         if (add < MIN_ADD_USD) continue;                                // at the ceiling or no transition worth an order
         if (rateLimited()) continue;

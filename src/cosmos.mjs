@@ -125,7 +125,11 @@ export function makeCosmos(config) {
     // shares, the server returns SELL_PARTIAL with that fraction (of our original) + a seq (once per step).
     async copyExit(pos) {
       const q = new URLSearchParams({ cid: pos.condition_id, outcome: String(pos.outcome ?? ""), seq: String(pos.copy_seq ?? 0) });
-      return getJSON(`/api/v1/copy-exit?${q}`); // { action, fraction?, seq?, reason }
+      // ONE-SHOT (hosted): ask for the two-step exit (half out at -50% from his peak, the rest when he
+      // is gone) instead of the 10-step ladder, which costs ~10 signatures per position. Self-hosted
+      // bots leave COSMOS_ONESHOT unset and never send this, so their behaviour is unchanged.
+      if (/^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "")) q.set("mode", "oneshot");
+      return getJSON(`/api/v1/copy-exit?${q}`); // { action, fraction?, of?, seq?, reason }
     },
 
     // Report a copy fill (BUY on entry/scale-in, SELL on a mirror step) to the per-user admin ledger.
