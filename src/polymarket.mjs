@@ -185,8 +185,22 @@ export async function makePolymarket(config) {
 
   // L1: derive (or create) the L2 API credentials from a wallet signature. These are bound to the
   // SIGNER EOA — correct for EOA / POLY_PROXY / Safe accounts.
+  //
+  // PRE-SUPPLIED CREDS SKIP DERIVATION ENTIRELY (hosted prove-out 2026-07-30). Derivation is free
+  // when the key is local, but hosted every L1 header is a PAID enclave ClobAuth signature — and
+  // createOrDeriveApiKey signs TWICE (create, then derive, each building its own header). Five boots
+  // exhausted the platform's 8/day ClobAuth cap without placing a single order. Credentials are
+  // deterministic per signer and long-lived, so deriving them once and injecting them here turns
+  // every later boot into zero ClobAuth spend. Env names mirror the platform's cloud_accounts cache.
+  const injected = {
+    key: process.env.CLOB_API_KEY || config?.polymarket?.clobApiKey || "",
+    secret: process.env.CLOB_API_SECRET || config?.polymarket?.clobApiSecret || "",
+    passphrase: process.env.CLOB_PASSPHRASE || config?.polymarket?.clobPassphrase || "",
+  };
+  const haveInjected = injected.key && injected.secret && injected.passphrase;
+  if (haveInjected) console.log("[polymarket] CLOB creds injected from config — skipping derivation (0 signatures)");
   const pre = new ClobClient({ host: CLOB_HOST, chain: Chain.POLYGON, signer: walletClient });
-  const creds = await pre.createOrDeriveApiKey();
+  const creds = haveInjected ? injected : await pre.createOrDeriveApiKey();
 
   // API key bound to the FUNDER (deposit wallet), signed by the EOA — REQUIRED for POLY_1271 accounts
   // (Polymarket's NEW deposit-wallet flow): the CLOB demands order.signer (= the deposit wallet) equal
