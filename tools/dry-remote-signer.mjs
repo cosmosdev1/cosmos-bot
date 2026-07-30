@@ -136,6 +136,20 @@ await t("a 4xx is definitive; a 5xx and a network failure are not", async () => 
   assert.notEqual(en.definitive, true, "a network failure must never be read as a definitive refusal");
 });
 
+await t("an ERC-7739 TypedDataSign envelope routes as an ORDER (context required, trigger carried)", async () => {
+  const { account, seen } = harness(okSig);
+  const env7739 = {
+    domain: ORDER.domain, // same exchange domain — that is the 7739 shape
+    types: { TypedDataSign: [{ name: "contents", type: "Order" }], Order: ORDER.types.Order },
+    primaryType: "TypedDataSign",
+    message: { contents: ORDER.message, name: "DepositWallet", version: "1", chainId: 137, verifyingContract: "0x" + "c".repeat(40), salt: "0x" + "0".repeat(64) },
+  };
+  await assert.rejects(() => account.signTypedData(env7739), /no triggerId in context/);
+  const id = randomUUID();
+  await withSignContext({ triggerId: id, conditionId: "0xcond" }, () => account.signTypedData(env7739));
+  assert.equal(seen.at(-1).triggerId, id, "envelope order must carry the decision trigger");
+});
+
 await t("the signer refuses everything that is not an Order or ClobAuth", async () => {
   const { account } = harness(okSig);
   await assert.rejects(() => account.signMessage({ message: "hi" }), /not supported/);

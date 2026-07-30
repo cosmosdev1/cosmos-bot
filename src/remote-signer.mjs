@@ -141,7 +141,11 @@ export function makeRemoteSigner(config) {
       if (domain?.name === CLOBAUTH_DOMAIN || primaryType === "ClobAuth") {
         return await postSign({ typedData: td, kind: "clobauth" });
       }
-      if (domain?.name === ORDER_DOMAIN || primaryType === "Order") {
+      // "TypedDataSign" is the ERC-7739 envelope deposit-wallet (POLY_1271) accounts sign orders
+      // in — same exchange domain, the Order nested under message.contents. The domain match alone
+      // already routes it here, but the explicit primaryType keeps a future refactor to
+      // primaryType-first matching from silently orphaning every deposit-wallet order.
+      if (domain?.name === ORDER_DOMAIN || primaryType === "Order" || primaryType === "TypedDataSign") {
         // FAIL CLOSED on a missing context. Minting a triggerId here instead would look harmless and
         // would quietly remove idempotency for that order — every retry a fresh key, every key a
         // fresh paid signature. An unwired caller must break loudly, not trade unprotected.

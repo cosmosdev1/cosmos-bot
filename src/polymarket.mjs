@@ -208,13 +208,25 @@ export async function makePolymarket(config) {
   // allowed, please use the deposit wallet flow". Ported from the validated qtable-live tester —
   // without this, every new-style Polymarket account fails 100% of its orders.
   const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has to be the address of the API/i;
-  let depositCreds = null;
+  // Funder-bound creds may be INJECTED like the EOA-bound set (policy v2, 2026-07-30): the platform
+  // caches them per hosted account (cloud_accounts.clob_deposit_*), and hosted every L1 header is a
+  // paid enclave ClobAuth signature — injection makes a deposit-wallet boot cost zero.
+  const injectedDeposit = {
+    key: process.env.CLOB_DEPOSIT_API_KEY || config?.polymarket?.clobDepositApiKey || "",
+    secret: process.env.CLOB_DEPOSIT_API_SECRET || config?.polymarket?.clobDepositApiSecret || "",
+    passphrase: process.env.CLOB_DEPOSIT_PASSPHRASE || config?.polymarket?.clobDepositPassphrase || "",
+  };
+  let depositCreds = injectedDeposit.key && injectedDeposit.secret && injectedDeposit.passphrase ? injectedDeposit : null;
+  if (depositCreds) console.log("[polymarket] deposit-wallet CLOB creds injected from config — skipping funder derivation (0 signatures)");
   const deriveForFunder = async () => {
     if (depositCreds) return depositCreds;
     try {
-      const mkH = async () => createL1Headers(walletClient, 137, 0, undefined, funder);
-      let jj = await fetch(`${CLOB_HOST}/auth/api-key`, { method: "POST", headers: await mkH(), signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-      if (!jj?.apiKey) jj = await fetch(`${CLOB_HOST}/auth/derive-api-key`, { headers: await mkH(), signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      // ONE set of L1 headers for BOTH fetches (policy v2): the ClobAuth signature covers only
+      // address+timestamp+nonce+message, never method or path — and hosted, each header build is a
+      // PAID enclave signature. Building it twice literally doubled the cost of every derivation.
+      const h = await createL1Headers(walletClient, 137, 0, undefined, funder);
+      let jj = await fetch(`${CLOB_HOST}/auth/api-key`, { method: "POST", headers: h, signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      if (!jj?.apiKey) jj = await fetch(`${CLOB_HOST}/auth/derive-api-key`, { headers: h, signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
       depositCreds = jj?.apiKey ? { key: jj.apiKey, secret: jj.secret, passphrase: jj.passphrase } : null;
     } catch { depositCreds = null; }
     console.log(depositCreds ? "[polymarket] ✓ API key bound to the deposit wallet (POLY_1271 ready)" : "[polymarket] ⚠ could not derive a deposit-wallet API key");
