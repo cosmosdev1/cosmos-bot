@@ -128,7 +128,9 @@ const mid = ask != null && bid != null ? Math.round((ask + bid) / 2) : null;
 if (ask == null) die("no best ask on this market — refusing to buy into an unknown book");
 // Cross the spread by a cent so the FAK actually fills. Well inside the gate's 15% slip band.
 const priceCents = Math.max(1, Math.min(99, ask + 1));
-const shares = Math.floor((USD / (priceCents / 100)) * 100) / 100;
+// CEIL, not floor (prove-out: 2.32sh x 43c = $0.9976 -> the gate's $1 dust floor refused it). Ceiling
+// puts the notional a hair ABOVE the target, so integer-cent rounding can never dip under the minimum.
+const shares = Math.ceil((USD / (priceCents / 100)) * 100) / 100;
 
 console.log(`
  best bid/ask .. ${bid ?? "?"}c / ${ask}c        (mid ${mid ?? "?"}c, ask depth $${askDepthUsd.toFixed(0)})
