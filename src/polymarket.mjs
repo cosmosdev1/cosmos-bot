@@ -346,7 +346,16 @@ export async function makePolymarket(config) {
     if (!affClient || affSig !== sigType || affCreds !== c) { affClient = mkClientFor(sigType, c, affCode); affSig = sigType; affCreds = c; }
     return affClient;
   };
-  if (sigType === SignatureTypeV2.POLY_1271) await deriveForFunder();
+  // NOT at boot (prove-out 2026-07-30). A funder-bound key cannot be derived for a deposit wallet:
+  // the CLOB answers 401 "Invalid L1 Request headers" because the funder is a CONTRACT and our
+  // signature is a plain EOA ECDSA it cannot verify against it. And it is not needed — a POLY_1271
+  // order signed as the ERC-7739 envelope authenticates fine under the EOA-bound key (proven: the
+  // CLOB accepted the auth and moved on to validating amounts). Deriving it at boot therefore spent
+  // a real enclave signature, every boot, for a call that always fails. The order-time recovery at
+  // the DEPOSIT_ERR branch still tries it if the CLOB ever does demand one.
+  if (sigType === SignatureTypeV2.POLY_1271 && /^(1|true|yes|on)$/i.test(process.env.COSMOS_DERIVE_FUNDER_KEY || "")) {
+    await deriveForFunder();
+  }
   let client = sigType === SignatureTypeV2.POLY_1271 && depositCreds ? mkClientFor(sigType, depositCreds) : mkClient(sigType);
 
   const tokenCache = new Map();
