@@ -14,3 +14,4 @@ qtable-live.env
 # fleet kill-switch OFFLINE private key — never commit
 fleet-priv.pem
 *.pem
+.proveout.env
