@@ -225,10 +225,18 @@ export async function makePolymarket(config) {
       // address+timestamp+nonce+message, never method or path — and hosted, each header build is a
       // PAID enclave signature. Building it twice literally doubled the cost of every derivation.
       const h = await createL1Headers(walletClient, 137, 0, undefined, funder);
-      let jj = await fetch(`${CLOB_HOST}/auth/api-key`, { method: "POST", headers: h, signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
-      if (!jj?.apiKey) jj = await fetch(`${CLOB_HOST}/auth/derive-api-key`, { headers: h, signal: AbortSignal.timeout(10_000) }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
+      // SURFACE the CLOB's own words on failure. Swallowing them into `null` cost a paid signature
+      // and told us nothing — "could not derive a deposit-wallet API key" is not a diagnosis.
+      const call = async (method, path) => {
+        const r = await fetch(`${CLOB_HOST}${path}`, { method, headers: h, signal: AbortSignal.timeout(10_000) });
+        const body = await r.text().catch(() => "");
+        if (!r.ok) { console.warn(`[polymarket] funder-key ${method} ${path} -> ${r.status} ${body.slice(0, 220)}`); return null; }
+        try { return JSON.parse(body); } catch { return null; }
+      };
+      let jj = await call("POST", "/auth/api-key");
+      if (!jj?.apiKey) jj = await call("GET", "/auth/derive-api-key");
       depositCreds = jj?.apiKey ? { key: jj.apiKey, secret: jj.secret, passphrase: jj.passphrase } : null;
-    } catch { depositCreds = null; }
+    } catch (e) { console.warn(`[polymarket] funder-key derivation threw: ${e?.message ?? e}`); depositCreds = null; }
     console.log(depositCreds ? "[polymarket] ✓ API key bound to the deposit wallet (POLY_1271 ready)" : "[polymarket] ⚠ could not derive a deposit-wallet API key");
     return depositCreds;
   };

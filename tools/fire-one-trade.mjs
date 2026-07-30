@@ -73,9 +73,13 @@ async function pickMarket() {
   // end_date_min is REQUIRED. Without it gamma answers with the oldest unresolved markets it has
   // (stale ones from months back) and the hourly crypto series never appears at all.
   const now = Date.now();
+  // AT LEAST 15 MINUTES OUT. A 5-minute candle in its final minutes is the most volatile thing on
+  // the board — it moved 49c -> 43c between our read and the approver's, tripping the 15% slip
+  // guard. Markets further from expiry carry far less gamma, so our price and the approver's
+  // independent read agree. Still resolves within the hour, so the test capital comes straight back.
   const qs = new URLSearchParams({
     closed: "false", active: "true", limit: "200", order: "endDate", ascending: "true",
-    end_date_min: new Date(now + 4 * 60_000).toISOString(),   // room to fill before it settles
+    end_date_min: new Date(now + 15 * 60_000).toISOString(),
     end_date_max: new Date(now + 3 * 3600_000).toISOString(),
   });
   const r = await fetch(`https://gamma-api.polymarket.com/markets?${qs}`, { signal: AbortSignal.timeout(20_000) });
@@ -157,13 +161,27 @@ if (!FIRE) {
 // signature on the first run for this account) and builds the remote signer.
 const pm = await makePolymarket(config);
 
+// RE-READ THE BOOK IMMEDIATELY BEFORE SIGNING (prove-out 2026-07-30). The preview above ran BEFORE
+// the stack booted — credential derivation and the enclave round trip take seconds, and a 5-minute
+// crypto candle moved 49c -> 43c in that window. The approver independently re-fetches the book and
+// refuses anything more than 15% off it, so a stale price is refused as `buy_above_book`: the drain
+// defence doing its job on a price we no longer meant. Pricing off a fresh read collapses that gap
+// to the single hop between us and the approver.
+const fresh = await readBook(pick.tokenId);
+if (fresh.ask == null) die("the book went unreadable just before firing — refusing to price blind");
+const firePrice = Math.max(1, Math.min(99, fresh.ask + 1));
+const fireShares = Math.ceil((USD / (firePrice / 100)) * 100) / 100;
+if (firePrice !== priceCents) {
+  console.log(` book moved: ${ask}c -> ${fresh.ask}c ask · repricing ${priceCents}c -> ${firePrice}c (${fireShares} shares)\n`);
+}
+
 // One decision = one triggerId, exactly as placeWithRetry does it. Deliberately NO retry loop here:
 // this is a one-shot prove-out and a retry would be a second paid signature for no new information.
 const triggerId = randomUUID();
 console.log(` firing … triggerId ${triggerId}\n`);
 
 const res = await withSignContext({ triggerId }, () =>
-  pm.placeOrder({ tokenId: pick.tokenId, side: "BUY", sizeShares: shares, priceCents, orderType: "FAK" }));
+  pm.placeOrder({ tokenId: pick.tokenId, side: "BUY", sizeShares: fireShares, priceCents: firePrice, orderType: "FAK" }));
 
 console.log("──────────────────────────────────────────────────────────────");
 if (res.ok) {
