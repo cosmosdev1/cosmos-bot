@@ -1,7 +1,18 @@
 // Cosmos API client: settings + signal feed + the exit brain + the metering relay.
 export function makeCosmos(config) {
   const base = config.cosmosApi.replace(/\/$/, "");
-  const headers = { Authorization: `Bearer ${config.cosmosToken}`, "Content-Type": "application/json" };
+  // DUAL-RUN GUARD (platform lib/cloud/dual-run.ts). Once an account moves to Cosmos Cloud, the
+  // signal feeds refuse any caller that does NOT declare itself the hosted bot — otherwise a
+  // forgotten legacy bot keeps trading the SAME wallet alongside it: doubled entries, exits
+  // fighting each other, and twice the intended exposure. Declaring the mode here is what lets the
+  // server tell the two apart; a legacy deployment predates this header and is correctly refused.
+  const headers = {
+    Authorization: `Bearer ${config.cosmosToken}`,
+    "Content-Type": "application/json",
+    ...((process.env.COSMOS_SIGNER || "local").toLowerCase() === "remote"
+      ? { "x-cosmos-signer": "remote" }
+      : {}),
+  };
 
   async function getJSON(path) {
     // HARD TIMEOUT (2026-07-22). Node fetch has NO default timeout: a half-open connection makes the
