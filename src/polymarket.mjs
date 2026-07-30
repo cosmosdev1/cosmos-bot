@@ -233,7 +233,19 @@ export async function makePolymarket(config) {
   const SIG_NAMES = { 0: "EOA", 1: "POLY_PROXY", 2: "POLY_GNOSIS_SAFE", 3: "POLY_1271" };
   let sigType = SignatureTypeV2.POLY_PROXY;
   let walletKind = "unknown";
-  try {
+  // EXPLICIT OVERRIDE beats guessing (hosted prove-out 2026-07-30). The heuristics below misread the
+  // owner's 146-byte proxy variant (bytecode matched none of the known patterns -> "safe-or-other")
+  // and the balance probe then confirmed the WRONG type, because the CLOB answers a balance under
+  // more than one type for some accounts. Under POLY_1271 the client wraps orders in an ERC-7739
+  // TypedDataSign envelope, which the hosted gate (and the enclave policy, pinned to primaryType
+  // 'Order') rightly refuses — so a misdetection means no order can ever sign. Hosted accounts have
+  // a CLOB-verified type recorded platform-side (cloud_accounts.sig_type); passing it here skips
+  // detection entirely. Self-hosted users can set it too if detection ever misreads their wallet.
+  const SIG_BY_NAME = { EOA: SignatureTypeV2.EOA, POLY_PROXY: SignatureTypeV2.POLY_PROXY, POLY_GNOSIS_SAFE: SignatureTypeV2.POLY_GNOSIS_SAFE, POLY_1271: SignatureTypeV2.POLY_1271 };
+  const forcedName = String(process.env.POLYMARKET_SIG_TYPE || config?.polymarket?.sigType || "").toUpperCase().trim();
+  const forced = Object.prototype.hasOwnProperty.call(SIG_BY_NAME, forcedName);
+  if (forced) { sigType = SIG_BY_NAME[forcedName]; walletKind = "forced-by-config"; }
+  else try {
     if (funder.toLowerCase() === address.toLowerCase()) {
       sigType = SignatureTypeV2.EOA; walletKind = "eoa";
     } else {
