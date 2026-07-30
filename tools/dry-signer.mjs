@@ -9,7 +9,7 @@
 // Uses a throwaway key generated here. No real key is ever read by this script.
 
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
-import { makeSigner, SIGNER_MODE } from "../src/signer.mjs";
+import { makeSigner, signerMode } from "../src/signer.mjs";
 
 const KEY = generatePrivateKey();
 const old = privateKeyToAccount(KEY);
@@ -21,7 +21,7 @@ const check = (name, ok, detail = "") => {
   console.log(`  ${ok ? "ok  " : "FAIL"} ${name}${detail ? " :: " + detail : ""}`);
 };
 
-console.log(`signer mode: ${mode} (COSMOS_SIGNER=${SIGNER_MODE})\n`);
+console.log(`signer mode: ${mode} (COSMOS_SIGNER=${signerMode()})\n`);
 check("mode is local by default", mode === "local");
 check("address matches privateKeyToAccount", old.address === neu.address, `${old.address} vs ${neu.address}`);
 check("makeSigner returns the same address it reports", address === neu.address);

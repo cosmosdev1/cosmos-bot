@@ -22,7 +22,11 @@
 
 import { privateKeyToAccount } from "viem/accounts";
 
-export const SIGNER_MODE = (process.env.COSMOS_SIGNER || "local").toLowerCase();
+// Read at CALL time, not import time (prove-out 2026-07-30): ES module imports are hoisted and
+// evaluate before any statement in the importing file, so a tool that sets process.env.COSMOS_SIGNER
+// after its imports had the mode silently locked to "local" — which then demanded a raw private key,
+// the exact thing hosted mode exists to never touch. A function cannot be captured stale.
+export const signerMode = () => (process.env.COSMOS_SIGNER || "local").toLowerCase();
 
 const need = (name) => {
   const v = process.env[name];
@@ -36,14 +40,15 @@ const need = (name) => {
  * cannot sign must fail loudly at boot, never silently trade with the wrong identity.
  */
 export async function makeSigner(config) {
-  if (SIGNER_MODE === "local") {
+  const mode = signerMode();
+  if (mode === "local") {
     const key = config?.polymarket?.privateKey;
     if (!key) throw new Error("no private key configured (config.polymarket.privateKey)");
     const account = privateKeyToAccount(key);
     return { account, address: account.address, mode: "local" };
   }
 
-  if (SIGNER_MODE === "remote") {
+  if (mode === "remote") {
     // COSMOS CLOUD (Option C): no key here. signTypedData POSTs to the platform's /api/cloud/sign,
     // which runs the risk gate, has the delegate initiate, and a SEPARATE approver co-sign. This is
     // the model that keeps a compromised bot container unable to place anything but its own gated,
@@ -52,7 +57,7 @@ export async function makeSigner(config) {
     return makeRemoteSigner(config);
   }
 
-  if (SIGNER_MODE === "turnkey") {
+  if (mode === "turnkey") {
     // DANGEROUS FOR HOSTED ACCOUNTS (audit 2026-07-29). This mode calls Turnkey DIRECTLY from the bot
     // with the delegate credential: no risk gate, no idempotency ledger, no approver co-sign, and no
     // per-trade signature cap. Under the two-party order policy its signs can never complete anyway
@@ -110,5 +115,5 @@ export async function makeSigner(config) {
     return { account, address: account.address, mode: "turnkey" };
   }
 
-  throw new Error(`unknown COSMOS_SIGNER "${SIGNER_MODE}" (expected "local", "remote", or "turnkey")`);
+  throw new Error(`unknown COSMOS_SIGNER "${mode}" (expected "local", "remote", or "turnkey")`);
 }
