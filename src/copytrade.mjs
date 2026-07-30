@@ -131,11 +131,14 @@ const BEATS = N("COPY_BEATS", 5);                 // 5 beats -> 20% each
 // ---------------------------------------------------------------------------------------------
 const ONESHOT = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "");
 const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position
-// TESTING VALUE (owner 2026-07-29): $2 so the prove-out can trade small. The PRODUCTION floor is $5,
-// because a signature costs ~$0.05 and a $5 position round-trips ~$10 of volume, which is roughly
-// where the 0.9% builder fee covers it. At $2 every trade loses money. RAISE THIS BACK TO 5 (or set
-// COPY_ONESHOT_MIN_USD=5) before any real user runs one-shot mode.
-const ONESHOT_MIN_USD = N("COPY_ONESHOT_MIN_USD", 2);
+// PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
+// small on a ~$24 test account). The economics set this number, not caution: a hosted signature
+// costs real money and a $5 position round-trips ~$10 of volume, which is roughly where the 0.9%
+// builder fee covers it. At $2 every trade loses money on net.
+//
+// The per-position ceiling still WINS over this floor (see oneShotTarget): a small portfolio trades
+// under $5 rather than breach the 5% cap, which the hosted gate would reject as `order_too_large`.
+const ONESHOT_MIN_USD = N("COPY_ONESHOT_MIN_USD", 5);
 const ONESHOT_TIER = N("COPY_ONESHOT_TIER", 2);        // enter only once he reaches this tier
 
 function oneShotTarget(sig, portfolio) {
