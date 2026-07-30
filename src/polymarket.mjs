@@ -579,6 +579,13 @@ export async function makePolymarket(config) {
       // derive the funder-bound key, switch the client to POLY_1271, and retry ONCE. Sticky — every
       // later order uses the working client. This is what makes the bot work for EVERY account kind.
       if (!r.ok && sigType !== SignatureTypeV2.POLY_1271 && DEPOSIT_ERR.test(JSON.stringify(r.body ?? ""))) {
+        // Print the CLOB's OWN words before recovery overwrites them (prove-out 2026-07-30: the flip
+        // masked the first rejection and we could not tell WHICH deposit-wallet condition fired).
+        console.warn("[polymarket] CLOB rejected the order:", JSON.stringify(r.body?.polymarket ?? r.body).slice(0, 400));
+        if (/^(1|true|yes|on)$/i.test(process.env.COSMOS_NO_1271_RECOVERY || "")) {
+          console.warn("[polymarket] POLY_1271 auto-recovery disabled (COSMOS_NO_1271_RECOVERY) — returning the rejection as-is");
+          return r;
+        }
         console.log("[polymarket] ↻ deposit-wallet account detected at order time — switching to POLY_1271 with a funder-bound API key…");
         const dc = await deriveForFunder();
         sigType = SignatureTypeV2.POLY_1271;
