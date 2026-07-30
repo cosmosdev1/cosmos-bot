@@ -1090,6 +1090,19 @@ async function main() {
   const cosmos = makeCosmos(config);
   const acct = await cosmos.account();
   if (!acct.bot_access) { console.error("This plan does not include bot/API trading. Upgrade in the dashboard."); process.exit(1); }
+
+  // SIGNATURE TYPE FROM THE SERVER, applied BEFORE the client is built (makePolymarket reads
+  // config.polymarket.sigType at construction). Hosted accounts have this detected on-chain at
+  // connect and recorded platform-side; trust it over local detection, because the local heuristic
+  // classifies by bytecode and then "confirms" with a CLOB balance probe that answers under more
+  // than one type. Getting it wrong is not a degradation: a deposit-wallet account signed as a plain
+  // proxy has every order refused with "maker address not allowed" and never trades at all.
+  // An explicit env override still wins, and null leaves local detection exactly as it was.
+  if (acct.signature_type && !process.env.POLYMARKET_SIG_TYPE) {
+    config.polymarket.sigType = String(acct.signature_type);
+    log(`account type from Cosmos: ${config.polymarket.sigType}`);
+  }
+
   const pm = await makePolymarket(config);
   log(`connected · plan ${acct.tier} · wallet ${pm.address.slice(0, 6)}… · funder ${pm.funder.slice(0, 6)}…${pm.builderFee ? " · builder fee ON" : ""}`);
 
