@@ -88,5 +88,31 @@ console.log("\n=== a whale we have no baseline for ===");
   check("no baseline -> no target, never fires blind", target === 0);
 }
 
+console.log("\n=== live defaults: engine ON, one-shot FORCED, keyed off the TRADE ===");
+{
+  // Mirrors the constants in copytrade.mjs, so changing either default trips a test instead of
+  // silently altering what the fleet does with real money.
+  const CANDLE_ENGINE = !/^(0|false|no|off)$/i.test(process.env.COPY_CANDLE_ENGINE || "1");
+  const CANDLE_TIERS = /^(1|true|yes|on)$/i.test(process.env.COPY_CANDLE_TIERS || "");
+  const isCandleSig = (sig) => /\bup or down\b/i.test(String(sig?.market_question ?? ""));
+
+  check("engine is ON with no env set", CANDLE_ENGINE);
+  check("tiers are OFF with no env set (one-shot only)", !CANDLE_TIERS);
+
+  const real = "Solana Up or Down - July 28, 7:10PM-7:15PM ET";   // a real signal title from the DB
+  check("a real candle title is recognised", isCandleSig({ market_question: real }));
+  check("15m candle recognised", isCandleSig({ market_question: "Bitcoin Up or Down - Aug 1, 3:00PM-3:15PM ET" }));
+  check("hourly candle recognised", isCandleSig({ market_question: "Ethereum Up or Down - Aug 1, 3PM-4PM ET" }));
+  check("a sports market is NOT a candle", !isCandleSig({ market_question: "Lakers to win vs Celtics" }));
+  check("a political market is NOT a candle", !isCandleSig({ market_question: "Will the Fed cut rates in September?" }));
+  check("a market merely mentioning bitcoin is NOT a candle", !isCandleSig({ market_question: "Bitcoin above $118,000 on Aug 3?" }));
+
+  // TRADE-keyed, not wallet-keyed: a sports whale who takes one candle gets candle sizing on it.
+  const portfolio = 1000, baseline = 100, posCeil = 50;
+  check("a sports whale taking a candle is treated as a candle", isCandleSig({ market_question: real }));
+  const t = candleTarget(60, baseline, portfolio, !CANDLE_TIERS);
+  check("and it sizes one-shot 2%, not the 3% tier", close(addFor(t.target, 0, posCeil), 20), `$${addFor(t.target, 0, posCeil).toFixed(2)}`);
+}
+
 console.log(`\n${fail === 0 ? "ALL WIRING TESTS PASSED" : `${fail} FAILED`} (${pass} passed)`);
 process.exit(fail === 0 ? 0 : 1);

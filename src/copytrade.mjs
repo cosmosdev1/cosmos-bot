@@ -166,9 +166,24 @@ function oneShotTarget(sig, portfolio) {
 // Scoped to candles ONLY. Sports and everything else keep the beat ladder untouched, because the
 // tiers were specified against a whale's behaviour in a 15m market and mean nothing on a 3-week
 // political position.
-const CANDLE_ENGINE = /^(1|true|yes|on)$/i.test(process.env.COPY_CANDLE_ENGINE || "");
-const isCandleSig = (sig) => /updown-(5m|15m|1h|hourly)-/i.test(String(sig?.event_slug ?? sig?.eventSlug ?? "")) ||
-  /up or down/i.test(String(sig?.market_question ?? ""));
+// ON by default (owner 2026-07-31). Set COPY_CANDLE_ENGINE=0 to fall back to the beat ladder.
+const CANDLE_ENGINE = !/^(0|false|no|off)$/i.test(process.env.COPY_CANDLE_ENGINE || "1");
+
+// ONE-SHOT ONLY for now (owner 2026-07-31): "once we update to enterprise in turnkey we will change
+// it". The tiered 30/60/90 ladder is built and tested but costs three signatures per position
+// instead of one, which does not pay at current per-signature pricing. Forced here rather than
+// inherited from COSMOS_ONESHOT so a bot that happens not to set that env cannot silently run the
+// expensive ladder. Flip with COPY_CANDLE_TIERS=1 when the pricing changes.
+const CANDLE_TIERS = /^(1|true|yes|on)$/i.test(process.env.COPY_CANDLE_TIERS || "");
+
+// WHAT COUNTS AS A CANDLE. Keyed off the TRADE, never the wallet — a sports whale who takes one
+// crypto candle gets candle sizing for that position, which is the owner's point: "even if it's a
+// regular wallet that places a crypto trade".
+//
+// copy_signals carries no event_slug, so market_question is the only identifier available; every
+// candle market Polymarket lists is titled "<Asset> Up or Down - <date>, <time>-<time> ET". Covers
+// 5m/15m/hourly alike, per the earlier spec ("all crypto 5m/15m/hourly trades").
+const isCandleSig = (sig) => /up or down/i.test(String(sig?.market_question ?? ""));
 
 function candleTarget(sig, portfolio) {
   const w = (sig.wallets ?? [])[0] ?? {};
@@ -178,7 +193,7 @@ function candleTarget(sig, portfolio) {
   // `add = min(target, posCeil) - held`, so returning a delta here would double-count: at the 60%
   // tier it would buy 3% on top of the 1.5% already held instead of topping up to 3%. Returning the
   // target makes the cumulative rule fall out of the existing arithmetic for free.
-  const pct = targetPctForHolding(his, baseline, { oneShot: ONESHOT });
+  const pct = targetPctForHolding(his, baseline, { oneShot: !CANDLE_TIERS });
   return { target: (portfolio * pct) / 100, ceiling: (portfolio * 4.5) / 100, beats: pct ? 1 : 0, beatUsd: 0, candle: true, pct };
 }
 
