@@ -16,6 +16,7 @@
 // Spawned from main() ONLY when COPYTRADE_ENABLED=1 (per-deployment gate). DRY: COPYTRADE_DRY=1 logs
 // would-be fills and places nothing. Positions are tagged source:"copytrade".
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { targetPctForHolding } from "./candle-sizing.mjs";
 import { log, warn } from "./log.mjs";
 
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
@@ -157,7 +158,32 @@ function oneShotTarget(sig, portfolio) {
   return { target, ceiling: target, beats: 1, beatUsd: target };
 }
 
+// CANDLE ENGINES (owner 2026-07-31). On crypto candles the sizing is his-holding-relative, not
+// beat-relative: the server already gives us both numbers the spec needs — his money-in for THIS
+// market (his_cost_usd) and his average per market (avg_trade_usd, already averaged per condition
+// id, not per fill). See src/candle-sizing.mjs for the tiers and the cumulative rule.
+//
+// Scoped to candles ONLY. Sports and everything else keep the beat ladder untouched, because the
+// tiers were specified against a whale's behaviour in a 15m market and mean nothing on a 3-week
+// political position.
+const CANDLE_ENGINE = /^(1|true|yes|on)$/i.test(process.env.COPY_CANDLE_ENGINE || "");
+const isCandleSig = (sig) => /updown-(5m|15m|1h|hourly)-/i.test(String(sig?.event_slug ?? sig?.eventSlug ?? "")) ||
+  /up or down/i.test(String(sig?.market_question ?? ""));
+
+function candleTarget(sig, portfolio) {
+  const w = (sig.wallets ?? [])[0] ?? {};
+  const baseline = Number(w.avg_trade_usd) || 0;
+  const his = Number(w.cost_usd) || Number(sig.his_cost_usd) || 0;
+  // Return the TOTAL we should hold, not the top-up. The caller already computes
+  // `add = min(target, posCeil) - held`, so returning a delta here would double-count: at the 60%
+  // tier it would buy 3% on top of the 1.5% already held instead of topping up to 3%. Returning the
+  // target makes the cumulative rule fall out of the existing arithmetic for free.
+  const pct = targetPctForHolding(his, baseline, { oneShot: ONESHOT });
+  return { target: (portfolio * pct) / 100, ceiling: (portfolio * 4.5) / 100, beats: pct ? 1 : 0, beatUsd: 0, candle: true, pct };
+}
+
 function targetUsd(sig, unit, portfolio) {
+  if (CANDLE_ENGINE && isCandleSig(sig)) return candleTarget(sig, portfolio);
   if (ONESHOT) return oneShotTarget(sig, portfolio);
   const step = 1 / BEATS;                          // 0.20 of his average = 0.20 of our size
   // THE $1 BEAT FLOOR (owner 2026-07-14). Polymarket will not accept an order under ~$1, so a beat
@@ -310,7 +336,7 @@ export function startCopyTrade(deps) {
       return { target: Math.max(MIN_ORDER_USD, port * (pct / 100)), beats: null };
     }
     if (sig.kind === "adopt") return { target: Math.max(MIN_ORDER_USD, port * (ADOPT_PCT / 100)), beats: null };  // weather/other adopt: flat 1%
-    return targetUsd(sig, unitBasis, portfolio);   // crypto: the beats (5 x 20% of his average)
+    return targetUsd(sig, unitBasis, portfolio);   // crypto: the beats, or the candle tiers
   }
 
   async function fastOpen(sig) {
