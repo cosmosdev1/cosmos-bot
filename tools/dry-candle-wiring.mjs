@@ -92,12 +92,23 @@ console.log("\n=== live defaults: engine ON, one-shot FORCED, keyed off the TRAD
 {
   // Mirrors the constants in copytrade.mjs, so changing either default trips a test instead of
   // silently altering what the fleet does with real money.
-  const CANDLE_ENGINE = !/^(0|false|no|off)$/i.test(process.env.COPY_CANDLE_ENGINE || "1");
+  const engineFor = (signer, env) => {
+    const hosted = (signer || "local").toLowerCase() === "remote";
+    const e = env || "";
+    return /^(1|true|yes|on)$/i.test(e) ? true : /^(0|false|no|off)$/i.test(e) ? false : hosted;
+  };
   const CANDLE_TIERS = /^(1|true|yes|on)$/i.test(process.env.COPY_CANDLE_TIERS || "");
   const isCandleSig = (sig) => /\bup or down\b/i.test(String(sig?.market_question ?? ""));
 
-  check("engine is ON with no env set", CANDLE_ENGINE);
+  // HOSTED ONLY. The live self-hosted fleet must not change behaviour when this merges: its
+  // signatures are free, so collapsing its ladder to one clip removes upside it pays nothing for.
+  check("SELF-HOSTED bot, no env -> engine OFF (fleet unchanged)", engineFor("local", "") === false);
+  check("HOSTED bot, no env -> engine ON", engineFor("remote", "") === true);
+  check("self-hosted can force it on for testing", engineFor("local", "1") === true);
+  check("hosted can disable it", engineFor("remote", "0") === false);
   check("tiers are OFF with no env set (one-shot only)", !CANDLE_TIERS);
+  const CANDLE_ENGINE = engineFor("remote", "");
+  check("hosted engine resolves on", CANDLE_ENGINE);
 
   const real = "Solana Up or Down - July 28, 7:10PM-7:15PM ET";   // a real signal title from the DB
   check("a real candle title is recognised", isCandleSig({ market_question: real }));

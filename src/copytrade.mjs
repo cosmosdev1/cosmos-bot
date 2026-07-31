@@ -166,8 +166,21 @@ function oneShotTarget(sig, portfolio) {
 // Scoped to candles ONLY. Sports and everything else keep the beat ladder untouched, because the
 // tiers were specified against a whale's behaviour in a 15m market and mean nothing on a 3-week
 // political position.
-// ON by default (owner 2026-07-31). Set COPY_CANDLE_ENGINE=0 to fall back to the beat ladder.
-const CANDLE_ENGINE = !/^(0|false|no|off)$/i.test(process.env.COPY_CANDLE_ENGINE || "1");
+// HOSTED ONLY (owner 2026-07-31: "right now we're doing changes for hosted only"). Cosmos Cloud is
+// the new method and everything in this spec targets it; the self-hosted fleet keeps the 5-beat
+// ladder untouched.
+//
+// That is not just scope discipline, it is the right economics: one-shot exists BECAUSE a hosted
+// signature costs real money, and a self-hosted bot signs locally for free — so collapsing its
+// ladder to a single clip would take away upside it pays nothing for. Gating on the signer means a
+// bot cannot end up on the wrong engine by forgetting an env var.
+//
+// COPY_CANDLE_ENGINE=0 disables it even when hosted; =1 forces it on for local testing.
+const HOSTED = (process.env.COSMOS_SIGNER || "local").toLowerCase() === "remote";
+const CANDLE_ENGINE_ENV = process.env.COPY_CANDLE_ENGINE || "";
+const CANDLE_ENGINE = /^(1|true|yes|on)$/i.test(CANDLE_ENGINE_ENV)
+  ? true
+  : /^(0|false|no|off)$/i.test(CANDLE_ENGINE_ENV) ? false : HOSTED;
 
 // ONE-SHOT ONLY for now (owner 2026-07-31): "once we update to enterprise in turnkey we will change
 // it". The tiered 30/60/90 ladder is built and tested but costs three signatures per position
