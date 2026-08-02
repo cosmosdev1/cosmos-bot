@@ -36,14 +36,19 @@ function loadConfig() {
   };
 }
 const config = loadConfig();
-if (!config.cosmosToken || !config.polymarket.privateKey) {
+// HOSTED MODE (COSMOS_SIGNER=turnkey, the runner supervisor's children): there IS no local private
+// key - signing happens inside the user's enclave via the remote signer, which validates its own
+// requirements (COSMOS_SIGN_URL + token + TURNKEY_SIGN_WITH). Demanding a key here forced the
+// prove-out to fake one; hosted needs the token only.
+const HOSTED = process.env.COSMOS_SIGNER === "turnkey";
+if (!config.cosmosToken || (!HOSTED && !config.polymarket.privateKey)) {
   console.error("Missing config. Either run `npm run setup` (local) or set the env vars COSMOS_TOKEN + POLYMARKET_PRIVATE_KEY (+ POLYMARKET_FUNDER) for a 24/7 host.");
   process.exit(1);
 }
 // PLAIN-LANGUAGE CONFIG VALIDATION (2026-07-14): users pasted the deploy command with the placeholder
 // text still in it, or a truncated key/address — and the only symptom was a crash deep inside viem or
 // a bot that never trades. Fail FAST with a message a non-technical user can act on.
-{
+if (!HOSTED) {
   const pk = String(config.polymarket.privateKey).trim();
   const fu = String(config.polymarket.funderAddress || "").trim();
   const die = (msg) => { console.error(`CONFIG ERROR: ${msg}`); process.exit(1); };

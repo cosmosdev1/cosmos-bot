@@ -1,0 +1,37 @@
+# HOSTED-RUNNER fly app — the multi-tenant supervisor (src/runner.mjs), one bot child per active
+# hosted account. Separate app from the single-tenant cosmos-bot so the legacy deployment is
+# untouched (hosted is the product; self-hosted bots must not change behaviour).
+#
+# First deploy:
+#   fly apps create cosmos-hosted-runner
+#   fly volumes create runner_data --region arn --size 1 -a cosmos-hosted-runner
+#   fly secrets set -a cosmos-hosted-runner RUNNER_SECRET=<same value as Vercel RUNNER_SECRET>
+#   fly deploy -c fly.runner.toml -a cosmos-hosted-runner
+#
+# Scale memory as the fleet grows (~60-80MB per bot child): fly scale memory 1024 -a cosmos-hosted-runner
+
+app = 'cosmos-hosted-runner'
+primary_region = 'arn'
+
+[build]
+  # same image as the bot; only the entrypoint differs
+
+[processes]
+  runner = 'node src/runner.mjs'
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1
+  processes = ['runner']
+
+[env]
+  COSMOS_API = 'https://try-cosmos.com'
+  COSMOS_DATA_DIR = '/data'
+
+# Per-child persistent state (builder-rotation counter, seen.json, positions) lives under
+# /data/u-<userId>; the volume survives deploys so restarts never reset cadence or re-buy history.
+[mounts]
+  source = 'runner_data'
+  destination = '/data'
+  processes = ['runner']
