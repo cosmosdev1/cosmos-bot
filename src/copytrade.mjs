@@ -144,19 +144,40 @@ const ONESHOT_TIER = N("COPY_ONESHOT_TIER", 2);        // enter only once he rea
 
 function oneShotTarget(sig, portfolio) {
   const none = { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
-  // `tier_pct_resolved` is the server's resolved band for his CURRENT money-in, so `>= 2` is exactly
-  // "he has crossed the 2% tier threshold". A whale with no such tier never qualifies and is skipped.
+  if (!(portfolio > 0)) return none;
+
+  // PROPORTIONAL AUTO SIZING (owner 2026-08-02). Still ONE-SHOT — one entry, one signature, no
+  // follow-ups. The size of that single entry is LINEAR in his dollars: the server embeds the
+  // whale's sizing anchor (p95 of his own last-X position costs) in the signal
+  // (wallets[0].auto_tiers = { anchor_usd }), and pct = min(6, 6 * his_usd / anchor). Double his
+  // bet = exactly double our % — if $50k -> 5% then $25k -> 2.5% (the owner's proportionality
+  // rule). Only two deviations, both accepted: the 6% cap above his anchor (~5% of his trades),
+  // and the copier-side $1 exchange minimum truncating the smallest copies.
+  const bands = sig.wallets?.[0]?.auto_tiers;
+  const gradedPct = pctFromAutoTiers(bands, Number(sig.his_cost_usd) || 0);
+  if (gradedPct != null) {
+    if (!(gradedPct > 0)) return none;
+    const target = Math.min((portfolio * gradedPct) / 100, (portfolio * TIER_MAX_PCT) / 100);
+    // Polymarket's $1 minimum. Deliberately NOT bumped up to $1: on a $150 portfolio the 0.5%
+    // band is $0.75, and paying $1 would out-size the tier he earned on his weakest signal.
+    if (target < MIN_ORDER_USD) return none;
+    return { target, ceiling: target, beats: 1, beatUsd: target };
+  }
+
+  // FALLBACK — signal predates the auto-tiers migration/backfill (no bands embedded). The exact
+  // legacy behaviour, byte-for-byte: single >=2% gate, flat 3%, $5 floor, 5% cap.
   const tier = Number(sig.tier_pct_resolved) || 0;
   if (!(tier >= ONESHOT_TIER)) return none;
-  if (!(portfolio > 0)) return none;
-  // The per-position ceiling WINS over the $5 floor: on a small portfolio we trade under $5 rather
-  // than breach the 5% cap (which the hosted risk gate would reject outright as `order_too_large`).
-  // A $75 portfolio therefore trades ~$3.75, a $150 one trades $5, a $200 one trades $6.
   const capUsd = (portfolio * MAX_POSITION_PCT) / 100;
   const target = Math.min(Math.max((portfolio * ONESHOT_PCT) / 100, ONESHOT_MIN_USD), capUsd);
   if (target < MIN_ORDER_USD) return none;             // below Polymarket's minimum -> no trade
   return { target, ceiling: target, beats: 1, beatUsd: target };
 }
+
+// ONE-SHOT STAYS ONE-SHOT (owner 2026-08-01). The graded ladder below is explicitly NOT wired in
+// here: one-shot exists to hold each position to a single signature, and a per-conviction ladder
+// would reintroduce exactly the signature cost it was built to remove. The ladder is for the
+// future non-one-shot mode, so it lives on the beat path behind COPY_TIER_LADDER.
 
 // CANDLE ENGINES (owner 2026-07-31). On crypto candles the sizing is his-holding-relative, not
 // beat-relative: the server already gives us both numbers the spec needs — his money-in for THIS
@@ -188,6 +209,8 @@ const CANDLE_ENGINE = /^(1|true|yes|on)$/i.test(CANDLE_ENGINE_ENV)
 // inherited from COSMOS_ONESHOT so a bot that happens not to set that env cannot silently run the
 // expensive ladder. Flip with COPY_CANDLE_TIERS=1 when the pricing changes.
 const CANDLE_TIERS = /^(1|true|yes|on)$/i.test(process.env.COPY_CANDLE_TIERS || "");
+// The graded sports ladder. OFF unless explicitly enabled — see targetUsd for why.
+const TIER_LADDER_ON = /^(1|true|yes|on)$/i.test(process.env.COPY_TIER_LADDER || "");
 
 // WHAT COUNTS AS A CANDLE. Keyed off the TRADE, never the wallet — a sports whale who takes one
 // crypto candle gets candle sizing for that position, which is the owner's point: "even if it's a
@@ -213,6 +236,22 @@ function candleTarget(sig, portfolio) {
 function targetUsd(sig, unit, portfolio) {
   if (CANDLE_ENGINE && isCandleSig(sig)) return candleTarget(sig, portfolio);
   if (ONESHOT) return oneShotTarget(sig, portfolio);
+  // THE 20-TIER LADDER (owner 2026-08-02) — the future non-one-shot sizing, BUILT AND OFF
+  // (COPY_TIER_LADDER=1 to enable, when one-shot is retired). His top-10% average bet maps to the
+  // 5% per-trade cap; twenty 0.25% tiers keep ONE user-to-whale ratio across the whole ladder,
+  // recomputed against the CURRENT portfolio every pass (so daily, in practice). Candles never
+  // come through here (checked above) and the whale side refreshes with the server sweep.
+  if (TIER_LADDER_ON && !isCandleSig(sig)) {
+    const top10 = Number(sig.wallets?.[0]?.auto_tiers?.top10_avg_usd) || 0;
+    const hisUsd = Number(sig.his_cost_usd) || Number(sig.wallets?.[0]?.cost_usd) || 0;
+    if (top10 > 0) {
+      const { target, pct } = twentyTierTarget({ hisUsd, top10AvgUsd: top10, portfolio });
+      if (target > 0) return { target, ceiling: target, beats: 1, beatUsd: target, pct };
+      return { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
+    }
+    // No top-10% anchor for this whale (thin history) -> fall through to the beat ladder rather
+    // than skip a vetted wallet.
+  }
   const step = 1 / BEATS;                          // 0.20 of his average = 0.20 of our size
   // THE $1 BEAT FLOOR (owner 2026-07-14). Polymarket will not accept an order under ~$1, so a beat
   // worth $0.30 is not a small trade — it is NO trade. The ratio alone made the big whales uncopyable:
