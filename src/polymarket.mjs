@@ -49,10 +49,14 @@ const DEFAULT_BUILDER_CODE = "0xbb05bc9c71cb8e40ba9a0fab6e58bcac9df3cb53fb0b2553
 const envCode = (process.env.COSMOS_BUILDER_CODE || "").trim();
 const BUILDER_CODE = /^0x[0-9a-fA-F]{64}$/.test(envCode) && envCode !== ZERO32 ? envCode : DEFAULT_BUILDER_CODE;
 const builderOn = true;
-// AFFILIATE ROTATION (owner 2026-07-16): when this user was referred by an active affiliate, the server
-// sends the affiliate's builder code and every 5th order carries IT instead of Cosmos's — 4/5 Cosmos,
-// 1/5 affiliate = the affiliate's ~20% share, paid by Polymarket directly to their account (never via
-// Cosmos). The counter persists to disk so restarts don't reset the cadence.
+// AFFILIATE ROTATION (owner 2026-07-16; tiered 2026-08-02): when this user was referred by an active
+// affiliate, the server sends the affiliate's builder code plus a SLOT COUNT k, and k orders out of
+// every 36 carry IT instead of Cosmos's, paid by Polymarket directly to their account (never via
+// Cosmos). k is the affiliate's tier: 7 at base (1.80% fee x 7/36 = exactly the 0.35% the site
+// quotes) up to 20 at 650 referrals (= 1.00%). The window is 36 because it is the only small
+// denominator where EVERY tier's share (rate / 1.80%) is a whole number of orders. "Every Nth
+// order" could not express the ladder - 0.40% is every 4.5th, 1.00% every 1.8th.
+// The counter persists to disk so restarts don't reset the cadence.
 // COSMOS_DATA_DIR when set (Fly mounts /data — keep that); otherwise a FIXED per-user dir
 // (~/.cosmos), NOT the cwd: a bot relaunched from a different directory (or a host whose working
 // dir is wiped on restart) would silently reset the 1-in-5 cadence and over/under-serve the
@@ -64,7 +68,13 @@ try { _mkd(ROT_DIR, { recursive: true }); } catch { /* rotSave stays best-effort
 const ROT_FILE = _pjoin(ROT_DIR, "builder-rotation.json");
 let rotN = 0; try { rotN = Number(JSON.parse(_rfs(ROT_FILE, "utf8")).n) || 0; } catch { /* fresh */ }
 function rotSave() { try { _wfs(ROT_FILE, JSON.stringify({ n: rotN })); } catch { /* best-effort */ } }
-const AFF_EVERY = 5;
+const AFF_WINDOW = 36;
+const AFF_SLOTS_DEFAULT = 7; // base tier - what a bot pays when the server predates affiliate_slots
+// Bresenham spacing: order n is an affiliate slot when floor(n*k/36) ticks over. The k slots land
+// evenly through the window (k=7 -> gaps of 5 and 6, practically today's cadence; k=20 -> every
+// other order, then two in a row once per window) instead of clumping at the window's start - so a
+// low-volume bot that only places a few orders a day still serves the affiliate their true share.
+const affSlotHit = (n, k) => Math.floor((n * k) / AFF_WINDOW) > Math.floor(((n - 1) * k) / AFF_WINDOW);
 
 // ============================================================================
 // LOCAL RISK CAP (2026-07-22) — the last line of defence against a COMPROMISED
@@ -339,7 +349,7 @@ export async function makePolymarket(config) {
   };
   // Affiliate client is built lazily and rebuilt whenever the code or the signature type changes
   // (the deposit-wallet recovery can flip sigType at order time).
-  let affCode = null, affClient = null, affSig = null, affCreds = null;
+  let affCode = null, affClient = null, affSig = null, affCreds = null, affSlots = AFF_SLOTS_DEFAULT;
   const getAffClient = () => {
     if (!affCode) return null;
     const c = sigType === SignatureTypeV2.POLY_1271 && depositCreds ? depositCreds : creds;
@@ -369,11 +379,15 @@ export async function makePolymarket(config) {
     builderFee: builderOn, // whether a builder fee is being attached to orders
 
     // AFFILIATE ROTATION: server-controlled. null/invalid clears it (all orders -> Cosmos code).
-    setAffiliateCode(code) {
+    // slots = the referrer's tier (orders per 36); absent/invalid -> the base tier, so a bot talking
+    // to an older server keeps earning the affiliate their floor rather than nothing.
+    setAffiliateCode(code, slots) {
       const v = String(code || "").trim();
       const ok = /^0x[0-9a-fA-F]{64}$/.test(v) && v !== ZERO32 && v.toLowerCase() !== BUILDER_CODE.toLowerCase();
       const next = ok ? v : null;
       if (next !== affCode) { affCode = next; affClient = null; }
+      const k = Math.floor(Number(slots));
+      affSlots = Number.isFinite(k) && k >= 1 && k <= AFF_WINDOW ? k : AFF_SLOTS_DEFAULT;
     },
 
     // Free USDC (cash) on the FUNDER/proxy wallet, for position sizing. On-chain balanceOf FIRST
@@ -547,9 +561,10 @@ export async function makePolymarket(config) {
         if (!(size > 0)) return { ok: false, status: 400, body: { polymarket: { error: "local risk cap: clamped to dust" } }, meta: { market: tokenId, side: "buy", size: 0, price: priceCents, risk_capped: true } };
       }
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
-      // ROTATION: order 5, 10, 15... carries the affiliate's builder code (when one is set).
+      // ROTATION: k of every 36 orders carry the affiliate's builder code (when one is set),
+      // Bresenham-spaced so the slots spread evenly through the window.
       rotN++; rotSave();
-      const wantAff = Boolean(getAffClient()) && rotN % AFF_EVERY === 0;
+      const wantAff = Boolean(getAffClient()) && affSlotHit(rotN, affSlots);
       // attempt(useAffiliate): resolves the client AND the code together, so meta.builder_code_used
       // always reports the code the order ACTUALLY carried (audit #9) — even after a deposit-wallet
       // recovery flips the signature type, or when getAffClient() has no client and we fall back.

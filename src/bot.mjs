@@ -617,8 +617,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   qtState.copytrade = wantCopy;
   qtState.cert15 = wantCert;
   qtState.copyFills = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;   // may we copy his live FILLS?
-  // AFFILIATE ROTATION: the server resolves this user's referrer -> active affiliate -> builder code.
-  try { pm.setAffiliateCode?.(settings.affiliate_code || null); } catch { /* advisory */ }
+  // AFFILIATE ROTATION: the server resolves this user's referrer -> active affiliate -> builder code
+  // + tier slot count (k orders per 36 carry the affiliate's code; base 7 = 0.35%, up to 20 = 1.00%).
+  try { pm.setAffiliateCode?.(settings.affiliate_code || null, settings.affiliate_slots); } catch { /* advisory */ }
   if (wantQt && !engines.qtable2) {
     engines.qtable2 = true;
     const { startQTable2 } = await import("./qtable2.mjs");
