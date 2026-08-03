@@ -45,6 +45,11 @@ cd "$SRC"
 
 export COSMOS_LAUNCHER=1  # tells the bot a restarter is present, so its self-update may exit
 
+# Which entry file this machine runs. Default is the single-tenant bot (every legacy machine, no
+# behaviour change); the hosted-runner app sets COSMOS_ENTRY=src/runner.mjs and gets the SAME
+# self-updating launcher - one push to the repo updates the supervisor exactly like it updates bots.
+ENTRY="${COSMOS_ENTRY:-src/bot.mjs}"
+
 BOT_PID=""
 start_bot() {
   # SUPPLY CHAIN (security sweep 2026-07-22): npm ci against the committed lockfile, with lifecycle
@@ -55,7 +60,7 @@ start_bot() {
   # are skipped harmlessly. npm install remains only as the fallback for a lock desync, so a bad
   # lockfile can never brick the fleet - it logs loudly instead.
   npm ci --omit=dev --ignore-scripts --no-audit --no-fund --silent     || { echo "[launcher] npm ci failed (lock desync?) - falling back to npm install"; npm install --omit=dev --ignore-scripts --no-audit --no-fund --silent || true; }
-  node src/bot.mjs &
+  node "$ENTRY" &
   BOT_PID=$!
   echo "[launcher] bot started (pid $BOT_PID) @ $(git rev-parse --short HEAD 2>/dev/null || echo '?')"
 }

@@ -16,17 +16,18 @@ primary_region = 'arn'
 [build]
   # same image as the bot; only the entrypoint differs
 
-[processes]
-  runner = 'node src/runner.mjs'
+# No [processes] override: the image CMD is the self-updating launcher (entrypoint.sh), which
+# clones the repo at runtime - `node src/runner.mjs` directly would point at a path that only
+# exists after the clone (that was the first deploy's crash loop). COSMOS_ENTRY picks the runner.
 
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
-  processes = ['runner']
 
 [env]
   COSMOS_API = 'https://try-cosmos.com'
+  COSMOS_ENTRY = 'src/runner.mjs'
   COSMOS_DATA_DIR = '/data'
 
 # Per-child persistent state (builder-rotation counter, seen.json, positions) lives under
@@ -34,4 +35,3 @@ primary_region = 'arn'
 [mounts]
   source = 'runner_data'
   destination = '/data'
-  processes = ['runner']
