@@ -17,6 +17,10 @@
 // would-be fills and places nothing. Positions are tagged source:"copytrade".
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { targetPctForHolding } from "./candle-sizing.mjs";
+// FIX (2026-08-03, first live fleet): oneShotTarget called pctFromAutoTiers and read TIER_MAX_PCT
+// with NEITHER in scope - a ReferenceError on every non-candle one-shot copy, so the hosted fleet
+// could only ever copy candle signals. Proven by executing the committed function in isolation.
+import { pctFromAutoTiers, ONESHOT_CAP_PCT } from "./tier-sizing.mjs";
 import { log, warn } from "./log.mjs";
 
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
@@ -131,7 +135,7 @@ const BEATS = N("COPY_BEATS", 5);                 // 5 beats -> 20% each
 // flip it back once Turnkey Enterprise pricing makes per-signature cost negligible).
 // ---------------------------------------------------------------------------------------------
 const ONESHOT = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "");
-const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position
+const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 4);          // flat % of OUR portfolio per position (4, was 3 - owner 2026-08-03)
 // PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
 // small on a ~$24 test account). The economics set this number, not caution: a hosted signature
 // costs real money and a $5 position round-trips ~$10 of volume, which is roughly where the 0.9%
@@ -141,6 +145,11 @@ const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfoli
 // under $5 rather than breach the 5% cap, which the hosted gate would reject as `order_too_large`.
 const ONESHOT_MIN_USD = N("COPY_ONESHOT_MIN_USD", 5);
 const ONESHOT_TIER = N("COPY_ONESHOT_TIER", 2);        // enter only once he reaches this tier
+
+// The graded ceiling = the one-shot cap. ONESHOT is set only by the hosted runner, so everything
+// inside this function is hosted-only: the legacy beat-ladder (and its MAX_POSITION_PCT=5 ceiling)
+// stays byte-for-byte, per the standing self-hosted rule.
+const TIER_MAX_PCT = ONESHOT_CAP_PCT;
 
 function oneShotTarget(sig, portfolio) {
   const none = { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
@@ -168,7 +177,9 @@ function oneShotTarget(sig, portfolio) {
   // legacy behaviour, byte-for-byte: single >=2% gate, flat 3%, $5 floor, 5% cap.
   const tier = Number(sig.tier_pct_resolved) || 0;
   if (!(tier >= ONESHOT_TIER)) return none;
-  const capUsd = (portfolio * MAX_POSITION_PCT) / 100;
+  // ONESHOT_CAP_PCT, not MAX_POSITION_PCT: this fallback is hosted-only (see above), and the
+  // legacy 5% constant must not silently truncate the hosted raise.
+  const capUsd = (portfolio * ONESHOT_CAP_PCT) / 100;
   const target = Math.min(Math.max((portfolio * ONESHOT_PCT) / 100, ONESHOT_MIN_USD), capUsd);
   if (target < MIN_ORDER_USD) return none;             // below Polymarket's minimum -> no trade
   return { target, ceiling: target, beats: 1, beatUsd: target };

@@ -5,7 +5,7 @@
 // wallets[0].auto_tiers):
 //
 //   * ONE-SHOT (live, hosted): continuous linear on anchor_usd = his p95.
-//     pct = min(6, 6 * his_usd / anchor). One entry, one signature. UNTOUCHED by the 20-tier spec.
+//     pct = min(cap, cap * his_usd / anchor), cap = ONESHOT_CAP_PCT. One entry, one signature. UNTOUCHED by the 20-tier spec.
 //   * 20-TIER LADDER (the non-one-shot strategy, owner 2026-08-02): anchor = the AVERAGE OF HIS
 //     TOP-10% trades -> that amount maps to the 5% per-trade cap. Twenty equal tiers of 0.25%
 //     keep ONE ratio the whole way (the owner's mirroring rule: user-to-whale ratio identical
@@ -21,7 +21,10 @@
 export const MIN_ORDER_USD = 1;
 
 // ---- one-shot (live) ----
-export const ONESHOT_CAP_PCT = 6;
+// 7, was 6 (owner 2026-08-03: "make the one-shot % a little higher... still one-shot"). The
+// platform gate's per-order cap moves with this - the two must agree or the gate refuses the very
+// order this curve produced.
+export const ONESHOT_CAP_PCT = 7;
 
 /**
  * One-shot resolver. { anchor_usd } -> continuous linear pct (cap 6). Legacy [{min_usd, pct}]
