@@ -144,6 +144,12 @@ const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 4);          // flat % of OUR portfoli
 // The per-position ceiling still WINS over this floor (see oneShotTarget): a small portfolio trades
 // under $5 rather than breach the 5% cap, which the hosted gate would reject as `order_too_large`.
 const ONESHOT_MIN_USD = N("COPY_ONESHOT_MIN_USD", 5);
+// $4 floor for GRADED one-shot entries (owner 2026-08-03: "add a floor of $4... only one-shot").
+// The graded curve had no floor at all - a whale's small probe on a $100 portfolio sized to cents,
+// which is dust nobody wants to hold. The cap still WINS on a conflict: a portfolio too small for
+// $4 inside the 7% cap trades smaller rather than breaching it (a floored order above the cap
+// would just be refused by the platform gate as order_too_large and trade NOTHING).
+const ONESHOT_FLOOR_USD = N("COPY_ONESHOT_FLOOR_USD", 4);
 const ONESHOT_TIER = N("COPY_ONESHOT_TIER", 2);        // enter only once he reaches this tier
 
 // The graded ceiling = the one-shot cap. ONESHOT is set only by the hosted runner, so everything
@@ -166,7 +172,8 @@ function oneShotTarget(sig, portfolio) {
   const gradedPct = pctFromAutoTiers(bands, Number(sig.his_cost_usd) || 0);
   if (gradedPct != null) {
     if (!(gradedPct > 0)) return none;
-    const target = Math.min((portfolio * gradedPct) / 100, (portfolio * TIER_MAX_PCT) / 100);
+    const capUsd7 = (portfolio * TIER_MAX_PCT) / 100;
+    const target = Math.min(Math.max((portfolio * gradedPct) / 100, ONESHOT_FLOOR_USD), capUsd7);
     // Polymarket's $1 minimum. Deliberately NOT bumped up to $1: on a $150 portfolio the 0.5%
     // band is $0.75, and paying $1 would out-size the tier he earned on his weakest signal.
     if (target < MIN_ORDER_USD) return none;
