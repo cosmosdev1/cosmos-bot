@@ -40,7 +40,9 @@ const config = loadConfig();
 // key - signing happens inside the user's enclave via the remote signer, which validates its own
 // requirements (COSMOS_SIGN_URL + token + TURNKEY_SIGN_WITH). Demanding a key here forced the
 // prove-out to fake one; hosted needs the token only.
-const HOSTED = process.env.COSMOS_SIGNER === "turnkey";
+// "remote" is the real hosted mode (signing through the platform gate - the only mode signer.mjs
+// accepts for hosted); "turnkey" kept for the offline-testing escape hatch. Both mean: no local key.
+const HOSTED = process.env.COSMOS_SIGNER === "remote" || process.env.COSMOS_SIGNER === "turnkey";
 if (!config.cosmosToken || (!HOSTED && !config.polymarket.privateKey)) {
   console.error("Missing config. Either run `npm run setup` (local) or set the env vars COSMOS_TOKEN + POLYMARKET_PRIVATE_KEY (+ POLYMARKET_FUNDER) for a 24/7 host.");
   process.exit(1);

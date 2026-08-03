@@ -14,7 +14,7 @@
 //   RUNNER_MAX      max concurrent children (default 25)
 //   COSMOS_DATA_DIR state root; each child gets <root>/u-<userId> (rotation counter, seen.json)
 //
-// Per-child env (from the roster entry): COSMOS_TOKEN, COSMOS_SIGN_URL, COSMOS_SIGNER=turnkey,
+// Per-child env (from the roster entry): COSMOS_TOKEN, COSMOS_SIGN_URL, COSMOS_SIGNER=remote,
 // TURNKEY_SIGN_WITH, POLYMARKET_FUNDER, POLYMARKET_SIG_TYPE, CLOB[_DEPOSIT]_* creds when cached,
 // COSMOS_ONESHOT=1 (hosted pays per signature - the one-shot architecture IS the hosted product),
 // COSMOS_NO_1271_RECOVERY=1 (the recovery derive always fails for deposit wallets and costs a paid
@@ -58,7 +58,11 @@ function childEnv(a) {
     COSMOS_API: API,
     COSMOS_TOKEN: a.token,
     COSMOS_SIGN_URL: API,                       // remote signer base; the module appends its paths
-    COSMOS_SIGNER: "turnkey",
+    // "remote", NOT "turnkey" (first live fleet start, 2026-08-03): signer.mjs refuses direct
+    // Turnkey from the bot - it would bypass the risk gate, the approver and the per-trade
+    // signature cap. remote signs through the platform's /api/cloud/sign gate, which is the
+    // live-proven path. All 8 children crash-looped on this one word.
+    COSMOS_SIGNER: "remote",
     TURNKEY_SIGN_WITH: a.signer || "",
     POLYMARKET_FUNDER: a.funder || "",
     POLYMARKET_SIG_TYPE: a.sig_type || "",
