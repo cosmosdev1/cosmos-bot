@@ -43,6 +43,17 @@ const config = loadConfig();
 // "remote" is the real hosted mode (signing through the platform gate - the only mode signer.mjs
 // accepts for hosted); "turnkey" kept for the offline-testing escape hatch. Both mean: no local key.
 const HOSTED = process.env.COSMOS_SIGNER === "remote" || process.env.COSMOS_SIGNER === "turnkey";
+// CRASH-PROOFING — hosted children only (deep audit 2026-08-04). A floating promise's fetch
+// timeout (DOMException TimeoutError) was killing whole bots mid-tick: every child in the fleet
+// died and respawned on a ~15-20 min loop, and the entry pass never survived long enough to place
+// an order — the runner's respawn made it look alive while it traded nothing. A trading process
+// must never die from a stray rejection: log it LOUDLY (the stack names the culprit call-site)
+// and keep running — money safety lives server-side (risk gate, 2-signature cap), not in crash
+// semantics. Legacy self-hosted bots keep stock behaviour (standing rule: gate on the signer).
+if (HOSTED) {
+  process.on("unhandledRejection", (e) => console.error("[fatal-averted] unhandledRejection:", e?.stack || e));
+  process.on("uncaughtException", (e) => console.error("[fatal-averted] uncaughtException:", e?.stack || e));
+}
 if (!config.cosmosToken || (!HOSTED && !config.polymarket.privateKey)) {
   console.error("Missing config. Either run `npm run setup` (local) or set the env vars COSMOS_TOKEN + POLYMARKET_PRIVATE_KEY (+ POLYMARKET_FUNDER) for a 24/7 host.");
   process.exit(1);
