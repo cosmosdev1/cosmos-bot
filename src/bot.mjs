@@ -1124,11 +1124,34 @@ function maybeSelfUpdate() {
   } catch { /* git unavailable (local dev) or a transient failure - ignore, retry next window */ }
 }
 
+// BOOT-WEDGE GUARD — hosted children only (deep audit 2026-08-04). The funded POLY_1271 bots
+// wedged INSIDE boot: "starting…" printed, then hours of silence — no heartbeat, no error, no
+// trades. cosmos.account() and makePolymarket() contain calls (CLOB cred derive, on-chain reads)
+// that can hang without a deadline, and the cycle-wedge guard only arms AFTER boot completes, so
+// a boot hang was invisible and permanent across relaunches. Each boot stage now carries a hard
+// deadline; on breach the stage NAMES itself in the log and the process exits(1) for a clean
+// launcher relaunch (fresh sockets/DNS clear the common causes). Legacy self-hosted bots keep
+// plain awaits (standing rule: gate on the signer).
+async function bootStage(name, promise, ms) {
+  if (!HOSTED) return promise;
+  let t;
+  const timer = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`boot stage '${name}' exceeded ${Math.round(ms / 1000)}s`)), ms); });
+  try {
+    return await Promise.race([promise, timer]);
+  } catch (e) {
+    if (/boot stage/.test(String(e?.message))) {
+      err(`BOOT WEDGE: ${e.message} - exiting for a launcher relaunch`);
+      if (process.env.COSMOS_LAUNCHER === "1") process.exit(1);
+    }
+    throw e;
+  } finally { clearTimeout(t); }
+}
+
 async function main() {
   log("Cosmos bot starting…");
   startFleetStateWatch(log);   // server-independent kill switch: poll the signed FLEETSTATE (GitHub raw)
   const cosmos = makeCosmos(config);
-  const acct = await cosmos.account();
+  const acct = await bootStage("cosmos.account", cosmos.account(), 90_000);
   if (!acct.bot_access) { console.error("This plan does not include bot/API trading. Upgrade in the dashboard."); process.exit(1); }
 
   // SIGNATURE TYPE FROM THE SERVER, applied BEFORE the client is built (makePolymarket reads
@@ -1143,7 +1166,7 @@ async function main() {
     log(`account type from Cosmos: ${config.polymarket.sigType}`);
   }
 
-  const pm = await makePolymarket(config);
+  const pm = await bootStage("makePolymarket (CLOB init/creds)", makePolymarket(config), 180_000);
   log(`connected · plan ${acct.tier} · wallet ${pm.address.slice(0, 6)}… · funder ${pm.funder.slice(0, 6)}…${pm.builderFee ? " · builder fee ON" : ""}`);
 
   // Geoblock check (Polymarket docs): if this server's IP is blocked, every order is rejected with
