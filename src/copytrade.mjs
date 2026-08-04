@@ -264,7 +264,14 @@ function candleTarget(sig, portfolio) {
   return { target: (portfolio * pct) / 100, ceiling: (portfolio * 4.5) / 100, beats: pct ? 1 : 0, beatUsd: 0, candle: true, pct };
 }
 
+const ONESHOT_MIN_PORTFOLIO_USD = N("COPY_MIN_PORTFOLIO_USD", 75); // owner 2026-08-04: under \$75, no entries at all
+
 function targetUsd(sig, unit, portfolio) {
+  // HOSTED FLOOR (owner 2026-08-04): a portfolio under \$75 places NO entries - candle or whale.
+  // Bot-side so the fleet does not burn sign-gate calls on orders the gate would refuse anyway;
+  // the gate enforces the same line server-side. Exits are unaffected (this sizes entries only),
+  // and legacy self-hosted bots (ONESHOT off) are untouched.
+  if (ONESHOT && !(portfolio >= ONESHOT_MIN_PORTFOLIO_USD)) return { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
   if (CANDLE_ENGINE && isCandleSig(sig)) return candleTarget(sig, portfolio);
   if (ONESHOT) return oneShotTarget(sig, portfolio);
   // THE 20-TIER LADDER (owner 2026-08-02) — the future non-one-shot sizing, BUILT AND OFF
