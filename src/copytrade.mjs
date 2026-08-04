@@ -75,6 +75,22 @@ function sportsWindowClosed(sig) {
   const leftMin = (Date.parse(sig.end_date) - Date.now()) / 60_000;
   return Number.isFinite(leftMin) && leftMin < SPORTS_MIN_LEFT_MIN;
 }
+// IN-PLAY GAP BAND — hosted one-shot only (deep audit 2026-08-04). Sports markets carry endDate =
+// KICKOFF, so a signal past its end_date is a LIVE game, not a corpse (the server refuses true
+// corpses, and candles never reach here - the candle engine owns them). The old model refused all
+// of it, which hid the whales' in-play conviction - the exact volume the median trigger exists to
+// catch. One-shot buys in-play, but only within GAP cents of HIS average entry: past that, the
+// line ran away from his book and we would be buying our price, not his edge.
+const ONESHOT_GAP_C = N("COPY_ONESHOT_GAP_CENTS", 20);
+function inPlayBand(sig, cap, floor) {
+  if (!ONESHOT || isCandleSig(sig)) return { cap, floor };
+  const end = Date.parse(String(sig.end_date ?? ""));
+  if (!Number.isFinite(end) || end > Date.now()) return { cap, floor };   // pre-game: normal band
+  const c = Number(sig.his_cost_usd), sh = Number(sig.his_shares);
+  const hisAvgC = c > 0 && sh > 0 ? Math.round((c / sh) * 100) : Number(sig.his_entry_cents) || Number(sig.entry_cents) || 0;
+  if (!(hisAvgC > 0)) return { cap, floor };
+  return { cap: Math.min(cap, hisAvgC + ONESHOT_GAP_C), floor: Math.max(floor, hisAvgC - ONESHOT_GAP_C) };
+}
 // SPORTS adopt TIERS (owner 2026-07-15, swisstony): size by HIS money in the position, and SCALE IN as
 // it grows — if he starts at $80k we hold 1%, when he grows to $125k we top up to 2%, etc.
 //   < $30k: skip · $30-70k: 1% · $70-120k: 2% · $120-180k: 3% · $180k+: 4%   (percent OF the portfolio)
@@ -430,6 +446,15 @@ export function startCopyTrade(deps) {
   // What do we put into THIS signal? Beats for a new position he just opened; a flat 1% for one we are
   // adopting (he is already in it, at roughly this price).
   function sizeFor(sig, unitBasis, portfolio) {
+    // ONE-SHOT SIZES EVERYTHING (deep audit 2026-08-04, the fleet's root cause). The SPORTS branch
+    // below intercepted every sports signal BEFORE targetUsd, so the median one-shot never ran for
+    // the fleet's dominant category - sports sized off tier_pct_resolved with a hardcoded fallback
+    // that skips anything under $30k, which is why whales with $1k-$13k conviction positions never
+    // produced a single entry. Hosted bots route every signal through targetUsd: the $75 portfolio
+    // floor, then the candle engine for candles, then the median-trigger one-shot for the rest
+    // (sports, adopt, ALL-category alike - the owner's spec has ONE entry rule). Legacy bots
+    // (ONESHOT off) keep the branches below byte-for-byte.
+    if (ONESHOT) return targetUsd(sig, unitBasis, portfolio);
     // ADOPT: flat 1% of the portfolio - but FLOORED at Polymarket's $1 minimum, exactly like a beat.
     // Without the floor a $76 portfolio sizes an adopt at $0.76, which is below the minimum order, so
     // `if (target < MIN_ORDER_USD) continue` silently drops it. That is not "small", it is NEVER: no
@@ -471,7 +496,8 @@ export function startCopyTrade(deps) {
     // silently — 38 approved markets got no order in 24h and NOTHING said why. One line per skip.
     const skip = (why) => log(`copytrade fast-skip ${sig.category} ${sig.outcome}: ${why} · ${String(sig.market_question || "").slice(0, 32)}`);
     if (!(target > 0)) return skip("beats=0 (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " vs avg $" + Math.round(Number(sig.wallets?.[0]?.avg_trade_usd) || 0) + ")");
-    if (sportsWindowClosed(sig)) return skip(`pre-game window closed (<${SPORTS_MIN_LEFT_MIN}m to kickoff)`);
+    // pre-kickoff window is the LEGACY model; one-shot buys in-play behind the gap band instead
+    if (!ONESHOT && sportsWindowClosed(sig)) return skip(`pre-game window closed (<${SPORTS_MIN_LEFT_MIN}m to kickoff)`);
 
     if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return skip("cooldown");
     if (target < MIN_ORDER_USD) return skip("target $" + target.toFixed(2) + " < $1 min");
@@ -514,10 +540,27 @@ export function startCopyTrade(deps) {
       ? Math.min(99, Number(sig.max_entry_cents) || 99)
       : Math.min(capMax, Number(sig.max_entry_cents) || capMax);
     const floor = sig.is_pair ? 1 : (String(sig.category).toUpperCase() === "SPORTS" ? 3 : MIN_ENTRY_CENTS);
-    const px = await priceFor(sig.token_id, cap, floor);
-    if (px == null) return skip("price out of band (cap " + cap + "c)");
+    const band = inPlayBand(sig, cap, floor);            // in-play (hosted): within ±20c of HIS avg entry
+    const px = await priceFor(sig.token_id, band.cap, band.floor);
+    if (px == null) return skip("price out of band (cap " + band.cap + "c)");
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
+  }
+
+  // MY PICKS ONLY — hosted one-shot (deep audit 2026-08-04). The polled feed serves the whole
+  // track's signals with no per-user filter, so a hosted bot could buy off whales its user never
+  // picked. Filter against the same roster chainwatch subscribes to (/api/v1/copy-wallets: the
+  // user's picks, or the full track for pick-less legacy accounts - where this is a no-op by
+  // construction). Fail-closed: no roster yet -> no polled entries this pass (the fast path is
+  // unaffected; copy-check enforces picks server-side either way).
+  let myWallets = null, myWalletsAt = 0;
+  async function refreshMyWallets() {
+    if (myWallets && Date.now() - myWalletsAt < 5 * 60_000) return;
+    try {
+      const r = await cosmos.copyWallets();
+      const list = (r?.wallets ?? []).map((x) => String(x.wallet).toLowerCase()).filter((x) => /^0x[a-f0-9]{40}$/.test(x));
+      if (list.length) { myWallets = new Set(list); myWalletsAt = Date.now(); }
+    } catch (e) { warn("copytrade picks roster:", e.message); }   // keep the last known roster
   }
 
   async function tick() {
@@ -527,6 +570,7 @@ export function startCopyTrade(deps) {
     try { feed = await cosmos.copySignals(); } catch (e) { warn("copytrade feed:", e.message); return; }
     const signals = feed?.signals ?? [];
     if (!signals.length) return;
+    if (ONESHOT) { await refreshMyWallets(); if (!myWallets) return; }
     const positions = store.load();
     let openCopy = 0; for (const p of Object.values(positions)) if (copyLive(p)) openCopy++;   // dead dust does not fill a slot
     // "smaller amount per trade" (owner): the copy unit is a FRACTION of the dashboard per-trade size
@@ -538,8 +582,11 @@ export function startCopyTrade(deps) {
       if (!sig.condition_id || !sig.token_id) continue;
       // ADOPT-ONLY users see ONLY adopt signals. The whale-fill copies (kind "new") are aviv's alone.
       if (state.copyFills === false && sig.kind !== "adopt") continue;
+      // hosted: only signals driven by one of THIS user's picked wallets (see refreshMyWallets)
+      if (ONESHOT && !(sig.wallets ?? []).some((x) => myWallets.has(String(x.wallet).toLowerCase()))) continue;
       if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) continue; // settle-window cooldown
-      if (sportsWindowClosed(sig)) continue;              // retry bound: never buy inside the last 10min pre-kickoff
+      // pre-kickoff window is the LEGACY model; one-shot buys in-play behind the gap band instead
+      if (!ONESHOT && sportsWindowClosed(sig)) continue;  // retry bound: never buy inside the last 10min pre-kickoff
       let { target } = sizeFor(sig, unitBasis, state.portfolio);
       if (!(target > 0)) continue;
       stats.signals++;
@@ -591,7 +638,8 @@ export function startCopyTrade(deps) {
           ? Math.min(99, Number(sig.max_entry_cents) || 99)
           : Math.min(capMax2, Number(sig.max_entry_cents) || capMax2);
         const floor = sig.is_pair ? 1 : (String(sig.category).toUpperCase() === "SPORTS" ? 3 : MIN_ENTRY_CENTS);
-        const px = await priceFor(sig.token_id, cap, floor);
+        const band = inPlayBand(sig, cap, floor);          // in-play (hosted): within ±20c of HIS avg entry
+        const px = await priceFor(sig.token_id, band.cap, band.floor);
         if (px == null) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
