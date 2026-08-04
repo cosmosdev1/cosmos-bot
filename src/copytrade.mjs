@@ -175,8 +175,16 @@ function oneShotTarget(sig, portfolio) {
   const bands = sig.wallets?.[0]?.auto_tiers;
   const median = Number(bands?.median_usd);
   if (Number.isFinite(median) && median > 0) {
+    // OPEN-POSITION BASIS (owner 2026-08-04: "the open position size - one position - should be
+    // above that median, not one entry"). his_cost_usd is his cumulative money-in; scaling it by
+    // shares-held / peak-shares nets out what he has already sold, so a whale who bought $500 and
+    // exited down to a $100 stub does not read as a $500 conviction. Checked on every fill
+    // (chainwatch, ~1s) and every poll (20s) - the position crosses the median, we enter once.
     const hisUsd = Number(sig.his_cost_usd) || 0;
-    if (!(hisUsd > median)) return none;                 // routine-sized trade -> not a signal
+    const sh = Number(sig.his_shares), peak = Number(sig.his_peak_shares);
+    const openFrac = peak > 0 && sh >= 0 ? Math.min(1, sh / peak) : 1;
+    const openUsd = hisUsd * openFrac;
+    if (!(openUsd > median)) return none;                // open position still routine-sized -> not a signal
     const capUsd = (portfolio * TIER_MAX_PCT) / 100;
     const target = Math.min(Math.max((portfolio * ONESHOT_PCT) / 100, ONESHOT_FLOOR_USD), capUsd);
     if (target < MIN_ORDER_USD) return none;
