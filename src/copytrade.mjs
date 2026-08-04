@@ -135,7 +135,7 @@ const BEATS = N("COPY_BEATS", 5);                 // 5 beats -> 20% each
 // flip it back once Turnkey Enterprise pricing makes per-signature cost negligible).
 // ---------------------------------------------------------------------------------------------
 const ONESHOT = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "");
-const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 4);          // flat % of OUR portfolio per position (4, was 3 - owner 2026-08-03)
+const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position (owner 2026-08-04: enter at 3%, that is it)
 // PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
 // small on a ~$24 test account). The economics set this number, not caution: a hosted signature
 // costs real money and a $5 position round-trips ~$10 of volume, which is roughly where the 0.9%
@@ -161,21 +161,34 @@ function oneShotTarget(sig, portfolio) {
   const none = { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
   if (!(portfolio > 0)) return none;
 
-  // PROPORTIONAL AUTO SIZING (owner 2026-08-02). Still ONE-SHOT — one entry, one signature, no
-  // follow-ups. The size of that single entry is LINEAR in his dollars: the server embeds the
-  // whale's sizing anchor (p95 of his own last-X position costs) in the signal
-  // (wallets[0].auto_tiers = { anchor_usd }), and pct = min(6, 6 * his_usd / anchor). Double his
-  // bet = exactly double our % — if $50k -> 5% then $25k -> 2.5% (the owner's proportionality
-  // rule). Only two deviations, both accepted: the 6% cap above his anchor (~5% of his trades),
-  // and the copier-side $1 exchange minimum truncating the smallest copies.
+  // MEDIAN-TRIGGER ONE-SHOT (owner 2026-08-04: monitor the whale's median amount per trade over
+  // his last 200 trades - once he passes this amount in a trade, enter at 3%. That is it).
+  //
+  // The server embeds median_usd (his median cost over his last 200 trades, fewer if he has fewer)
+  // in wallets[0].auto_tiers. A trade AT or below his median is routine and copies nothing; a trade
+  // ABOVE it is conviction above his own baseline and copies a flat 3% of OUR portfolio - the $4
+  // floor lifts dust, and the 7% ceiling still wins over the floor on a small portfolio (a floored
+  // order above the gate's cap would only be refused and trade nothing).
+  //
+  // This REPLACED the proportional curve (pct linear in his size, cap 7%): entry selectivity now
+  // comes from the median gate, not from scaling the size.
   const bands = sig.wallets?.[0]?.auto_tiers;
+  const median = Number(bands?.median_usd);
+  if (Number.isFinite(median) && median > 0) {
+    const hisUsd = Number(sig.his_cost_usd) || 0;
+    if (!(hisUsd > median)) return none;                 // routine-sized trade -> not a signal
+    const capUsd = (portfolio * TIER_MAX_PCT) / 100;
+    const target = Math.min(Math.max((portfolio * ONESHOT_PCT) / 100, ONESHOT_FLOOR_USD), capUsd);
+    if (target < MIN_ORDER_USD) return none;
+    return { target, ceiling: target, beats: 1, beatUsd: target };
+  }
+  // Signal predates the median rollout (no median_usd embedded yet): the old proportional curve,
+  // so an in-flight signal can never crash sizing mid-deploy. Dies out as signals refresh.
   const gradedPct = pctFromAutoTiers(bands, Number(sig.his_cost_usd) || 0);
   if (gradedPct != null) {
     if (!(gradedPct > 0)) return none;
     const capUsd7 = (portfolio * TIER_MAX_PCT) / 100;
     const target = Math.min(Math.max((portfolio * gradedPct) / 100, ONESHOT_FLOOR_USD), capUsd7);
-    // Polymarket's $1 minimum. Deliberately NOT bumped up to $1: on a $150 portfolio the 0.5%
-    // band is $0.75, and paying $1 would out-size the tier he earned on his weakest signal.
     if (target < MIN_ORDER_USD) return none;
     return { target, ceiling: target, beats: 1, beatUsd: target };
   }

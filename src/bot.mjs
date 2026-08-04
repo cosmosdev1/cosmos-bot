@@ -464,6 +464,27 @@ async function top5ExitStep(cosmos, pm, positions, pos) {
 // of OUR original copied position (owner spec 2026-07-13). Steps fire exactly once via the server seq;
 // seq>=10 (or fraction 1) = full exit. Mirrors top5ExitStep. Returns true if it acted this cycle.
 async function copyExitStep(cosmos, pm, positions, pos) {
+  // FULL EXIT AT 98c, one-shot only (owner 2026-08-04). Checked BEFORE the advice call and entirely
+  // bot-side: the last 2c is dead capital versus resolution risk, and a hung advice endpoint
+  // (fail-safe HOLD) must never park a 98c position. Legacy bots (ONESHOT off) are untouched.
+  const isOneShot = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "");
+  let cur = null;
+  if (isOneShot) {
+    cur = await pm.getPriceCents(pos.token_id);
+    if (cur != null && cur >= 98) {
+      const r98 = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT");
+      if (r98.ok) {
+        const soldShares = Number(r98.meta?.size) > 0 ? Number(r98.meta.size) : pos.size_shares;
+        const soldCents = Number(r98.meta?.price) > 0 ? Number(r98.meta.price) : (r98.sellPrice ?? r98.mid ?? cur);
+        store.save(positions);
+        cosmos.copyReport({ wallet: pos.copy_wallet, condition_id: pos.condition_id, outcome: pos.outcome, category: pos.copy_category, action: "SELL", shares: soldShares, price_cents: soldCents, size_usd: Number(((soldShares * soldCents) / 100).toFixed(2)), market_question: pos.market_question }).catch(() => {});
+        log(`COPY exit-98c: sold ALL ${pos.outcome} @ ~${soldCents}c (one-shot take-profit)`);
+        return true;
+      }
+      if (!r98.held) warn("exit-98c sell failed (will retry next cycle):", r98.status);
+      // fall through to advice on failure - the position still needs managing
+    }
+  }
   let d = null;
   try { d = await cosmos.copyExit(pos); }
   catch (e) { warn("copy-exit:", e.message); return false; }
@@ -471,7 +492,7 @@ async function copyExitStep(cosmos, pm, positions, pos) {
   const fraction = Math.min(1, Number(d.fraction) || 0);
   if (fraction <= 0) return false;
   if (pos.copy_orig_shares == null) { pos.copy_orig_shares = pos.size_shares; store.save(positions); }
-  const cur = await pm.getPriceCents(pos.token_id);
+  if (cur == null) cur = await pm.getPriceCents(pos.token_id);
   const base = d.of === "original" ? pos.copy_orig_shares : pos.size_shares;
   const chunk = fraction >= 0.99 ? pos.size_shares : Math.min(pos.size_shares, Math.floor(base * fraction));
   const full = chunk >= pos.size_shares || chunk < 1 || (cur != null && chunk * cur < 110); // ~$1 min -> full exit
