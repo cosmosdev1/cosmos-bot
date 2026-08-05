@@ -8,7 +8,7 @@
 #   fly secrets set -a cosmos-hosted-runner RUNNER_SECRET=<same value as Vercel RUNNER_SECRET>
 #   fly deploy -c fly.runner.toml -a cosmos-hosted-runner
 #
-# Scale memory as the fleet grows (~60-80MB per bot child): fly scale memory 1024 -a cosmos-hosted-runner
+# Scale as the fleet grows (~80MB + CPU per bot child): fly scale vm shared-cpu-4x --memory 4096 -a cosmos-hosted-runner
 
 app = 'cosmos-hosted-runner'
 primary_region = 'arn'
@@ -21,9 +21,15 @@ primary_region = 'arn'
 # exists after the clone (that was the first deploy's crash loop). COSMOS_ENTRY picks the runner.
 
 [[vm]]
-  memory = '1gb'
+  # OOM INCIDENT 2026-08-05: 25 children on 1 vCPU / 1GB with no swap. Each child could not even
+  # finish loading before its first API call timed out; the box sat at loadavg 35 with 52MB free and
+  # OOM-killed itself in a loop. The whole hosted fleet traded nothing for ~15 hours and every
+  # heartbeat went stale, while the 9 legacy self-hosted bots (their own machines) stayed perfectly
+  # healthy - which is what proved it was the box, not the code.
+  # Budget ~80MB and a real slice of CPU per child; re-scale when RUNNER_MAX grows past ~40.
+  memory = '4gb'
   cpu_kind = 'shared'
-  cpus = 1
+  cpus = 4
 
 [env]
   COSMOS_API = 'https://try-cosmos.com'
