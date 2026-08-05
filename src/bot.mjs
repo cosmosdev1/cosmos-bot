@@ -393,7 +393,7 @@ async function decideExit(cosmos, pm, settings, pos, curFromEdge, aiVerdict) {
 // hand a near-resolved winner to a lowball bid - if nothing clears the floor we HOLD and it resolves
 // in our favour anyway. The caller re-runs this every cycle until reconcile confirms the holding is
 // actually gone, so a momentary empty book is retried until it fills.
-async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
+async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS", minCents = 0) {
   // COSMOS CLOUD: one exit decision = one triggerId, same contract as placeWithRetry.
   //
   // NOTE the loop below RE-PRICES on every attempt, so each attempt is a genuinely different order:
@@ -404,16 +404,19 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS") {
   // cannot be sold again until the 24h window rolls (the cap counts only SIGNED orders in the last
   // 24h, so denials and kills never lock a position out).
   return withSignContext({ triggerId: randomUUID(), conditionId: pos.condition_id || "" },
-    () => marketableSellInner(cosmos, pm, pos, action));
+    () => marketableSellInner(cosmos, pm, pos, action, minCents));
 }
 
-async function marketableSellInner(cosmos, pm, pos, action = "STOP_LOSS") {
+async function marketableSellInner(cosmos, pm, pos, action = "STOP_LOSS", minCents = 0) {
   const mid = (await pm.getPriceCents(pos.token_id)) ?? pos.entry_cents;
   const salvage = action !== "TAKE_PROFIT"; // stop-loss / edge-salvage may dump; take-profit may not
   // Quant take-profits never sell under 99c (per admin spec: the 98.5-99 band; integer ticks make
   // that a fixed 99c ask). A killed FAK just retries - every cycle, forever - and if 99c never
   // fills, resolution redeems at 100c, so holding out costs nothing.
-  const floor = salvage ? 1 : (pos.source === "quant" || pos.source === "qtable") ? HZ("QUANT_TP_CENTS", 99) : Math.max(1, mid - 10);   // qtable joined the 99c floor (deep-check: mid-10 leaked -$121/72h on TP fills; a killed FAK retries and resolution pays 100c anyway)
+  // minCents (audit 2026-08-05): a caller-supplied executable floor - the 98c one-shot TP passes
+  // entry+1 so a take-profit can never fill BELOW what we paid (observed: 99c entries "profit-taken"
+  // into a 96c bid on positions that resolved at 100). Bid under the floor -> held, resolution pays.
+  const floor = Math.max(minCents, salvage ? 1 : (pos.source === "quant" || pos.source === "qtable") ? HZ("QUANT_TP_CENTS", 99) : Math.max(1, mid - 10));   // qtable joined the 99c floor (deep-check: mid-10 leaked -$121/72h on TP fills; a killed FAK retries and resolution pays 100c anyway)
   let last = { ok: false, status: 0, body: {} };
   for (let attempt = 0; attempt < 5; attempt++) {
     const bid = await pm.getBestBidCents(pos.token_id);
@@ -482,8 +485,10 @@ async function copyExitStep(cosmos, pm, positions, pos) {
   let cur = null;
   if (isOneShot) {
     cur = await pm.getPriceCents(pos.token_id);
-    if (cur != null && cur >= 98) {
-      const r98 = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT");
+    // entry+1 must be REACHABLE (audit 2026-08-05): a 99c entry can never fill above itself (price
+    // caps at 99), so attempting only burns a paid signature - hold; resolution pays 100 anyway.
+    if (cur != null && cur >= 98 && (Number(pos.entry_cents) || 0) + 1 <= 99) {
+      const r98 = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT", (Number(pos.entry_cents) || 0) + 1);
       if (r98.ok) {
         const soldShares = Number(r98.meta?.size) > 0 ? Number(r98.meta.size) : pos.size_shares;
         const soldCents = Number(r98.meta?.price) > 0 ? Number(r98.meta.price) : (r98.sellPrice ?? r98.mid ?? cur);
@@ -682,6 +687,7 @@ async function maybeStartEngines(settings, pm, cosmos) {
   }
 }
 
+let lastSkipFlush = 0;   // copy-skip telemetry cadence (see the heartbeat block below)
 async function cycle(cosmos, pm) {
   const account = await cosmos.account();
   const settings = account.settings;
@@ -823,6 +829,14 @@ async function cycle(cosmos, pm) {
   // Telemetry: report the live sizing basis + config so the admin can SEE why orders are sized as they
   // are (cash vs portfolio vs override, and any funder misconfig). Fire-and-forget.
   {
+    // WHY-NO-ORDER flush (audit 2026-08-05): every ~15 min the copy engine's refusal counters ride
+    // the heartbeat to the server (scan_runs 'bot-skips') - bot-side skips used to die in Fly logs.
+    let copySkips;
+    if (qtState.copySkips?.size && Date.now() - lastSkipFlush >= 15 * 60_000) {
+      lastSkipFlush = Date.now();
+      copySkips = Object.fromEntries(qtState.copySkips);
+      qtState.copySkips.clear();
+    }
     const z = settings.sizing || {};
     const sampleSizeUsd = sizeForSignal(z, { lock_tier: "free", score: 5 }, portfolioValue, deployed);
     const bd = pm.balanceBreakdown ? pm.balanceBreakdown() : { onchain: null, clob: null };
@@ -852,6 +866,7 @@ async function cycle(cosmos, pm) {
       // Without these a halted bot looks green in admin (polling + reporting) while buying nothing.
       dd_halt: qtState.ddHalt === true,
       engines_on: { qtable2: qtState.qtable2 === true, copytrade: qtState.copytrade === true, cert15: qtState.cert15 === true },
+      copy_skips: copySkips,   // undefined on most cycles; JSON.stringify drops it
     });
   }
 

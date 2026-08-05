@@ -144,9 +144,19 @@ export function makeCosmos(config) {
     },
 
     // Report a copy fill (BUY on entry/scale-in, SELL on a mirror step) to the per-user admin ledger.
-    // Fire-and-forget: never blocks or breaks the copy loop.
+    // RETRIES x3 (ledger audit 2026-08-05): fire-and-forget with a swallowed catch silently lost
+    // ~28 positions' rows (~$467) through the OOM/outage windows - the ledger, the PnL backfill and
+    // the admin report all under-counted, and a dropped row is invisible forever. Still async at
+    // every call site so the trading loop never blocks on it; a final drop is now LOGGED, not silent.
     async copyReport(trade) {
-      try { await fetch(`${base}/api/v1/copy-trade`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify({ trade }) }); } catch { /* observability only */ }
+      for (let i = 0; i < 3; i++) {
+        try {
+          const r = await fetch(`${base}/api/v1/copy-trade`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify({ trade }) });
+          if (r.ok) return;
+        } catch { /* retry below */ }
+        if (i < 2) await new Promise((res) => setTimeout(res, 1_500 * (i + 1)));
+      }
+      console.error(`[copy-report] DROPPED after 3 tries: ${trade.action} ${trade.outcome} $${trade.size_usd} · ${String(trade.market_question || "").slice(0, 40)}`);
     },
 
     // Report a placed order to Cosmos: records the $0.09 fee and returns whether the daily

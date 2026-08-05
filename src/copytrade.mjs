@@ -340,6 +340,17 @@ function targetUsd(sig, unit, portfolio) {
 
 export function startCopyTrade(deps) {
   const { pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state } = deps;
+  // WHY-NO-ORDER TELEMETRY (gate-funnel audit 2026-08-05): 3,036 server-APPROVED signals died
+  // silently inside the fleet's bots in 48h - every refusal logged only to Fly, invisible from the
+  // DB. Count each refusal reason here (numbers normalised to # so "target $3.20" and "target
+  // $4.10" share a bucket); bot.mjs flushes the map through the heartbeat every ~15 min and the
+  // server lands it in scan_runs as source='bot-skips'.
+  const skipCounts = new Map();
+  state.copySkips = skipCounts;
+  const bumpSkip = (why) => {
+    const key = String(why).replace(/[0-9$.]+/g, "#").slice(0, 40);
+    skipCounts.set(key, (skipCounts.get(key) ?? 0) + 1);
+  };
   const recentBuy = new Map(); // cid -> ts (settle-window cooldown; also throttles scale-in cadence)
   const seen = loadSeen();     // (cid#token) -> ts of first OPEN — never re-open (persisted)
   const buyTimes = [];         // sliding-window rate limit
@@ -494,7 +505,7 @@ export function startCopyTrade(deps) {
     let { target } = sizeFor(sig, unitBasis, state.portfolio);
     // TRACE EVERY REFUSAL (deep-check forensics): the server logs every verdict, but the bot refused
     // silently — 38 approved markets got no order in 24h and NOTHING said why. One line per skip.
-    const skip = (why) => log(`copytrade fast-skip ${sig.category} ${sig.outcome}: ${why} · ${String(sig.market_question || "").slice(0, 32)}`);
+    const skip = (why) => { bumpSkip(why); log(`copytrade fast-skip ${sig.category} ${sig.outcome}: ${why} · ${String(sig.market_question || "").slice(0, 32)}`); };
     if (!(target > 0)) return skip("beats=0 (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " vs avg $" + Math.round(Number(sig.wallets?.[0]?.avg_trade_usd) || 0) + ")");
     // pre-kickoff window is the LEGACY model; one-shot buys in-play behind the gap band instead
     if (!ONESHOT && sportsWindowClosed(sig)) return skip(`pre-game window closed (<${SPORTS_MIN_LEFT_MIN}m to kickoff)`);
