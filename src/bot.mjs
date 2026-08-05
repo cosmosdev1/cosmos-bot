@@ -1135,17 +1135,28 @@ function maybeSelfUpdate() {
     execSync(`git fetch --depth 1 origin ${ref}`, { stdio: "ignore", timeout: 20000 });
     const local = execSync("git rev-parse HEAD", { timeout: 5000 }).toString().trim();
     const remote = execSync("git rev-parse FETCH_HEAD", { timeout: 5000 }).toString().trim();
+    // SHARED-CHECKOUT RACE (2026-08-05): all hosted children run from ONE checkout. The first
+    // child whose timer fired reset the checkout to the new commit and restarted - after which
+    // every OTHER child compared disk HEAD == FETCH_HEAD, concluded "up to date", and kept running
+    // the OLD code from memory indefinitely (observed: 13 of 25 children stranded on 12a8a59
+    // while the disk said bfa8373). What must be compared against the remote is what THIS PROCESS
+    // is running - BUILD_SHA, resolved at boot - not what the disk happens to hold. Hosted only:
+    // a self-hosted machine is one bot per checkout, where disk==process and the old comparison
+    // is exact; keeping it there keeps legacy byte-identical.
+    const running = HOSTED && BUILD_SHA !== "unknown" ? BUILD_SHA : local;
     if (local && remote && local !== remote) {
       execSync("git reset --hard FETCH_HEAD", { stdio: "ignore", timeout: 20000 });
+    }
+    if (running && remote && remote !== running && !remote.startsWith(running)) {
       // Exit ONLY when a launcher is there to restart us (entrypoint.sh / the install loops set
       // COSMOS_LAUNCHER=1). A bare `node src/bot.mjs` (old local installs) has no restarter -
       // exiting killed the bot until someone noticed. There we keep RUNNING on the old code
       // (the new code is on disk and applies on the next manual restart).
       if (process.env.COSMOS_LAUNCHER === "1") {
-        log(`self-update ${local.slice(0, 7)} -> ${remote.slice(0, 7)}; restarting via launcher`);
+        log(`self-update ${running.slice(0, 7)} -> ${remote.slice(0, 7)}; restarting via launcher`);
         process.exit(0);
       }
-      log(`self-update pulled ${local.slice(0, 7)} -> ${remote.slice(0, 7)}; no launcher detected - restart the bot to apply`);
+      log(`self-update pulled ${running.slice(0, 7)} -> ${remote.slice(0, 7)}; no launcher detected - restart the bot to apply`);
     }
   } catch { /* git unavailable (local dev) or a transient failure - ignore, retry next window */ }
 }
