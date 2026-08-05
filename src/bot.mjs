@@ -638,14 +638,20 @@ async function maybeStartEngines(settings, pm, cosmos) {
   const stopWhy = settings.bot_enabled === false ? "you pressed Stop in the dashboard"
     : halted ? "signed FLEET HALT"
     : "drawdown breaker: portfolio >30% below its 12h high (entries resume on recovery)";
-  const wantQt = engineOn("QTABLE2_ENABLED", settings.qtable2) && !stopped;
+  // HOSTED IS COPY-ONLY (owner 2026-08-05). A hosted user picked wallets in the dashboard; his
+  // money must trade those wallets and nothing else. The 08-03..08-05 audit measured qtable2 at
+  // -$96/3d on hosted accounts - more than every copy-engine leak combined - and top5/quant were
+  // positions no user chose. Existing engine positions keep their exits (TP/mirror/salvage run on
+  // held positions regardless of engine flags); only NEW entries stop. Legacy self-hosted bots
+  // (HOSTED=false) are untouched.
+  const wantQt = !HOSTED && engineOn("QTABLE2_ENABLED", settings.qtable2) && !stopped;
   const wantCopy = (process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true) && !stopped;
-  const wantCert = engineOn("CERT15_ENABLED", settings.cert15) && !stopped;
+  const wantCert = !HOSTED && engineOn("CERT15_ENABLED", settings.cert15) && !stopped;
   // Announce every transition. A silently-disabled engine is the failure this whole block exists to
   // prevent: without these lines the only symptom is "the bot stopped trading" with no explanation.
   for (const [name, want, reason] of [
-    ["qtable2", wantQt, stopped ? stopWhy : engineReason("QTABLE2_ENABLED", settings.qtable2)],
-    ["cert15", wantCert, stopped ? stopWhy : engineReason("CERT15_ENABLED", settings.cert15)],
+    ["qtable2", wantQt, stopped ? stopWhy : HOSTED ? "hosted accounts are copy-only" : engineReason("QTABLE2_ENABLED", settings.qtable2)],
+    ["cert15", wantCert, stopped ? stopWhy : HOSTED ? "hosted accounts are copy-only" : engineReason("CERT15_ENABLED", settings.cert15)],
     ["copytrade", wantCopy, stopped ? stopWhy : settings.copytrade === true ? "" : "server flag off"],
   ]) {
     if (qtState[name] !== undefined && qtState[name] !== want) {
@@ -963,6 +969,11 @@ async function cycle(cosmos, pm) {
 
     for (const s of feed.signals) {
       if (!s.condition_id) continue;
+      // HOSTED IS COPY-ONLY (owner 2026-08-05): every buy on a hosted account goes through the
+      // copytrade engine's own loop against the user's picked wallets. The main feed - quant
+      // strikes, weather ladders, server sports, top5 - must never open a position the user did
+      // not choose. No markSeen: if this account ever stops being hosted, the signals are intact.
+      if (HOSTED && s.source !== "copytrade") continue;
       if (seen[s.condition_id] || positions[s.condition_id] || heldCids.has(s.condition_id)) continue; // already evaluated / held (any side)
       if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break; // full — leave for when a slot frees
 
@@ -1185,7 +1196,7 @@ async function main() {
   // so "edge" selected model error (fleet -18.6% in 24h; the corrected model showed the real
   // edge was <4pp on 78% of fills). Re-enable ONLY with a conditionally-refit table via
   // QTABLE_ENABLED=1. Open qtable positions still exit normally (TP/salvage/resolution).
-  if (process.env.QTABLE_ENABLED === "1") {
+  if (process.env.QTABLE_ENABLED === "1" && !HOSTED) {   // hosted accounts are copy-only (2026-08-05)
     startQTable({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
 
