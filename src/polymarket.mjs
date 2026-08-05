@@ -25,8 +25,13 @@ const GAMMA = "https://gamma-api.polymarket.com";
 // USDC on Polygon: bridged USDC.e (Polymarket's collateral) + native USDC. We read the funder's USDC
 // on-chain (authoritative, never stale, correct wallet) and only fall back to the CLOB's cached
 // balance if the on-chain read is ~0 - matching the whales-radar portfolio_sizer approach.
+// pUSD FIRST (incident 2026-08-05). Polymarket migrated its collateral to its own token, and a
+// modern deposit wallet holds nothing but pUSD - so reading only USDC.e answered a truthful $0 and
+// the bot sized every entry off "no cash". Ten hosted accounts holding $2,445 between them were
+// invisible this way, one of them $1,213, one $907. Read all three and take the largest.
 const USDC_ADDRESSES = [
-  "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e (bridged) - Polymarket collateral
+  "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", // pUSD - Polymarket USD (current collateral)
+  "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e (bridged) - legacy collateral
   "0x3c499c542cEF5E3811e1192ce70d8cc03d5c3359", // native USDC
 ];
 const ERC20_BALANCE_ABI = [{
