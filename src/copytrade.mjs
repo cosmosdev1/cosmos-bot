@@ -626,6 +626,22 @@ export function startCopyTrade(deps) {
     let feed;
     try { feed = await cosmos.copySignals(); } catch (e) { warn("copytrade feed:", e.message); return; }
     const signals = feed?.signals ?? [];
+    // PUBLISH THE EXIT LADDER FROM THE FEED (DB-load fix 2026-08-06). Every signal row already
+    // carries sell_seq, and the bot polls this feed every 20s - so bot.mjs can skip its per-position
+    // /copy-exit call whenever the feed proves the ladder has not advanced past what the position
+    // already executed. That call was the single heaviest load on the platform: 6 queries x every
+    // open position x every cycle x every bot (~3,840 q/min fleet-wide, 9,600 at 25 positions).
+    // Absent/stale keys are NOT skipped - the exit route stays authoritative for anything the feed
+    // does not cover (inactive signals after a full exit, filtered rows).
+    {
+      const m = state.copySeq instanceof Map ? state.copySeq : new Map();
+      for (const s2 of signals) {
+        if (!s2?.condition_id) continue;
+        m.set(`${s2.condition_id}|${String(s2.outcome ?? "").toLowerCase()}`, { seq: Number(s2.sell_seq) || 0, at: Date.now() });
+      }
+      if (m.size > 4000) m.clear();
+      state.copySeq = m;
+    }
     if (!signals.length) return;
     if (ONESHOT) { await refreshMyWallets(); if (!myWallets) return; }
     const positions = store.load();

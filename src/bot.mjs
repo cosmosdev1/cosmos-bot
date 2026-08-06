@@ -528,6 +528,16 @@ async function copyExitStep(cosmos, pm, positions, pos) {
       if (!rw.held) warn("exit-resolution sell failed (will retry next cycle):", rw.status);
     }
   }
+  // FEED-GATED (DB-load fix 2026-08-06): the polled copy feed publishes each signal's sell_seq into
+  // qtState.copySeq every ~20s. When a FRESH feed entry shows the ladder has not moved past what we
+  // already executed, the verdict cannot be anything but HOLD - so don't spend a request (and its 6
+  // queries) to be told so. Anything the feed does not cover, or covers staler than 90s, still asks
+  // the server, so exits can never be missed because of this optimisation.
+  {
+    const fk = `${pos.condition_id}|${String(pos.outcome ?? "").toLowerCase()}`;
+    const fs = qtState.copySeq instanceof Map ? qtState.copySeq.get(fk) : null;
+    if (fs && Date.now() - fs.at < 90_000 && fs.seq <= (Number(pos.copy_seq) || 0)) return false;
+  }
   let d = null;
   try { d = await cosmos.copyExit(pos); }
   catch (e) { warn("copy-exit:", e.message); return false; }
