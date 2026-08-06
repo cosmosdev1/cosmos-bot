@@ -483,12 +483,14 @@ async function copyExitStep(cosmos, pm, positions, pos) {
   // (fail-safe HOLD) must never park a 98c position. Legacy bots (ONESHOT off) are untouched.
   const isOneShot = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "");
   let cur = null;
+  let tp98Tried = false;
   if (isOneShot) {
     cur = await pm.getPriceCents(pos.token_id);
     // entry+1 must be REACHABLE (audit 2026-08-05): a 99c entry can never fill above itself (price
     // caps at 99), so attempting only burns a paid signature - hold; resolution pays 100 anyway.
     if (cur != null && cur >= 98 && (Number(pos.entry_cents) || 0) + 1 <= 99) {
       const r98 = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT", (Number(pos.entry_cents) || 0) + 1);
+      tp98Tried = !r98.held;   // `held` = refused before placing (bid under the floor): no signature spent
       if (r98.ok) {
         const soldShares = Number(r98.meta?.size) > 0 ? Number(r98.meta.size) : pos.size_shares;
         const soldCents = Number(r98.meta?.price) > 0 ? Number(r98.meta.price) : (r98.sellPrice ?? r98.mid ?? cur);
@@ -508,8 +510,12 @@ async function copyExitStep(cosmos, pm, positions, pos) {
     // at 99c (unreachable entry+1 floor) and books that only firm up after the event ends. Sports
     // end_date is kickoff, so "ended + 99c" = a decided game - locking 99c now beats waiting out
     // the redemption sweep and frees cash for the next signal.
+    // NOT in the same cycle the 98c branch already spent signatures on (QA 2026-08-06): the gate
+    // caps a trade at 2 SIGNED orders per 24h, and marketableSell re-prices per attempt - running
+    // both layers back-to-back can exhaust that budget in one cycle and leave the position
+    // unsellable for a day. `tp98Tried` is set only when the 98c path actually placed something.
     const endedMs = Date.parse(pos.end_date && pos.end_date !== "none" ? pos.end_date : "");
-    if (Number.isFinite(endedMs) && endedMs < Date.now() && cur != null && cur >= 99) {
+    if (!tp98Tried && Number.isFinite(endedMs) && endedMs < Date.now() && cur != null && cur >= 99) {
       const rw = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT", 99);
       if (rw.ok) {
         const soldShares = Number(rw.meta?.size) > 0 ? Number(rw.meta.size) : pos.size_shares;

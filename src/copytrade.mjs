@@ -161,10 +161,17 @@ const hisAvgCents = (sig) => {
   const c = (cost / sh) * 100;
   return Number.isFinite(c) && c >= 1 && c <= 99 ? c : null;
 };
-const tooFarFromHisEntry = (sig, px) => {
+// QA 2026-08-06: this used to be handed priceFor()'s return value - the FAK CEILING (current+5c),
+// not the price we pay - so the +5c inflation alone blew the 20% test on every cheap market: 27% of
+// live signals were refused, and 15% were refused at the whale's OWN price (his avg 19c, market 20c
+// -> "32% away"). Compare the executable mid, and floor the tolerance at 5c so spread/rounding on a
+// single-digit-cent market can never trip a percentage rule.
+const tooFarFromHisEntry = (sig, execCents) => {
   if (sig.is_pair) return false;
   const avg = hisAvgCents(sig);
-  return avg != null && Math.abs(px - avg) / avg > COPY_GAP_REL;
+  if (avg == null || !(execCents > 0)) return false;
+  const tol = Math.max(avg * COPY_GAP_REL, 5);
+  return Math.abs(execCents - avg) > tol;
 };
 const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position (owner 2026-08-04: enter at 3%, that is it)
 // PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
@@ -362,6 +369,7 @@ export function startCopyTrade(deps) {
   // server lands it in scan_runs as source='bot-skips'.
   const skipCounts = new Map();
   state.copySkips = skipCounts;
+  const lastMid = new Map();   // token -> last mid read by priceFor (see the gap guard below)
   // BUDGET CIRCUIT-BREAKER (incident 2026-08-06): with the exposure cap gone, bots reach the cloud
   // gate's rolling-24h ceiling (100% of portfolio in gross buys - the drain-defense hard floor) and
   // then every NEW signal fired a fresh sign request: 999 denials/90min hammered /api/cloud/sign
@@ -383,6 +391,8 @@ export function startCopyTrade(deps) {
   async function priceFor(tokenId, capCents, floorCents) {
     const mid = await pm.getPriceCents(tokenId);
     if (mid == null) return null;
+    lastMid.set(tokenId, mid);   // the executable price; priceFor RETURNS the FAK ceiling, not this
+
     if (mid > capCents) return null;                    // market is above our cap -> don't chase it
     if (mid < floorCents) return null;                  // penny leg -> spread eats any edge; skip
     // FAK limit = the vetted CAP, not mid+1 (deep-check #5). A FAK's limit price is a CEILING — the fill
@@ -587,7 +597,8 @@ export function startCopyTrade(deps) {
     const band = inPlayBand(sig, cap, floor);            // in-play (hosted): within ±20c of HIS avg entry
     const px = await priceFor(sig.token_id, band.cap, band.floor);
     if (px == null) return skip("price out of band (cap " + band.cap + "c)");
-    if (ONESHOT && tooFarFromHisEntry(sig, px)) return skip("price " + px + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
+    const execC = lastMid.get(sig.token_id) ?? px;
+    if (ONESHOT && tooFarFromHisEntry(sig, execC)) return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
   }
@@ -687,7 +698,7 @@ export function startCopyTrade(deps) {
         const band = inPlayBand(sig, cap, floor);          // in-play (hosted): within ±20c of HIS avg entry
         const px = await priceFor(sig.token_id, band.cap, band.floor);
         if (px == null) continue;
-        if (ONESHOT && tooFarFromHisEntry(sig, px)) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
+        if (ONESHOT && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px)) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
       }
