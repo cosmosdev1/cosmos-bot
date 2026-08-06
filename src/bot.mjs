@@ -500,6 +500,27 @@ async function copyExitStep(cosmos, pm, positions, pos) {
       if (!r98.held) warn("exit-98c sell failed (will retry next cycle):", r98.status);
       // fall through to advice on failure - the position still needs managing
     }
+    // RESOLUTION-WINNER BACKUP (owner 2026-08-06, "another layer on top of the 98c exit"): the
+    // market's end time has PASSED and our side reads as the winner (mid >= 99c) -> sell ALL with a
+    // hard 99c floor, whatever the entry. Winners-only by construction: a losing side reads ~0-1c
+    // and never trips the 99c gate, so losers are never touched; a bid under 99c simply holds (the
+    // floor refuses it) and resolution pays 100c. Covers the two holes the 98c TP leaves: entries
+    // at 99c (unreachable entry+1 floor) and books that only firm up after the event ends. Sports
+    // end_date is kickoff, so "ended + 99c" = a decided game - locking 99c now beats waiting out
+    // the redemption sweep and frees cash for the next signal.
+    const endedMs = Date.parse(pos.end_date && pos.end_date !== "none" ? pos.end_date : "");
+    if (Number.isFinite(endedMs) && endedMs < Date.now() && cur != null && cur >= 99) {
+      const rw = await marketableSell(cosmos, pm, pos, "TAKE_PROFIT", 99);
+      if (rw.ok) {
+        const soldShares = Number(rw.meta?.size) > 0 ? Number(rw.meta.size) : pos.size_shares;
+        const soldCents = Number(rw.meta?.price) > 0 ? Number(rw.meta.price) : (rw.sellPrice ?? rw.mid ?? cur);
+        store.save(positions);
+        cosmos.copyReport({ wallet: pos.copy_wallet, condition_id: pos.condition_id, outcome: pos.outcome, category: pos.copy_category, action: "SELL", shares: soldShares, price_cents: soldCents, size_usd: Number(((soldShares * soldCents) / 100).toFixed(2)), market_question: pos.market_question }).catch(() => {});
+        log(`COPY exit-resolution: sold ALL ${pos.outcome} @ ~${soldCents}c (ended market, winning side)`);
+        return true;
+      }
+      if (!rw.held) warn("exit-resolution sell failed (will retry next cycle):", rw.status);
+    }
   }
   let d = null;
   try { d = await cosmos.copyExit(pos); }
