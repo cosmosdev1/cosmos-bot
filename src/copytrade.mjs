@@ -151,6 +151,21 @@ const BEATS = N("COPY_BEATS", 5);                 // 5 beats -> 20% each
 // flip it back once Turnkey Enterprise pricing makes per-signature cost negligible).
 // ---------------------------------------------------------------------------------------------
 const ONESHOT = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "");
+// RELATIVE ENTRY GAP (owner 2026-08-06): never buy when our fill price sits more than 20% (relative)
+// away from the whale's own average entry - "if we want to buy at 90c but the whale bought at 65c,
+// it's too late". Applies to every one-shot entry, both directions; pair legs exempt (hedge mirror).
+const COPY_GAP_REL = (() => { const v = Number(process.env.COPY_GAP_REL); return Number.isFinite(v) && v > 0 ? v : 0.20; })();
+const hisAvgCents = (sig) => {
+  const cost = Number(sig.his_cost_usd), sh = Number(sig.his_shares);
+  if (!(cost > 0) || !(sh > 0)) return null;
+  const c = (cost / sh) * 100;
+  return Number.isFinite(c) && c >= 1 && c <= 99 ? c : null;
+};
+const tooFarFromHisEntry = (sig, px) => {
+  if (sig.is_pair) return false;
+  const avg = hisAvgCents(sig);
+  return avg != null && Math.abs(px - avg) / avg > COPY_GAP_REL;
+};
 const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position (owner 2026-08-04: enter at 3%, that is it)
 // PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
 // small on a ~$24 test account). The economics set this number, not caution: a hosted signature
@@ -512,7 +527,10 @@ export function startCopyTrade(deps) {
 
     if ((recentBuy.get(sig.condition_id) ?? 0) > Date.now() - COOLDOWN_MS) return skip("cooldown");
     if (target < MIN_ORDER_USD) return skip("target $" + target.toFixed(2) + " < $1 min");
-    if (openCopy >= MAX_OPEN) return skip("MAX_OPEN " + openCopy);
+    // NO POSITION-COUNT / EXPOSURE LIMITS in one-shot (owner 2026-08-06: "delete this rule - we just
+    // look at 3% of the total portfolio"). Sizing (3%, $4 floor, 7% per-position cap), buy-once-ever,
+    // cash itself and the 30/h rate brake are the remaining guards. Legacy keeps both caps.
+    if (!ONESHOT && openCopy >= MAX_OPEN) return skip("MAX_OPEN " + openCopy);
     if (rateLimited()) return skip("rate limit " + MAX_BUYS_PER_HOUR + "/h");
     const primary = positions[sig.condition_id];
     const sameSide = (p) => p && String(p.outcome).toLowerCase() === String(sig.outcome).toLowerCase();
@@ -532,7 +550,7 @@ export function startCopyTrade(deps) {
       // Never let one position grow past the per-position ceiling, whatever the target says.
       let add = Math.min(target, posCeil) - held;
       if (add < MIN_ADD_USD) return;                              // at/over the ceiling or fully sized (steady-state)
-      if (copyExposure(positions) + add > exposureCap) return skip("exposure cap (add $" + add.toFixed(2) + ")");
+      if (!ONESHOT && copyExposure(positions) + add > exposureCap) return skip("exposure cap (add $" + add.toFixed(2) + ")");
       const px = await priceFor(sig.token_id, addCapFor(sig), MIN_ADD_CENTS);
       if (px == null) return skip("add price out of band");
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
@@ -545,7 +563,7 @@ export function startCopyTrade(deps) {
     if (seen[seenKey]) return skip("buy-once-ever");
     target = Math.min(target, posCeil);                          // per-position ceiling on the opening clip too
     if (target < MIN_ORDER_USD) return skip("per-position cap below $1 min");
-    if (copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
+    if (!ONESHOT && copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
     const capMax = String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS;   // sports band 3-99c (owner 2026-07-15)
     const cap = sig.is_pair
       ? Math.min(99, Number(sig.max_entry_cents) || 99)
@@ -554,6 +572,7 @@ export function startCopyTrade(deps) {
     const band = inPlayBand(sig, cap, floor);            // in-play (hosted): within ±20c of HIS avg entry
     const px = await priceFor(sig.token_id, band.cap, band.floor);
     if (px == null) return skip("price out of band (cap " + band.cap + "c)");
+    if (ONESHOT && tooFarFromHisEntry(sig, px)) return skip("price " + px + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
   }
@@ -628,7 +647,7 @@ export function startCopyTrade(deps) {
       } else {
         target = Math.min(target, posCeil);                             // per-position ceiling on the opening clip
         if (target < MIN_ORDER_USD) continue;                           // first beat not reached (or capped below $1)
-        if (openCopy >= MAX_OPEN) continue;
+        if (!ONESHOT && openCopy >= MAX_OPEN) continue;
         if (rateLimited()) continue;
         // pick the store key: free primary slot -> cid; primary holds the OPPOSITE side -> composite key
         // (hold both). Primary holds the SAME side already (any engine) -> don't stack, skip.
@@ -638,7 +657,7 @@ export function startCopyTrade(deps) {
         // salvage->cooldown->re-buy loop that shoveled $148 into one dying candle side.
         const seenKey = `${sig.condition_id}#${sig.token_id}`;
         if (seen[seenKey]) continue;
-        if (copyExposure(positions) + target > exposureCap) continue;   // copytrade never exceeds its slice
+        if (!ONESHOT && copyExposure(positions) + target > exposureCap) continue;   // legacy only - one-shot has no exposure cap (owner 2026-08-06)
         // NEW ENTRY: hard 92c cap + 10c floor (owner + blowup forensics).
         // PAIR LEG (is_pair): the whale holds BOTH sides — we mirror both, so this leg is half of a
         // hedge, not a directional bet. The 92c cap and 10c floor DON'T apply: a 96c/3c pair is a good
@@ -652,6 +671,7 @@ export function startCopyTrade(deps) {
         const band = inPlayBand(sig, cap, floor);          // in-play (hosted): within ±20c of HIS avg entry
         const px = await priceFor(sig.token_id, band.cap, band.floor);
         if (px == null) continue;
+        if (ONESHOT && tooFarFromHisEntry(sig, px)) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
       }
