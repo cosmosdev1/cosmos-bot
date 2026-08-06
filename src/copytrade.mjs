@@ -362,6 +362,14 @@ export function startCopyTrade(deps) {
   // server lands it in scan_runs as source='bot-skips'.
   const skipCounts = new Map();
   state.copySkips = skipCounts;
+  // BUDGET CIRCUIT-BREAKER (incident 2026-08-06): with the exposure cap gone, bots reach the cloud
+  // gate's rolling-24h ceiling (100% of portfolio in gross buys - the drain-defense hard floor) and
+  // then every NEW signal fired a fresh sign request: 999 denials/90min hammered /api/cloud/sign
+  // into 5xx and starved the DB. A day/hour-budget denial now pauses ALL copy entries for
+  // COPY_BUDGET_PAUSE_MIN (default 30) - the window is rolling, so capacity frees continuously and
+  // one probe per pause window is enough. Exits are never paused.
+  let budgetPausedUntil = 0;
+  const BUDGET_PAUSE_MS = (Number(process.env.COPY_BUDGET_PAUSE_MIN) > 0 ? Number(process.env.COPY_BUDGET_PAUSE_MIN) : 30) * 60_000;
   const bumpSkip = (why) => {
     const key = String(why).replace(/[0-9$.]+/g, "#").slice(0, 40);
     skipCounts.set(key, (skipCounts.get(key) ?? 0) + 1);
@@ -424,7 +432,13 @@ export function startCopyTrade(deps) {
       recentBuy.set(sig.condition_id, Date.now() - COOLDOWN_MS + 5_000);
       // Log the REASON, not just the status: "open failed: 400" hid that the local risk governor
       // (not Polymarket) was refusing every buy for two days (2026-07-26 incident).
-      warn(`copytrade ${kind} failed: ${String(r.body?.polymarket?.error ?? r.error ?? r.err ?? r.status ?? "").slice(0, 120)}`); return false;
+      const why = String(r.body?.polymarket?.error ?? r.error ?? r.err ?? r.status ?? "");
+      if (r.cloudCode === "day_budget" || r.cloudCode === "hour_budget" || /exceed the (daily|hourly) budget/i.test(why)) {
+        budgetPausedUntil = Date.now() + BUDGET_PAUSE_MS;
+        bumpSkip("budget-paused");
+        warn(`copytrade BUDGET reached (${r.cloudCode || "budget"}) - pausing ALL entries ${Math.round(BUDGET_PAUSE_MS / 60000)}min (rolling window frees capacity; exits unaffected)`);
+      }
+      warn(`copytrade ${kind} failed: ${why.slice(0, 120)}`); return false;
     }
     stats.fills++;
     cosmos.meter({ ...r.meta, source: "copytrade" }).catch(() => {}); // fire-and-forget: the trading loop must NEVER block on the metering relay (a hung await here froze tick() for 12.5h on 07-21)
@@ -505,6 +519,7 @@ export function startCopyTrade(deps) {
 
   async function fastOpen(sig) {
     if (state.copytrade === false) return;
+    if (Date.now() < budgetPausedUntil) return;   // budget breaker: no entries until the window frees
     // The fast path IS the whale-fill path. A bot that only has the adopt flag must never take one.
     if (state.copyFills === false) return;
     if (state.cash == null || state.sizing == null) return;      // no cycle data yet -> can't size
@@ -595,6 +610,7 @@ export function startCopyTrade(deps) {
 
   async function tick() {
     if (state.copytrade === false) return;                       // server turned the engine off -> stop trading
+    if (Date.now() < budgetPausedUntil) return;                  // budget breaker: no entries until the window frees
     if (state.cash == null || state.sizing == null) return;      // no cycle data yet
     let feed;
     try { feed = await cosmos.copySignals(); } catch (e) { warn("copytrade feed:", e.message); return; }
