@@ -98,15 +98,28 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
   // BOUNDED RETRY (owner 2026-07-19, "never miss an event"): a transient copy-check failure (network
   // blip, cold start, 5xx) used to DROP the fill from the fast path entirely — the cron's slow path
   // would re-find it ~6min later, which on a pre-game window entry can be the whole edge. Retry the
-  // check up to 3 times with short backoff; a real REFUSAL (res.ok === false) is final, not retried.
+  // check up to 3 times with backoff; a real REFUSAL (res.ok === false) is final, not retried.
+  //
+  // STORM BREAKER (DB-saturation 2026-08-07). When the SERVER is the thing failing, 34 bots each
+  // retrying 3x within ~1.2s is the documented self-amplifying collapse: slow DB -> timeouts ->
+  // triple the requests -> slower DB. Two changes, both bot-side so no fill is ever lost:
+  //   * backoff is 1.5s/6s (not 400/800ms) — a recovering server sees a trickle, not a volley;
+  //   * after 3 consecutive FAILED checks (errors, not refusals) the fast path stands down for
+  //     60s and lets the cron's slow path carry — it re-finds every fill ~6min later anyway.
+  let checkFails = 0, standdownUntil = 0;
   async function onFill(w, tokenId, shares, l) {
+    if (Date.now() < standdownUntil) return;   // server is struggling — slow path covers this fill
     const t0 = Date.now();
     let res;
     for (let a = 0; ; a++) {
-      try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); break; }
+      try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); checkFails = 0; break; }
       catch (e) {
-        if (a >= 2) { warn(`chainwatch check failed ${a + 1}x (giving up; slow path covers):`, e.message); return; }
-        await new Promise((r) => setTimeout(r, 400 * (a + 1)));
+        if (a >= 2) {
+          if (++checkFails >= 3) { standdownUntil = Date.now() + 60_000; warn("chainwatch: 3 checks failed in a row - fast path stands down 60s (slow path covers)"); }
+          else warn(`chainwatch check failed ${a + 1}x (giving up; slow path covers):`, e.message);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 1500 * Math.pow(4, a)));
       }
     }
     const ms = Date.now() - t0;
