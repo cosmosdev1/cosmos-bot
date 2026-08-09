@@ -149,18 +149,35 @@ function riskRecordBuy(usd) { spendLog.push({ t: Date.now(), usd }); if (spendLo
 //   { shares: 0 }           fill fields present and zero: the FAK was killed with NOTHING filled
 //   null                    no readable fill info in the response (caller falls back + flags it)
 // Units are validated, never assumed: the amounts are documented as human-decimal strings, but if a
-// raw read violates the hard invariants (filled ≤ requested, price inside 0-100c) we retry the read
-// as 1e6 base units; if neither interpretation is sane we return null rather than guess.
-function extractFill(resp, side, reqShares) {
+// raw read violates the hard invariants we retry the read as 1e6 base units; if neither
+// interpretation is sane we return null rather than guess.
+//
+// WHICH LEG IS CAPPED DEPENDS ON THE SIDE (fixed 2026-08-09). The old code capped SHARES on both
+// sides ("filled ≤ requested"). That is true for a SELL — we cannot deliver more shares than we
+// offered — but FALSE for a BUY: a marketable FAK buy commits reqShares × limit in USDC and spends
+// all of it, so whenever it matches BELOW the limit it hands back MORE shares than requested. The
+// share cap therefore rejected precisely the price-improved (i.e. successful) buys, fell through to
+// null, and the caller ledgered the INTENT — the requested size at the limit price. Dollars stayed
+// exact while share counts ran ~7% low, and because lib/bot-pnl.ts marks losers at 0c and winners at
+// 100c, the missing shares only ever subtracted from WINNERS: real profits displayed as losses.
+// A BUY's true ceiling is the USDC leg — never more than we committed. (Note the price-sanity check
+// cannot discriminate units on its own: div cancels out of usd/shares, so priceC is identical for
+// both readings. The magnitude cap is the ONLY unit discriminator, which is why each side needs the
+// correct one rather than a shared approximation.)
+function extractFill(resp, side, reqShares, limitCents) {
   const t = Number(resp?.takingAmount), m = Number(resp?.makingAmount);
   if (!Number.isFinite(t) || !Number.isFinite(m)) return null;
   if (t === 0 && m === 0) return { shares: 0 };
+  // What a BUY can spend: the committed USDC. Without a usable limit, a share can never cost more
+  // than $1, so reqShares dollars is always a valid (looser) ceiling.
+  const usdCap = Number.isFinite(limitCents) && limitCents > 0 ? reqShares * (limitCents / 100) : reqShares;
   for (const div of [1, 1e6]) {
     const shares = (side === "SELL" ? m : t) / div;   // the shares leg of the fill
     const usd = (side === "SELL" ? t : m) / div;      // the USDC leg of the fill
     if (!(shares > 0) || !(usd > 0)) continue;
     const priceC = (usd / shares) * 100;
-    if (shares <= reqShares * 1.001 && priceC >= 0.1 && priceC <= 100.5) {
+    const withinCap = side === "SELL" ? shares <= reqShares * 1.001 : usd <= usdCap * 1.001;
+    if (withinCap && priceC >= 0.1 && priceC <= 100.5) {
       const sh = Math.round(shares * 100) / 100;      // 2dp — matches Polymarket's share precision
       // Sub-0.005-share dust = effectively nothing filled — but only trust that verdict from the
       // primary human-units reading. In the 1e6 fallback a "dust" result is more likely a misparse,
@@ -595,7 +612,7 @@ export async function makePolymarket(config) {
           // fill, and turn a zero-fill kill into ok:false so no phantom trade is ever recorded.
           meta.req_size = size;               // shares we ASKED for
           meta.limit_price = priceCents;      // the FAK cap we signed (cents)
-          const fill = resp ? extractFill(resp, side, size) : null;
+          const fill = resp ? extractFill(resp, side, size, priceCents) : null;
           if (!fill) {
             meta.fill_unknown = true;         // response carried no readable fill info — report the request, flagged, never guessed
           } else if (!(fill.shares > 0)) {

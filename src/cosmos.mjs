@@ -162,14 +162,34 @@ export function makeCosmos(config) {
     // Report a placed order to Cosmos: records the $0.09 fee and returns whether the daily
     // spend limit has been reached (paused). The order itself is posted directly to Polymarket
     // by the bot — Cosmos never touches keys or funds.
+    //
+    // RETRIES x3 (2026-08-09), the same hardening copyReport() got after the 2026-08-05 ledger
+    // audit. This is the ONLY writer of bot_orders, and every call site swallows its result, so a
+    // single dropped request lost the row forever. Reconciliation against Polymarket found hosted
+    // accounts logging barely half their SELL legs — and a dropped sell is the expensive one: the
+    // shares stay "held" in lib/bot-pnl.ts and get marked at resolution (usually 0c) instead of at
+    // the real exit price, turning a 97c profitable exit into a displayed total loss. A final drop
+    // is LOGGED, never silent. Still awaited only where it already was; callers that fire-and-forget
+    // keep doing so, so the trading loop never blocks on the relay.
     async meter(meta) {
-      try {
-        const res = await fetch(`${base}/api/v1/orders`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify({ meta }) });
-        const d = await res.json().catch(() => ({}));
-        return { ok: res.ok, paused: Boolean(d.paused), spent_today: d.spent_today, daily_limit: d.daily_limit };
-      } catch {
-        return { ok: false, paused: false };
+      for (let i = 0; i < 3; i++) {
+        try {
+          const res = await fetch(`${base}/api/v1/orders`, { method: "POST", headers, signal: AbortSignal.timeout(8_000), body: JSON.stringify({ meta }) });
+          if (res.ok) {
+            const d = await res.json().catch(() => ({}));
+            return { ok: true, paused: Boolean(d.paused), spent_today: d.spent_today, daily_limit: d.daily_limit };
+          }
+          // 4xx = the server rejected this payload; retrying re-sends the same body to the same
+          // verdict. Only 5xx / transport failures are worth another attempt.
+          if (res.status < 500) {
+            const d = await res.json().catch(() => ({}));
+            return { ok: false, paused: Boolean(d.paused), spent_today: d.spent_today, daily_limit: d.daily_limit };
+          }
+        } catch { /* transport failure - retry below */ }
+        if (i < 2) await new Promise((res) => setTimeout(res, 1_500 * (i + 1)));
       }
+      console.error(`[meter] DROPPED after 3 tries: ${meta?.side} ${meta?.size}sh @ ${meta?.price}c token ${String(meta?.market || "").slice(0, 12)}…`);
+      return { ok: false, paused: false };
     },
 
     // Report the bot's live sizing basis (cash/deployed/portfolio + config) so the admin can SEE why
