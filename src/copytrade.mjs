@@ -310,13 +310,21 @@ function candleTarget(sig, portfolio) {
   return { target: (portfolio * pct) / 100, ceiling: (portfolio * 4.5) / 100, beats: pct ? 1 : 0, beatUsd: 0, candle: true, pct };
 }
 
-const ONESHOT_MIN_PORTFOLIO_USD = N("COPY_MIN_PORTFOLIO_USD", 75); // owner 2026-08-04: under \$75, no entries at all
+const ONESHOT_MIN_PORTFOLIO_USD = N("COPY_MIN_PORTFOLIO_USD", 55); // owner 2026-08-11: was \$75
 
 function targetUsd(sig, unit, portfolio) {
-  // HOSTED FLOOR (owner 2026-08-04): a portfolio under \$75 places NO entries - candle or whale.
+  // HOSTED FLOOR (owner 2026-08-04, lowered to \$55 on 2026-08-11): a portfolio under the floor
+  // places NO entries - candle or whale. `portfolio` is cash + open-positions value (bot.mjs),
+  // so the floor is measured on the WHOLE account, not just idle cash.
+  //
+  // NOT a latch: this runs on every entry decision, so an account that dips under the floor simply
+  // stops opening new positions and resumes the moment its total climbs back above it. Exits are
+  // unaffected (this sizes entries only), so a bot below the floor can still close what it holds -
+  // which is what lets the balance recover on its own.
+  //
   // Bot-side so the fleet does not burn sign-gate calls on orders the gate would refuse anyway;
-  // the gate enforces the same line server-side. Exits are unaffected (this sizes entries only),
-  // and legacy self-hosted bots (ONESHOT off) are untouched.
+  // the app warns on the same line (MIN_PORTFOLIO_USD in lib/portfolio-floor.ts - keep them equal).
+  // Legacy self-hosted bots (ONESHOT off) are untouched.
   if (ONESHOT && !(portfolio >= ONESHOT_MIN_PORTFOLIO_USD)) return { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
   if (CANDLE_ENGINE && isCandleSig(sig)) return candleTarget(sig, portfolio);
   if (ONESHOT) return oneShotTarget(sig, portfolio);
