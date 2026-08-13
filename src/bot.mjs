@@ -704,6 +704,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   qtState.copytrade = wantCopy;
   qtState.cert15 = wantCert;
   qtState.copyFills = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;   // may we copy his live FILLS?
+  // TIERED COPY v2: server-delivered so one Vercel flip moves the WHOLE fleet (hosted + legacy) in
+  // a cycle. The local env var stays as a dev override.
+  qtState.strategyV2 = settings.strategy_v2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");
   // AFFILIATE ROTATION: the server resolves this user's referrer -> active affiliate -> builder code
   // + tier slot count (k orders per 36 carry the affiliate's code; base 7 = 0.35%, up to 20 = 1.00%).
   try { pm.setAffiliateCode?.(settings.affiliate_code || null, settings.affiliate_slots); } catch { /* advisory */ }

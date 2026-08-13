@@ -508,12 +508,14 @@ export function startCopyTrade(deps) {
   // his top 10/20/30% closed positions; 15m+hourly candles 4/3/2 off his top 25/50/75%). Under v2
   // the bot sizes EVERY signal at that pct of the TOTAL portfolio (cash + positions), floor $2 -
   // no median one-shot, no beats, no candle engine. pct null/0 = the server said no entry.
-  const V2 = /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");
+  // Live state, not a boot-time constant: the server delivers strategy_v2 every cycle (bot.mjs),
+  // so the fleet switches without restarts. Env stays as a dev override.
+  const V2 = () => state.strategyV2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");
   const V2_FLOOR_USD = Number(process.env.COPY_V2_FLOOR_USD) || 2;
   // Crypto cash reserve: the LAST 10% of the portfolio is crypto-only. A NON-candle buy needs cash
   // >= 10% of portfolio before it and may not take cash under 6% after. Candles spend freely.
   function v2ReserveBlocked(sig, amountUsd) {
-    if (!V2 || isCandleSig(sig)) return false;
+    if (!V2() || isCandleSig(sig)) return false;
     const port = state.portfolio || 0, cash = state.cash ?? 0;
     if (!(port > 0)) return false;
     if (cash < port * 0.10) return "cash under the 10% crypto reserve";
@@ -521,7 +523,7 @@ export function startCopyTrade(deps) {
     return false;
   }
   function sizeFor(sig, unitBasis, portfolio) {
-    if (V2) {
+    if (V2()) {
       const pct = Number(sig.tier_pct_resolved);
       if (!Number.isFinite(pct) || pct <= 0) return { target: 0, beats: null };
       return { target: Math.max(V2_FLOOR_USD, (portfolio || 0) * (pct / 100)), beats: null };
@@ -600,7 +602,10 @@ export function startCopyTrade(deps) {
     const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // hard ceiling for THIS market
     const mine = primary && sameSide(primary) ? primary : (positions[compKey]?.source === "copytrade" ? positions[compKey] : null);
     if (mine) {
-      if (ONESHOT && !V2) return;   // one-shot never follows him up; v2 DOES - tier escalation IS the top-up
+      if (ONESHOT && !V2()) return;  // one-shot never follows him up; v2 DOES - tier escalation IS the top-up
+      // NEVER REBUY AFTER AN EXIT (owner 2026-08-13): once ANY mirror-sell fired on this signal,
+      // adds are dead for good - a top-up after our own exit would buy back what we just sold.
+      if (V2() && (Number(sig.sell_seq) || 0) > 0) return skip("no adds after an exit (v2)");
       const held = Number(mine.size_usd) || 0;
       // Never let one position grow past the per-position ceiling, whatever the target says.
       let add = Math.min(target, posCeil) - held;
@@ -708,7 +713,8 @@ export function startCopyTrade(deps) {
       // Same $1 floor as the fast path: 5% of a sub-$20 portfolio is below the exchange minimum.
       const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // per-position ceiling (owner incident 2026-07-22)
       if (mine) {
-        if (ONESHOT && !V2) continue;   // v2 tops up to the escalated tier target
+        if (ONESHOT && !V2()) continue;   // v2 tops up to the escalated tier target
+        if (V2() && (Number(sig.sell_seq) || 0) > 0) continue;   // never rebuy after an exit (v2)
         const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
         if (add < MIN_ADD_USD) continue;                                // at the ceiling or no transition worth an order
         if (rateLimited()) continue;
