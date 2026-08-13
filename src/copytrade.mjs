@@ -503,7 +503,29 @@ export function startCopyTrade(deps) {
   // minutes fresher. Buy-once-ever means the slow feed re-delivering it later is a no-op.
   // What do we put into THIS signal? Beats for a new position he just opened; a flat 1% for one we are
   // adopting (he is already in it, at roughly this price).
+  // ---- STRATEGY v2 (COPY_STRATEGY_V2, owner 2026-08-13) ------------------------------------------
+  // The server stamps tier_pct_resolved from the whale's OWN percentile tiers (non-crypto 5/3/2 off
+  // his top 10/20/30% closed positions; 15m+hourly candles 4/3/2 off his top 25/50/75%). Under v2
+  // the bot sizes EVERY signal at that pct of the TOTAL portfolio (cash + positions), floor $2 -
+  // no median one-shot, no beats, no candle engine. pct null/0 = the server said no entry.
+  const V2 = /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");
+  const V2_FLOOR_USD = Number(process.env.COPY_V2_FLOOR_USD) || 2;
+  // Crypto cash reserve: the LAST 10% of the portfolio is crypto-only. A NON-candle buy needs cash
+  // >= 10% of portfolio before it and may not take cash under 6% after. Candles spend freely.
+  function v2ReserveBlocked(sig, amountUsd) {
+    if (!V2 || isCandleSig(sig)) return false;
+    const port = state.portfolio || 0, cash = state.cash ?? 0;
+    if (!(port > 0)) return false;
+    if (cash < port * 0.10) return "cash under the 10% crypto reserve";
+    if (cash - amountUsd < port * 0.06) return "buy would breach the 6% reserve floor";
+    return false;
+  }
   function sizeFor(sig, unitBasis, portfolio) {
+    if (V2) {
+      const pct = Number(sig.tier_pct_resolved);
+      if (!Number.isFinite(pct) || pct <= 0) return { target: 0, beats: null };
+      return { target: Math.max(V2_FLOOR_USD, (portfolio || 0) * (pct / 100)), beats: null };
+    }
     // ONE-SHOT SIZES EVERYTHING (deep audit 2026-08-04, the fleet's root cause). The SPORTS branch
     // below intercepted every sports signal BEFORE targetUsd, so the median one-shot never ran for
     // the fleet's dominant category - sports sized off tier_pct_resolved with a hardcoded fallback
@@ -578,7 +600,7 @@ export function startCopyTrade(deps) {
     const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // hard ceiling for THIS market
     const mine = primary && sameSide(primary) ? primary : (positions[compKey]?.source === "copytrade" ? positions[compKey] : null);
     if (mine) {
-      if (ONESHOT) return;      // one-shot: we are already in, and we never follow him up
+      if (ONESHOT && !V2) return;   // one-shot never follows him up; v2 DOES - tier escalation IS the top-up
       const held = Number(mine.size_usd) || 0;
       // Never let one position grow past the per-position ceiling, whatever the target says.
       let add = Math.min(target, posCeil) - held;
@@ -586,6 +608,7 @@ export function startCopyTrade(deps) {
       if (!ONESHOT && copyExposure(positions) + add > exposureCap) return skip("exposure cap (add $" + add.toFixed(2) + ")");
       const px = await priceFor(sig.token_id, addCapFor(sig), MIN_ADD_CENTS);
       if (px == null) return skip("add price out of band");
+      { const rb = v2ReserveBlocked(sig, add); if (rb) return skip(rb); }
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
       if (ok) buyTimes.push(Date.now());
       return;
@@ -607,6 +630,7 @@ export function startCopyTrade(deps) {
     if (px == null) return skip("price out of band (cap " + band.cap + "c)");
     const execC = lastMid.get(sig.token_id) ?? px;
     if (ONESHOT && tooFarFromHisEntry(sig, execC)) return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
+    { const rb = v2ReserveBlocked(sig, target); if (rb) return skip(rb); }
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
   }
@@ -684,7 +708,7 @@ export function startCopyTrade(deps) {
       // Same $1 floor as the fast path: 5% of a sub-$20 portfolio is below the exchange minimum.
       const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // per-position ceiling (owner incident 2026-07-22)
       if (mine) {
-        if (ONESHOT) continue;    // one-shot: we are already in, and we never follow him up
+        if (ONESHOT && !V2) continue;   // v2 tops up to the escalated tier target
         const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
         if (add < MIN_ADD_USD) continue;                                // at the ceiling or no transition worth an order
         if (rateLimited()) continue;
@@ -693,6 +717,7 @@ export function startCopyTrade(deps) {
         // ±20c-of-his-entry band (addCapFor); only non-adopt whale-fill adds ride to the flat cap.
         const px = await priceFor(sig.token_id, addCapFor(sig), MIN_ADD_CENTS);
         if (px == null) continue;
+        if (v2ReserveBlocked(sig, add)) continue;
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
         if (ok) buyTimes.push(Date.now());
       } else {
@@ -723,6 +748,7 @@ export function startCopyTrade(deps) {
         const px = await priceFor(sig.token_id, band.cap, band.floor);
         if (px == null) continue;
         if (ONESHOT && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px)) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
+        if (v2ReserveBlocked(sig, target)) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
       }
