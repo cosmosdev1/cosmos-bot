@@ -291,7 +291,9 @@ async function edgeExit(pm, pos) {
   // a 3c salvage would spend a signature to sell something already near worthless, and the owner
   // explicitly accepted that downside in exchange for the cheaper, whale-driven exit.
   const ONESHOT_COPY = /^(1|true|yes|on)$/i.test(process.env.COSMOS_ONESHOT || "") && pos.source === "copytrade";
-  const tpC = ONESHOT_COPY ? HZ("COPY_ONESHOT_TP_CENTS", 98)
+  // v2 raises the copy TP to 99c (owner 2026-08-16, dry-run finding: entries near 98c were TP'd
+  // straight back out at a guaranteed fee loss; 99c narrows the wash band). v1 keeps 98c.
+  const tpC = ONESHOT_COPY ? HZ("COPY_ONESHOT_TP_CENTS", qtState.strategyV2 === true ? 99 : 98)
     : pos.source === "quant" || pos.source === "qtable" ? HZ("QUANT_TP_CENTS", 99) : pos.source === "weather" ? HZ("WEATHER_TP_CENTS", 98) : 97;
   // A take-profit must actually PROFIT: the trigger is the mid, but the fill is the BID. A 97c-entry
   // whose mid hits 98 with a 95c bid used to "lock the win" at -2c (audited: repeated tiny losses).
