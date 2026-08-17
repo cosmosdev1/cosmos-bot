@@ -34,6 +34,9 @@ const SECRET = process.env.RUNNER_SECRET || "";
 // with 600MB reserved for OS + runner. RUNNER_MAX still overrides when set explicitly.
 const derivedMax = Math.max(4, Math.floor((os.totalmem() / 1048576 - 600) / 80));
 const MAX = Number(process.env.RUNNER_MAX) || derivedMax;
+// Boot ramp: children started per reconcile pass (~60s apart). 8/pass fills a 48-slot box in ~6
+// minutes while keeping the platform's boot load flat. Env-tunable for a cold-start hurry.
+const RAMP = Number(process.env.RUNNER_SPAWN_RAMP) || 8;
 const DATA_ROOT = (process.env.COSMOS_DATA_DIR || "/data").replace(/\/$/, "");
 const POLL_MS = 60_000;
 const BOT = join(dirname(fileURLToPath(import.meta.url)), "bot.mjs");
@@ -44,11 +47,17 @@ if (!SECRET) { console.error("[runner] RUNNER_SECRET is required"); process.exit
 const kids = new Map();
 const log = (...a) => console.log(new Date().toISOString(), "[runner]", ...a);
 
+// SHARDING (scale build Inc 1.3, 2026-08-17): RUNNER_SHARD="i/N" gives this VM a disjoint,
+// stable slice of the fleet (hashed server-side on user_id). Unset = the whole fleet, as before.
+// Capacity now grows by adding VMs instead of raising one box's cap.
+const SHARD = /^\d+\/\d+$/.test(process.env.RUNNER_SHARD || "") ? process.env.RUNNER_SHARD : "";
+
 async function roster() {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 20_000); // deadline rule: a hung poll must not wedge the loop
   try {
-    const r = await fetch(`${API}/api/cloud/runner/roster`, { headers: { "x-runner-secret": SECRET }, signal: ctl.signal });
+    const url = `${API}/api/cloud/runner/roster${SHARD ? `?shard=${encodeURIComponent(SHARD)}` : ""}`;
+    const r = await fetch(url, { headers: { "x-runner-secret": SECRET }, signal: ctl.signal });
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
     return Array.isArray(j?.accounts) ? j.accounts : null;
@@ -138,14 +147,25 @@ async function reconcile() {
   // COUNT the starvation instead of break-ing blind (scale build Inc 0.5): every deferred account
   // is user money with no manager, and that must page, not whisper in a Fly log.
   let running = [...kids.values()].filter((k) => k.child).length;
-  let deferred = 0;
+  let deferred = 0, startedThisPass = 0;
   for (const [userId, a] of want) {
     const rec = kids.get(userId);
     if (rec?.child) continue;                          // running
     if (rec && rec.retryAt && Date.now() < rec.retryAt) continue; // crash backoff
     if (running >= MAX) { deferred++; continue; }
-    start(a); running++;
+    // SPAWN RAMP (scale build Inc 1.3, 2026-08-17): a deploy or a cold start used to launch EVERY
+    // child in one pass - each booting child immediately hits /v1/account, /signals, the CLOB and
+    // the sign path, and that synchronized herd is what 5xx'd the platform on 2026-08-05. Ramp:
+    // at most RAMP children per reconcile pass (~60s apart), each with a small random boot delay
+    // so even within a pass they do not fire in lockstep. This ONLY affects boot; a running bot's
+    // trading loop and the <1s chainwatch fast path are untouched.
+    if (startedThisPass >= RAMP) { continue; }         // next pass takes the rest (not a deferral)
+    startedThisPass++;
+    const jitter = Math.floor(Math.random() * 4000);
+    setTimeout(() => { if (!kids.get(userId)?.child) start(a); }, jitter).unref();
+    running++;
   }
+  if (startedThisPass >= RAMP) log(`spawn ramp: started ${startedThisPass} this pass, more next pass`);
   if (deferred > 0) {
     log(`ALARM: ${deferred} runnable account(s) deferred at MAX=${MAX} - money with no manager`);
     alertPlatform(`runner at capacity: ${deferred} account(s) deferred (MAX=${MAX})`, deferred);
