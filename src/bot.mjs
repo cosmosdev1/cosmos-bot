@@ -925,6 +925,12 @@ async function cycle(cosmos, pm) {
   // Precompute the "Cosmos AI" exit verdicts for ALL positions in ONE batch call (was one POST per
   // position -> a per-token 429 storm that force-sold held positions at -50%).
   const adviceMap = await batchAdvice(cosmos, settings, Object.values(positions));
+  // BATCH THE PRICE READS TOO (scale build Inc 1.12, 2026-08-17): one getMidpoints call primes
+  // every open position's mid for this pass, instead of one CLOB round trip per position per
+  // cycle (the heaviest load we put on the exchange, and the audit's ceiling #16 - throttled
+  // price reads stop take-profits and salvages fleet-wide). Purely additive: on ANY failure the
+  // cache stays empty and each position falls back to its own read, exactly as before.
+  await pm.primeMidpoints?.(Object.values(positions).map((p) => p.token_id)).catch?.(() => {});
   let endDateLookups = 0; // cap the per-cycle gamma lookups for the horizon stop
   for (const key of Object.keys(positions)) {
     const pos = positions[key];
@@ -1066,7 +1072,7 @@ async function cycle(cosmos, pm) {
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
       if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; } // transient — retry
 
-      const mid = await pm.getPriceCents(tokenId);
+      const mid = await pm.getPriceCents(tokenId, { fresh: true });   // ENTRY: never a cached price
       if (mid == null) { warn("no live price:", (s.market_question || "").slice(0, 50)); continue; } // don't enter at a stale price — retry
       if (mid > s.max_entry_price) {
         // Ran past the entry cap. For ENGINE sources this is NOT a permanent decision: their markets

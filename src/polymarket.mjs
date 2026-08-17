@@ -391,6 +391,10 @@ export async function makePolymarket(config) {
   let client = sigType === SignatureTypeV2.POLY_1271 && depositCreds ? mkClientFor(sigType, depositCreds) : mkClient(sigType);
 
   const tokenCache = new Map();
+  // Midpoint cache fed by primeMidpoints() (scale build Inc 1.12). Deliberately SHORT: exit
+  // decisions must price off a live book, so this only collapses the reads of ONE cycle pass.
+  const midCache = new Map();
+  const MID_TTL_MS = Number(process.env.MID_CACHE_TTL_MS) || 4000;
 
   return {
     address,
@@ -520,12 +524,52 @@ export async function makePolymarket(config) {
       }
     },
 
-    // Current mid price in cents (null if unavailable).
-    async getPriceCents(tokenId) {
+    // BATCH PRIME (scale build Inc 1.12, 2026-08-17). The exit pass reads one midpoint PER OPEN
+    // POSITION PER CYCLE - at 20 positions x 2 cycles/min that is 40 CLOB round trips a minute
+    // from ONE bot, and at fleet scale it is the heaviest load we put on the exchange (the audit's
+    // ceiling #16: throttled price reads make take-profits and salvages stop firing fleet-wide).
+    // getMidpoints() answers the whole set in ONE request. This primes a short-lived cache that
+    // getPriceCents reads; ANY failure just leaves the cache empty and every caller falls back to
+    // its own per-token request exactly as before - so the exit path can never depend on it.
+    async primeMidpoints(tokenIds) {
+      const ids = [...new Set((tokenIds || []).filter(Boolean).map(String))];
+      if (ids.length < 2) return 0;                       // one position: no batching win
+      try {
+        const rows = await client.getMidpoints(ids.map((token_id) => ({ token_id })));
+        const now = Date.now();
+        let n = 0;
+        // The endpoint answers either a map {tokenId: "0.42"} or an array of {token_id, mid}.
+        if (rows && !Array.isArray(rows) && typeof rows === "object") {
+          for (const [k, v] of Object.entries(rows)) {
+            const p = Number(v?.mid ?? v);
+            if (p > 0) { midCache.set(String(k), { at: now, cents: Math.round(p * 100) }); n++; }
+          }
+        } else if (Array.isArray(rows)) {
+          for (const r of rows) {
+            const p = Number(r?.mid ?? r?.price ?? 0);
+            const id = String(r?.token_id ?? r?.asset_id ?? "");
+            if (id && p > 0) { midCache.set(id, { at: now, cents: Math.round(p * 100) }); n++; }
+          }
+        }
+        return n;
+      } catch {
+        return 0;                                          // fall back to per-token reads
+      }
+    },
+
+    // Current mid price in cents (null if unavailable). Serves from the batch prime when fresh -
+    // EXITS ONLY. Pass {fresh:true} to force a live read: ENTRY paths (the max_entry_price cap and
+    // copytrade's priceFor) must never size or gate money-in off a cached price, however short the
+    // window. Exits are safe on it because every sell still confirms against a LIVE best bid.
+    async getPriceCents(tokenId, opts) {
+      const hit = opts?.fresh ? null : midCache.get(String(tokenId));
+      if (hit && Date.now() - hit.at < MID_TTL_MS) return hit.cents;
       try {
         const mid = await client.getMidpoint(tokenId);
         const p = Number(mid?.mid ?? 0);
-        return p > 0 ? Math.round(p * 100) : null;
+        const cents = p > 0 ? Math.round(p * 100) : null;
+        if (cents != null) midCache.set(String(tokenId), { at: Date.now(), cents });
+        return cents;
       } catch {
         return null;
       }

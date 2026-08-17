@@ -397,7 +397,7 @@ export function startCopyTrade(deps) {
   let alive = true;
 
   async function priceFor(tokenId, capCents, floorCents) {
-    const mid = await pm.getPriceCents(tokenId);
+    const mid = await pm.getPriceCents(tokenId, { fresh: true });   // ENTRY: never a cached price
     if (mid == null) return null;
     lastMid.set(tokenId, mid);   // the executable price; priceFor RETURNS the FAK ceiling, not this
 
