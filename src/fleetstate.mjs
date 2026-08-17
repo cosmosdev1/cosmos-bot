@@ -19,8 +19,21 @@ const PUBKEY = crypto.createPublicKey({
 });
 // Out-of-band URL, overridable but defaults to this repo's raw main. Poll is independent of the git
 // pull, so a halt lands in <=POLL seconds, not the 10-min code-update window.
-const URL = process.env.COSMOS_FLEETSTATE_URL || "https://raw.githubusercontent.com/cosmosdev1/cosmos-bot/main/FLEETSTATE";
+// MIRRORS (scale build Inc 1.13, 2026-08-17). One URL meant the kill switch got WEAKER as the
+// fleet grew: at 10K bots polling every 45s that is ~222 req/s at raw.githubusercontent.com, and
+// a throttle there means the signed HALT stops propagating at exactly the fleet size where an
+// incident hurts most. Any number of mirrors can be listed (COSMOS_FLEETSTATE_URLS, comma-
+// separated); they are tried in a rotating order until one returns a VALID SIGNED document.
+// Adding mirrors adds no trust: every document is Ed25519-verified against the offline owner key
+// baked into this git-pulled source, and the ts replay guard rejects an older state - so a
+// hostile or stale mirror can neither forge a resume nor roll us back.
+const URLS = (process.env.COSMOS_FLEETSTATE_URLS || process.env.COSMOS_FLEETSTATE_URL ||
+  "https://raw.githubusercontent.com/cosmosdev1/cosmos-bot/main/FLEETSTATE")
+  .split(",").map((s) => s.trim()).filter(Boolean);
 const POLL_MS = (Number(process.env.COSMOS_FLEETSTATE_SECONDS) || 45) * 1000;
+// Jitter the poll so a fleet restart does not turn into a synchronized stampede on the mirrors
+// (the audit's thundering-herd class: every fixed timer in the fleet fires in the same second).
+const jitter = () => POLL_MS * (0.85 + Math.random() * 0.3);
 
 const DIR = process.env.COSMOS_DATA_DIR ? process.env.COSMOS_DATA_DIR.replace(/\/$/, "") : join(homedir(), ".cosmos");
 try { mkdirSync(DIR, { recursive: true }); } catch { /* best-effort */ }
@@ -54,14 +67,31 @@ function apply(text) {
 }
 
 let started = false;
+let rot = Math.floor(Math.random() * 1e6);          // per-process mirror rotation offset
 export function startFleetStateWatch(log) {
   if (started) return; started = true;
   const tick = async () => {
-    try {
-      const r = await fetch(URL, { signal: AbortSignal.timeout(8000), cache: "no-store" });
-      if (r.ok) { const before = state.halt; apply(await r.text()); if (state.halt !== before) (log || console.log)(`[fleetstate] ${state.halt ? "HALT" : "RESUME"} — ${state.reason || "(no reason)"} (ts ${state.ts})`); }
-    } catch { /* unreachable -> keep last state; never fail a cycle over this */ }
+    // Try mirrors in a rotating order; stop at the first one that yields a VALID SIGNED doc, so
+    // the normal cost stays one request per poll and a dead mirror only costs one extra try.
+    const order = URLS.map((_, i) => URLS[(rot + i) % URLS.length]);
+    rot++;
+    for (const url of order) {
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(8000), cache: "no-store" });
+        if (!r.ok) continue;
+        const before = state.halt, beforeTs = state.ts;
+        apply(await r.text());
+        if (state.ts !== beforeTs || state.halt !== before) {
+          if (state.halt !== before) (log || console.log)(`[fleetstate] ${state.halt ? "HALT" : "RESUME"} — ${state.reason || "(no reason)"} (ts ${state.ts})`);
+          return;                                    // a valid doc was applied - done for this tick
+        }
+        return;                                      // valid but unchanged (the common case)
+      } catch { /* try the next mirror */ }
+    }
+    // Every mirror unreachable -> keep the last state. Fail-open on AVAILABILITY is deliberate:
+    // blocking the URL must never be able to freeze the fleet, and never able to resume it either.
   };
   tick();
-  setInterval(tick, POLL_MS).unref?.();
+  const schedule = () => setTimeout(() => { tick().finally(schedule); }, jitter()).unref?.();
+  schedule();
 }
