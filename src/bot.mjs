@@ -411,6 +411,20 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS", minCents = 
   // anywhere else. Consequence worth knowing: if both signed sells fail to fill, this position
   // cannot be sold again until the 24h window rolls (the cap counts only SIGNED orders in the last
   // 24h, so denials and kills never lock a position out).
+  // DUST GUARD (scale build, 2026-08-17). Polymarket rejects orders under $1, and the platform
+  // gate refuses them as `dust` - but the exit pass re-attempted the same unfillable sell every
+  // cycle, forever: measured live, single positions had racked up 90+ identical denials, and
+  // `dust` was 238 of one day's gate refusals fleet-wide. Each of those is a wasted round trip
+  // through auth, the risk gate and a book fetch. Nothing is lost by not asking: the position is
+  // worth under a dollar and redeems at resolution. If the price rises, notional crosses $1 and
+  // the exit resumes on its own - so this is a skip, never a permanent give-up.
+  const shares = Number(pos.size_shares) || 0;
+  // The mid comes from the cycle's batch prime (primeMidpoints), so this costs no extra round
+  // trip; entry_cents is only the fallback when the book cannot be read at all.
+  const markC = (await pm.getPriceCents(pos.token_id).catch(() => null)) ?? Number(pos.entry_cents) ?? 0;
+  if (shares > 0 && markC > 0 && (shares * markC) / 100 < 1) {
+    return { held: true, ok: false, status: 0, body: { skipped: `below the $1 exchange minimum (${shares.toFixed(2)} sh @ ${markC}c)` } };
+  }
   return withSignContext({ triggerId: randomUUID(), conditionId: pos.condition_id || "" },
     () => marketableSellInner(cosmos, pm, pos, action, minCents));
 }
