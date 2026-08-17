@@ -108,6 +108,14 @@ const entryFails = new Map(); // condition_id -> 4xx count (in-memory; a restart
 // loop. The platform gate keys idempotency on (intent + triggerId), so these retries collapse to a
 // single reservation and can never double-fill. In local mode the context is simply unused.
 async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
+  // FLEET BREAKER = ENTRIES ONLY (scale build Inc 0.2, 2026-08-17). A tripped breaker used to
+  // arrive as bot_enabled=false (the master stop) and froze EXITS at the worst possible moment.
+  // It now arrives as settings.entries_halt and is enforced HERE - the one chokepoint every
+  // engine's orders pass through: BUYs refuse definitively (no retry), SELLs always flow.
+  if (qtState.entriesHalt && String(args?.side || "").toUpperCase() === "BUY") {
+    warn("entries halted (fleet breaker) - buy suppressed; exits keep running");
+    return { ok: false, cloudDefinitive: true, cloudCode: "entries_halt", error: "entries halted (fleet breaker)" };
+  }
   return withSignContext({ triggerId: randomUUID(), conditionId: args.conditionId || "" }, async () => {
     let r;
     for (let i = 0; i < attempts; i++) {
@@ -729,6 +737,12 @@ async function cycle(cosmos, pm) {
   const account = await cosmos.account();
   const settings = account.settings;
   await maybeStartEngines(settings, pm, cosmos).catch((e) => warn("engine start:", e.message));
+
+  // ENTRIES-ONLY FLEET HALT (scale build Inc 0.2, 2026-08-17): served by /v1/account when the
+  // drawdown breaker (or the owner) trips fleet_control.halt. New buys stop at placeWithRetry;
+  // everything below - reconcile, exits, take-profits, salvage, redeems - keeps running.
+  qtState.entriesHalt = settings.entries_halt === true;
+  if (qtState.entriesHalt) log(`fleet halt (entries-only): ${settings.fleet_halt_reason || "breaker"} - no new entries; exits still managed`);
 
   // --- MASTER STOP: the dashboard Start/Stop switch. When stopped, the bot trades nothing
   // (no entries, no exits) but stays connected and re-checks every cycle, so Start resumes it. ---
