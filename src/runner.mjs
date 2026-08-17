@@ -24,10 +24,16 @@ import { spawn } from "node:child_process";
 import { mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 
 const API = (process.env.COSMOS_API || "https://try-cosmos.com").replace(/\/$/, "");
 const SECRET = process.env.RUNNER_SECRET || "";
-const MAX = Number(process.env.RUNNER_MAX) || 25;
+// CAP FROM THE MACHINE, not a stale hardcode (scale build Inc 0.5, 2026-08-17). The cap and the
+// box diverged twice (60 runnable vs cap 48, ~$1,050 of accounts silently unmanaged; and the
+// 08-05 OOM the other direction). Default = what the memory actually supports at ~80MB/child
+// with 600MB reserved for OS + runner. RUNNER_MAX still overrides when set explicitly.
+const derivedMax = Math.max(4, Math.floor((os.totalmem() / 1048576 - 600) / 80));
+const MAX = Number(process.env.RUNNER_MAX) || derivedMax;
 const DATA_ROOT = (process.env.COSMOS_DATA_DIR || "/data").replace(/\/$/, "");
 const POLL_MS = 60_000;
 const BOT = join(dirname(fileURLToPath(import.meta.url)), "bot.mjs");
@@ -129,13 +135,37 @@ async function reconcile() {
     if (!want.has(userId)) stop(userId, "no longer on the roster (halted, disabled, or wallets cleared)");
   }
 
+  // COUNT the starvation instead of break-ing blind (scale build Inc 0.5): every deferred account
+  // is user money with no manager, and that must page, not whisper in a Fly log.
+  let running = [...kids.values()].filter((k) => k.child).length;
+  let deferred = 0;
   for (const [userId, a] of want) {
     const rec = kids.get(userId);
     if (rec?.child) continue;                          // running
     if (rec && rec.retryAt && Date.now() < rec.retryAt) continue; // crash backoff
-    if ([...kids.values()].filter((k) => k.child).length >= MAX) { log(`at RUNNER_MAX=${MAX}, deferring ${userId.slice(0, 8)}`); break; }
-    start(a);
+    if (running >= MAX) { deferred++; continue; }
+    start(a); running++;
   }
+  if (deferred > 0) {
+    log(`ALARM: ${deferred} runnable account(s) deferred at MAX=${MAX} - money with no manager`);
+    alertPlatform(`runner at capacity: ${deferred} account(s) deferred (MAX=${MAX})`, deferred);
+  }
+}
+
+// Throttled alert to the platform's alarm channel (scan_runs source alarm-runner) - fire and
+// forget, never let alerting wedge the reconcile loop.
+let lastAlertAt = 0;
+function alertPlatform(note, count) {
+  if (Date.now() - lastAlertAt < 10 * 60_000) return;
+  lastAlertAt = Date.now();
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 8_000);
+  fetch(`${API}/api/cloud/runner/alert`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-runner-secret": SECRET },
+    body: JSON.stringify({ note, count }),
+    signal: ctl.signal,
+  }).catch(() => {}).finally(() => clearTimeout(t));
 }
 
 log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}`);
