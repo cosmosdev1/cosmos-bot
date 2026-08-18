@@ -413,6 +413,20 @@ async function marketableSell(cosmos, pm, pos, action = "STOP_LOSS", minCents = 
   // anywhere else. Consequence worth knowing: if both signed sells fail to fill, this position
   // cannot be sold again until the 24h window rolls (the cap counts only SIGNED orders in the last
   // 24h, so denials and kills never lock a position out).
+  // DUST GUARD (scale build, 2026-08-17). Polymarket rejects orders under $1, and the platform
+  // gate refuses them as `dust` - but the exit pass re-attempted the same unfillable sell every
+  // cycle, forever: measured live, single positions had racked up 90+ identical denials, and
+  // `dust` was 238 of one day's gate refusals fleet-wide. Each of those is a wasted round trip
+  // through auth, the risk gate and a book fetch. Nothing is lost by not asking: the position is
+  // worth under a dollar and redeems at resolution. If the price rises, notional crosses $1 and
+  // the exit resumes on its own - so this is a skip, never a permanent give-up.
+  const shares = Number(pos.size_shares) || 0;
+  // The mid comes from the cycle's batch prime (primeMidpoints), so this costs no extra round
+  // trip; entry_cents is only the fallback when the book cannot be read at all.
+  const markC = (await pm.getPriceCents(pos.token_id).catch(() => null)) ?? Number(pos.entry_cents) ?? 0;
+  if (shares > 0 && markC > 0 && (shares * markC) / 100 < 1) {
+    return { held: true, ok: false, status: 0, body: { skipped: `below the $1 exchange minimum (${shares.toFixed(2)} sh @ ${markC}c)` } };
+  }
   return withSignContext({ triggerId: randomUUID(), conditionId: pos.condition_id || "" },
     () => marketableSellInner(cosmos, pm, pos, action, minCents));
 }
@@ -440,6 +454,15 @@ async function marketableSellInner(cosmos, pm, pos, action = "STOP_LOSS", minCen
       return { mid, held: true, ok: false, status: 0, body: { skipped: "bid below TP floor" } };
     }
     sellPrice = Math.max(1, Math.min(99, Math.round(sellPrice)));
+    // DUST AT THE PRICED MOMENT (2026-08-18). The pre-flight guard in marketableSell checks
+    // shares x MID, but the order is priced at the BID - and a position that clears $1 at mid can
+    // fall under it at bid-1 (measured live: one bot, 59 identical gate `dust` denials in 2h,
+    // every cycle, through that exact gap). This is the same expression the gate denies on, so
+    // checking it here means never paying a round trip for an order that cannot be accepted.
+    // A skip, not a give-up: the price rising lifts the notional over $1 and the exit resumes.
+    if ((Number(pos.size_shares) * sellPrice) / 100 < 1) {
+      return { mid, sellPrice, held: true, ok: false, status: 0, body: { skipped: `below the $1 exchange minimum at the priced bid (${pos.size_shares} sh @ ${sellPrice}c)` } };
+    }
     const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
     if (r.ok) { try { await cosmos.meter({ ...r.meta, source: pos.source ?? null }); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
     // Definitive cloud refusal: every further attempt re-prices into another paid signature that the
@@ -930,6 +953,12 @@ async function cycle(cosmos, pm) {
   // Precompute the "Cosmos AI" exit verdicts for ALL positions in ONE batch call (was one POST per
   // position -> a per-token 429 storm that force-sold held positions at -50%).
   const adviceMap = await batchAdvice(cosmos, settings, Object.values(positions));
+  // BATCH THE PRICE READS TOO (scale build Inc 1.12, 2026-08-17): one getMidpoints call primes
+  // every open position's mid for this pass, instead of one CLOB round trip per position per
+  // cycle (the heaviest load we put on the exchange, and the audit's ceiling #16 - throttled
+  // price reads stop take-profits and salvages fleet-wide). Purely additive: on ANY failure the
+  // cache stays empty and each position falls back to its own read, exactly as before.
+  await pm.primeMidpoints?.(Object.values(positions).map((p) => p.token_id)).catch?.(() => {});
   let endDateLookups = 0; // cap the per-cycle gamma lookups for the horizon stop
   for (const key of Object.keys(positions)) {
     const pos = positions[key];
@@ -1071,7 +1100,7 @@ async function cycle(cosmos, pm) {
       const tokenId = await pm.resolveToken(s.condition_id, s.outcome);
       if (!tokenId) { warn("no token:", (s.market_question || "").slice(0, 50)); continue; } // transient — retry
 
-      const mid = await pm.getPriceCents(tokenId);
+      const mid = await pm.getPriceCents(tokenId, { fresh: true });   // ENTRY: never a cached price
       if (mid == null) { warn("no live price:", (s.market_question || "").slice(0, 50)); continue; } // don't enter at a stale price — retry
       if (mid > s.max_entry_price) {
         // Ran past the entry cap. For ENGINE sources this is NOT a permanent decision: their markets

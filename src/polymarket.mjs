@@ -32,7 +32,12 @@ const GAMMA = "https://gamma-api.polymarket.com";
 const USDC_ADDRESSES = [
   "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB", // pUSD - Polymarket USD (current collateral)
   "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e (bridged) - legacy collateral
-  "0x3c499c542cEF5E3811e1192ce70d8cc03d5c3359", // native USDC
+  // CHECKSUM FIX (2026-08-18): this address carried an invalid EIP-55 checksum ("...d8cc03..."
+  // where the correct byte is "...d8cC03..."). viem REJECTS a mis-checksummed address before any
+  // network call, and the per-token read swallows the throw as 0n - so native-USDC cash has
+  // always read as $0, silently, for every account holding it. Found only because the batched
+  // read validates all addresses up front and failed loudly where the sequential one did not.
+  "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", // native USDC
 ];
 const ERC20_BALANCE_ABI = [{
   name: "balanceOf", type: "function", stateMutability: "view",
@@ -102,7 +107,11 @@ const affSlotHit = (n, k) => Math.floor((n * k) / AFF_WINDOW) > Math.floor(((n -
 const capPct = (env, hard) => { const v = Number(process.env[env]); return Number.isFinite(v) && v > 0 ? Math.min(v, hard) : hard; };
 const MAX_TRADE_PCT = capPct("COSMOS_MAX_TRADE_PCT", 5);    // one fill: <=5% of portfolio (owner 2026-07-22)
 const MAX_HOUR_PCT  = capPct("COSMOS_MAX_HOUR_PCT", 40);    // rolling 60min buy-volume ceiling
-const MAX_DAY_PCT   = capPct("COSMOS_MAX_DAY_PCT", 100);    // rolling 24h buy-volume ceiling
+// 100 -> 250 (owner 2026-08-18): matched to the platform gate's CLOUD_MAX_DAY_PCT. These two must
+// move TOGETHER - the lower of the pair is what actually binds, so leaving the bot at 100 would
+// have self-limited every account before the gate was ever asked. Hourly stays 40%, so a day's
+// allowance still cannot be spent in one burst.
+const MAX_DAY_PCT   = capPct("COSMOS_MAX_DAY_PCT", 250);    // rolling 24h buy-volume ceiling
 const MAX_HOUR_BUYS = Math.min(Number(process.env.COSMOS_MAX_HOUR_BUYS) || 45, 45); // count backstop (legit peak ~38: copy 30 + qt 4 + cert 4)
 const MIN_FLOOR_USD = 2;                                    // never clamp a fill below the ~$1-2 min order — sub-$50 accounts must still trade
 let lastLocalPortfolio = 0;                                 // set ONLY by getBalanceUsd/getPortfolioValue (chain + Polymarket)
@@ -135,6 +144,25 @@ function riskClampBuy(sizeShares, price) {
   return { shares: Math.floor((roomUsd / price) * 100) / 100, capped: true, reason: `per-fill/${MAX_TRADE_PCT}% clamp $${wantUsd.toFixed(0)}->$${roomUsd.toFixed(0)}` };
 }
 function riskRecordBuy(usd) { spendLog.push({ t: Date.now(), usd }); if (spendLog.length > 500) spendLog = spendLog.slice(-400); spendSave(); }
+
+// ---- BALANCE READ CACHE (2026-08-18) ----
+// The cash number was re-read from the chain EVERY cycle (~30s) x3 collateral tokens = ~259k
+// on-chain calls per bot per month, and that loop - not the whale watching - was ~95% of our RPC
+// consumption. It is also pure waste: a bot's cash changes at exactly one moment, when one of its
+// own orders fills, and that moment is observable locally.
+//
+// So: serve the cached number for BAL_TTL_MS, and invalidate the instant a fill is recorded, so
+// the read after a fill is always live. NOTHING about signal speed changes - whale detection is
+// push-based (chainwatch subscribes; it does not poll) and never touched this path. Sizing was
+// already computed from an in-memory number (lastLocalPortfolio); this only changes how often
+// that memory is refreshed from the network.
+//
+// Deliberately NOT cached: the post-fill read (invalidated), and any caller passing {fresh:true}.
+// A failed read is never cached - the existing lastGoodBalance fallback still covers blips.
+const BAL_TTL_MS = Number(process.env.COSMOS_BALANCE_TTL_MS) || 300_000;   // 5 min
+let balCache = { at: 0, usd: null };
+let balInflight = null;                        // single-flight: concurrent callers share one read
+function invalidateBalanceCache() { balCache = { at: 0, usd: null }; }
 
 // ---- ACTUAL-FILL extraction (2026-07-19) ----
 // The CLOB's POST /order response (clob-client-v2 OrderResponse: { success, errorMsg, orderID,
@@ -391,6 +419,10 @@ export async function makePolymarket(config) {
   let client = sigType === SignatureTypeV2.POLY_1271 && depositCreds ? mkClientFor(sigType, depositCreds) : mkClient(sigType);
 
   const tokenCache = new Map();
+  // Midpoint cache fed by primeMidpoints() (scale build Inc 1.12). Deliberately SHORT: exit
+  // decisions must price off a live book, so this only collapses the reads of ONE cycle pass.
+  const midCache = new Map();
+  const MID_TTL_MS = Number(process.env.MID_CACHE_TTL_MS) || 4000;
 
   return {
     address,
@@ -417,19 +449,49 @@ export async function makePolymarket(config) {
     // balance endpoint silently resolves to); fall back to the CLOB's cached collateral only if
     // on-chain reads ~0; and cache the last non-zero value so a transient blip never sizes off $0.
     // (Open positions are added by the caller as `deployed` for the TRUE portfolio.)
-    async getBalanceUsd() {
+    async getBalanceUsd(opts) {
+      // Cached for BAL_TTL_MS and invalidated on every fill (see invalidateBalanceCache). Pass
+      // {fresh:true} to force a live read. Concurrent callers share one in-flight read.
+      const fresh = opts?.fresh === true;
+      if (!fresh) {
+        if (balCache.usd != null && Date.now() - balCache.at < BAL_TTL_MS) return balCache.usd;
+        if (balInflight) return balInflight;
+      }
+      const run = (async () => {
       // Read BOTH the on-chain USDC on the funder AND the CLOB deposited collateral, and size off the
       // LARGER - a user's cash can sit EITHER on-chain in the proxy OR deposited in the CLOB exchange,
       // so we must use whichever actually holds it. Record the split (balanceBreakdown) for telemetry;
       // cache last-known-good so a transient blip never sizes off $0.
       let onchain = null;
       try {
-        let sum = 0;
-        for (const token of USDC_ADDRESSES) {
-          const raw = await publicClient
-            .readContract({ address: token, abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [funder] })
-            .catch(() => 0n);
-          sum += Number(raw) / 1e6; // USDC = 6 decimals
+        // ONE batched call for all three collateral tokens instead of three sequential ones
+        // (multicall3, which viem's polygon chain config already knows). Same numbers, a third of
+        // the requests and a third of the latency. Any failure falls back to the original
+        // per-token reads, so an RPC without multicall support behaves exactly as before.
+        let sum = null;
+        try {
+          const res = await publicClient.multicall({
+            contracts: USDC_ADDRESSES.map((address) => ({ address, abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [funder] })),
+            allowFailure: true,
+          });
+          // EVERY call must succeed before the batch is believed. A partial result must NEVER be
+          // summed: a failed leg is an UNKNOWN balance, not a zero, and treating it as zero is how
+          // a funded account gets sized as broke. (Exactly what happened in testing: one
+          // mis-checksummed address failed the whole batch and would have reported $0 for an
+          // account holding $329.) Anything less than all-success falls through to the per-token
+          // path below, which has its own last-known-good protection.
+          if (Array.isArray(res) && res.length === USDC_ADDRESSES.length && res.every((r) => r?.status === "success")) {
+            sum = res.reduce((t, r) => t + Number(r.result) / 1e6, 0);
+          }
+        } catch { sum = null; }
+        if (sum == null) {
+          sum = 0;
+          for (const token of USDC_ADDRESSES) {
+            const raw = await publicClient
+              .readContract({ address: token, abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [funder] })
+              .catch(() => 0n);
+            sum += Number(raw) / 1e6; // USDC = 6 decimals
+          }
         }
         onchain = sum;
       } catch { onchain = null; }
@@ -453,8 +515,17 @@ export async function makePolymarket(config) {
       } catch { clob = null; }
       lastBalanceBreakdown = { onchain, clob };
       const best = Math.max(onchain ?? 0, clob ?? 0);
-      if (best >= 0.01) { lastGoodBalance = best; setLocalPortfolio((lastGoodValue || 0) + best); return best; }
+      if (best >= 0.01) {
+        lastGoodBalance = best; setLocalPortfolio((lastGoodValue || 0) + best);
+        balCache = { at: Date.now(), usd: best };     // cache SUCCESS only
+        return best;
+      }
+      // Both sources unreadable or genuinely empty: fall back to last-known-good and do NOT cache,
+      // so the next cycle retries the network rather than serving a blip for 5 minutes.
       return lastGoodBalance ?? 0; // never collapse sizing to 0 on a transient failure
+      })();
+      if (!fresh) balInflight = run;
+      try { return await run; } finally { if (balInflight === run) balInflight = null; }
     },
     balanceBreakdown: () => lastBalanceBreakdown,
 
@@ -520,12 +591,52 @@ export async function makePolymarket(config) {
       }
     },
 
-    // Current mid price in cents (null if unavailable).
-    async getPriceCents(tokenId) {
+    // BATCH PRIME (scale build Inc 1.12, 2026-08-17). The exit pass reads one midpoint PER OPEN
+    // POSITION PER CYCLE - at 20 positions x 2 cycles/min that is 40 CLOB round trips a minute
+    // from ONE bot, and at fleet scale it is the heaviest load we put on the exchange (the audit's
+    // ceiling #16: throttled price reads make take-profits and salvages stop firing fleet-wide).
+    // getMidpoints() answers the whole set in ONE request. This primes a short-lived cache that
+    // getPriceCents reads; ANY failure just leaves the cache empty and every caller falls back to
+    // its own per-token request exactly as before - so the exit path can never depend on it.
+    async primeMidpoints(tokenIds) {
+      const ids = [...new Set((tokenIds || []).filter(Boolean).map(String))];
+      if (ids.length < 2) return 0;                       // one position: no batching win
+      try {
+        const rows = await client.getMidpoints(ids.map((token_id) => ({ token_id })));
+        const now = Date.now();
+        let n = 0;
+        // The endpoint answers either a map {tokenId: "0.42"} or an array of {token_id, mid}.
+        if (rows && !Array.isArray(rows) && typeof rows === "object") {
+          for (const [k, v] of Object.entries(rows)) {
+            const p = Number(v?.mid ?? v);
+            if (p > 0) { midCache.set(String(k), { at: now, cents: Math.round(p * 100) }); n++; }
+          }
+        } else if (Array.isArray(rows)) {
+          for (const r of rows) {
+            const p = Number(r?.mid ?? r?.price ?? 0);
+            const id = String(r?.token_id ?? r?.asset_id ?? "");
+            if (id && p > 0) { midCache.set(id, { at: now, cents: Math.round(p * 100) }); n++; }
+          }
+        }
+        return n;
+      } catch {
+        return 0;                                          // fall back to per-token reads
+      }
+    },
+
+    // Current mid price in cents (null if unavailable). Serves from the batch prime when fresh -
+    // EXITS ONLY. Pass {fresh:true} to force a live read: ENTRY paths (the max_entry_price cap and
+    // copytrade's priceFor) must never size or gate money-in off a cached price, however short the
+    // window. Exits are safe on it because every sell still confirms against a LIVE best bid.
+    async getPriceCents(tokenId, opts) {
+      const hit = opts?.fresh ? null : midCache.get(String(tokenId));
+      if (hit && Date.now() - hit.at < MID_TTL_MS) return hit.cents;
       try {
         const mid = await client.getMidpoint(tokenId);
         const p = Number(mid?.mid ?? 0);
-        return p > 0 ? Math.round(p * 100) : null;
+        const cents = p > 0 ? Math.round(p * 100) : null;
+        if (cents != null) midCache.set(String(tokenId), { at: Date.now(), cents });
+        return cents;
       } catch {
         return null;
       }
@@ -629,6 +740,10 @@ export async function makePolymarket(config) {
             // Record the REALISED buy $ in the rolling risk ledger (actual fill, not the request) so
             // the hour/day governors bound true deployed capital. BUYS only; sells never count.
             if (side === "BUY") riskRecordBuy((fill.shares || 0) * ((fill.priceCents || priceCents) / 100));
+            // MONEY JUST MOVED -> the cached cash number is stale. Invalidating here (rather than
+            // polling on a timer) is what makes the 5-minute balance TTL safe: the very next read
+            // after any fill, on either side, goes to the chain.
+            invalidateBalanceCache();
           }
           // Carry the CLOB's own answer (orderID, tx hashes, taking/making amounts) into the meta so
           // meter() reports it and the server can audit fills against what we ledgered (the orders
