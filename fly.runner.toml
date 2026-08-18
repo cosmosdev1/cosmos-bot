@@ -26,10 +26,28 @@ primary_region = 'arn'
   # OOM-killed itself in a loop. The whole hosted fleet traded nothing for ~15 hours and every
   # heartbeat went stale, while the 9 legacy self-hosted bots (their own machines) stayed perfectly
   # healthy - which is what proved it was the box, not the code.
-  # Budget ~80MB and a real slice of CPU per child; re-scale when RUNNER_MAX grows past ~40.
-  memory = '4gb'
-  cpu_kind = 'shared'
-  cpus = 4
+  #
+  # CPU-STEAL INCIDENT 2026-08-18 - why this is `performance`, not `shared`, and must STAY that way.
+  # On shared-cpu-4x/8GB the hypervisor was taking 92.8% of our CPU back (measured: two reads of
+  # /proc/stat 5s apart showed user 6.1%, system 1.0%, idle 0%, steal 92.8%) - 87 bot children were
+  # sharing 0.28 of one core, at load average 62. Fly's shared-cpu tiers are BURSTABLE: a sustained
+  # load like ours is throttled to its small baseline. Symptoms it produced, all of which had been
+  # misread as other bugs: `cycle WEDGED: no completed cycle for 607s` restart loops, heartbeats
+  # arriving every ~8.5 min against a 30s cycle, and chainwatch vetting at 2.7s instead of ~200ms
+  # (i.e. it was directly costing copy latency). After the switch: steal 0.1%, idle 97.4%, load 1.4.
+  #
+  # MEASURE, DO NOT GUESS, before changing this:
+  #   fly ssh console -a cosmos-hosted-runner -C "sh -c 'grep ^cpu /proc/stat | head -1; sleep 10; grep ^cpu /proc/stat | head -1'"
+  #   field 8 is steal. High steal + 0% idle => throttled, buy DEDICATED cpu, never more RAM.
+  #   fly ssh console -a cosmos-hosted-runner -C "sh -c 'grep -E \"^MemTotal|^MemAvailable\" /proc/meminfo'"
+  #
+  # Memory: budget ~80MB per child (87 children measured ~5GB). 6144 was tried first and fell to
+  # 683MB available while children were still spawning - too close to the 2026-08-05 OOM, so 8192.
+  # These values are what the MACHINE actually runs; a `fly deploy` reverts the machine to whatever
+  # is written HERE, so this block and the live machine must be kept in step.
+  memory = '8gb'
+  cpu_kind = 'performance'
+  cpus = 2
 
 [env]
   COSMOS_API = 'https://try-cosmos.com'
