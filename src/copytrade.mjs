@@ -173,6 +173,29 @@ const tooFarFromHisEntry = (sig, execCents) => {
   const tol = Math.max(avg * COPY_GAP_REL, 5);
   return Math.abs(execCents - avg) > tol;
 };
+
+// ---- v2 ENTRY WINDOW (owner 2026-08-18) ----
+// A NEW position may only open when the market resolves within V2_WINDOW_H hours.
+//
+// THE WINDOW IS ENFORCED HERE, IN THE BOT, ON PURPOSE. The server used to suppress the SIGNAL for
+// far-off markets, but the sweep that would later release it re-scans a given whale only about
+// every 2.5 hours (measured: ~18 of 153 wallets per pass, passes ~6 min apart) - so with a 4-hour
+// window a market could cross the line and sit unnoticed for most of it. The bot re-reads the whole
+// feed every ~20s, so checking here IS the owner's "scan the market all the time": a market at 5h
+// is not rejected, it is simply not eligible YET, and the very next cycle after it crosses 4h it is
+// re-tested against every other condition (price gate, tier, reserve, cash) and entered if they
+// still hold. A skip never marks the signal consumed - `seen` is only written after a real buy.
+//
+// TOP-UPS ARE EXEMPT: we can only be holding because we entered INSIDE the window, and the market
+// only moves closer to resolution from there.
+const V2_WINDOW_MS = (() => { const v = Number(process.env.COPY_V2_MAX_RESOLUTION_H); return (Number.isFinite(v) && v > 0 ? v : 4) * 3600_000; })();
+const outsideV2Window = (sig) => {
+  if (!V2()) return false;
+  const end = Date.parse(String(sig.end_date ?? ""));
+  if (!Number.isFinite(end)) return false;          // unknown end date -> other gates decide, never guess
+  return end > Date.now() + V2_WINDOW_MS;
+};
+const hoursLeft = (sig) => ((Date.parse(String(sig.end_date ?? "")) - Date.now()) / 3600_000);
 const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position (owner 2026-08-04: enter at 3%, that is it)
 // PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
 // small on a ~$24 test account). The economics set this number, not caution: a hosted signature
@@ -394,7 +417,9 @@ export function startCopyTrade(deps) {
   const recentBuy = new Map(); // cid -> ts (settle-window cooldown; also throttles scale-in cadence)
   const seen = loadSeen();     // (cid#token) -> ts of first OPEN — never re-open (persisted)
   const buyTimes = [];         // sliding-window rate limit
-  const stats = { signals: 0, opens: 0, adds: 0, fills: 0 };
+  // `waiting` = signals held back ONLY by the v2 entry window. It is the number that proves the
+// wait-then-enter loop is alive: it should be large and should convert into opens as markets cross.
+  const stats = { signals: 0, opens: 0, adds: 0, fills: 0, waiting: 0 };
   let alive = true;
 
   async function priceFor(tokenId, capCents, floorCents) {
@@ -641,6 +666,9 @@ export function startCopyTrade(deps) {
     if (positions[key]) return skip("already hold this side");
     const seenKey = compKey;
     if (seen[seenKey]) return skip("buy-once-ever");
+    // NOT YET, not never: the polled loop re-tests this signal every cycle and opens it the moment
+    // it is inside the window and still clears everything else.
+    if (outsideV2Window(sig)) return skip(`v2 window: resolves in ${hoursLeft(sig).toFixed(1)}h (>${V2_WINDOW_MS / 3600_000}h)`);
     target = Math.min(target, posCeil);                          // per-position ceiling on the opening clip too
     if (target < MIN_ORDER_USD) return skip("per-position cap below $1 min");
     if (!ONESHOT && copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
@@ -653,7 +681,13 @@ export function startCopyTrade(deps) {
     const px = await priceFor(sig.token_id, band.cap, band.floor);
     if (px == null) return skip("price out of band (cap " + band.cap + "c)");
     const execC = lastMid.get(sig.token_id) ?? px;
-    if (ONESHOT && tooFarFromHisEntry(sig, execC)) return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
+    // FIRST LEG ONLY (owner 2026-08-18). A NEW position is refused when the market has moved more
+    // than 20% either way from the whale's average entry - we are too late, and buying his idea at
+    // a materially different price is not copying it. TOP-UPS ARE DELIBERATELY EXEMPT: we are
+    // already in at his price, and the add is sized off his growing conviction, so the add path
+    // above uses addCapFor() and never reaches this test. Under v2 the gate is unconditional
+    // (previously ONESHOT-only), because v2 IS the strategy - the flag no longer selects behaviour.
+    if ((ONESHOT || V2()) && tooFarFromHisEntry(sig, execC)) return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
     { const rb = v2ReserveBlocked(sig, target); if (rb) return skip(rb); }
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
@@ -746,6 +780,9 @@ export function startCopyTrade(deps) {
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
         if (ok) buyTimes.push(Date.now());
       } else {
+        // v2 entry window - the "scan all the time" path. Skipping here costs nothing: this loop
+        // runs every ~20s, so the position opens on the first cycle after the market crosses inside.
+        if (outsideV2Window(sig)) { stats.waiting++; continue; }
         target = Math.min(target, posCeil);                             // per-position ceiling on the opening clip
         if (target < MIN_ORDER_USD) continue;                           // first beat not reached (or capped below $1)
         if (!ONESHOT && openCopy >= MAX_OPEN) continue;
@@ -772,7 +809,9 @@ export function startCopyTrade(deps) {
         const band = inPlayBand(sig, cap, floor);          // in-play (hosted): within ±20c of HIS avg entry
         const px = await priceFor(sig.token_id, band.cap, band.floor);
         if (px == null) continue;
-        if (ONESHOT && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px)) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
+        // Same first-leg gate as the fast path (owner 2026-08-18): unconditional under v2, and the
+        // polled ADD path above is likewise exempt because it is already in the position.
+        if ((ONESHOT || V2()) && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px)) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
         if (v2ReserveBlocked(sig, target)) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
@@ -794,7 +833,7 @@ export function startCopyTrade(deps) {
 
   (async function run() {
     log(`copytrade: engine ON · unit=${UNIT_FRACTION}x dashboard size · exposure≤${MAX_EXPOSURE_PCT}% · ${MIN_ENTRY_CENTS}-${MAX_ENTRY_CENTS}c entries · ≤${MAX_BUYS_PER_HOUR} buys/h · max ${MAX_OPEN} open · buy-once · poll ${POLL_MS}ms${DRY ? " · DRY RUN" : ""}`);
-    const si = setInterval(() => log(`copytrade … signals ${stats.signals} · opens ${stats.opens} · adds ${stats.adds} · fills ${stats.fills}`), 120_000);
+    const si = setInterval(() => log(`copytrade … signals ${stats.signals} · opens ${stats.opens} · adds ${stats.adds} · fills ${stats.fills}${stats.waiting ? ` · waiting-for-window ${stats.waiting}` : ""}`), 120_000);
     while (alive) {
       const t0 = Date.now();
       try { await tick(); } catch (e) { warn("copytrade:", e?.message); }
