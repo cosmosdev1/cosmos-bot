@@ -32,7 +32,11 @@ const SECRET = process.env.RUNNER_SECRET || "";
 // box diverged twice (60 runnable vs cap 48, ~$1,050 of accounts silently unmanaged; and the
 // 08-05 OOM the other direction). Default = what the memory actually supports at ~80MB/child
 // with 600MB reserved for OS + runner. RUNNER_MAX still overrides when set explicitly.
-const derivedMax = Math.max(4, Math.floor((os.totalmem() / 1048576 - 600) / 80));
+// 80MB/child was a conservative guess; MEASURED 2026-08-18 on the live box it is ~39MB (88
+// children used 3.4GB above a ~600MB base). Budgeting 55MB keeps a wide margin over the measurement
+// while no longer under-provisioning a box by half - the 08-05 OOM taught the cost of being too
+// generous, and the 08-11 starvation taught the cost of being too stingy.
+const derivedMax = Math.max(4, Math.floor((os.totalmem() / 1048576 - 600) / 55));
 const MAX = Number(process.env.RUNNER_MAX) || derivedMax;
 // Boot ramp: children started per reconcile pass (~60s apart). 8/pass fills a 48-slot box in ~6
 // minutes while keeping the platform's boot load flat. Env-tunable for a cold-start hurry.
@@ -74,7 +78,12 @@ async function roster() {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 20_000); // deadline rule: a hung poll must not wedge the loop
   try {
-    const url = `${API}/api/cloud/runner/roster${SHARD ? `?shard=${encodeURIComponent(SHARD)}` : ""}`;
+    // Report our REAL cap so the platform's capacity warning can never drift from it (that mirror
+    // has been wrong in both directions before - see the roster route's note).
+    const qs = new URLSearchParams();
+    if (SHARD) qs.set("shard", SHARD);
+    qs.set("cap", String(MAX));
+    const url = `${API}/api/cloud/runner/roster?${qs.toString()}`;
     const r = await fetch(url, { headers: { "x-runner-secret": SECRET }, signal: ctl.signal });
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
