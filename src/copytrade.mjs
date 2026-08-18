@@ -385,6 +385,7 @@ export function startCopyTrade(deps) {
   // COPY_BUDGET_PAUSE_MIN (default 30) - the window is rolling, so capacity frees continuously and
   // one probe per pause window is enough. Exits are never paused.
   let budgetPausedUntil = 0;
+  let brokenStreak = 0;        // consecutive "this ACCOUNT cannot trade" refusals (see the breaker below)
   const BUDGET_PAUSE_MS = (Number(process.env.COPY_BUDGET_PAUSE_MIN) > 0 ? Number(process.env.COPY_BUDGET_PAUSE_MIN) : 30) * 60_000;
   const bumpSkip = (why) => {
     const key = String(why).replace(/[0-9$.]+/g, "#").slice(0, 40);
@@ -456,6 +457,24 @@ export function startCopyTrade(deps) {
         bumpSkip("budget-paused");
         warn(`copytrade BUDGET reached (${r.cloudCode || "budget"}) - pausing ALL entries ${Math.round(BUDGET_PAUSE_MS / 60000)}min (rolling window frees capacity; exits unaffected)`);
       }
+      // ACCOUNT-BROKEN BREAKER (2026-08-18). Some refusals are not about this trade at all - they
+      // say the ACCOUNT cannot trade until a human fixes it (an unreadable portfolio, usually a
+      // funder that does not match the enclave key). Retrying those is pure waste, and unbounded:
+      // measured live, ONE such account produced 15,622 denials in 30 hours - 6,158 in a single
+      // hour, ~1.7 per second - because every whale fill triggered another doomed attempt. It cost
+      // real serverless invocations, buried the real denial signal in the stats, and filled
+      // cloud_orders with garbage.
+      // Same 30-minute pause as the budget breaker, and for the same reason: the condition cannot
+      // clear within seconds, so asking again within seconds is never useful. EXITS ARE UNAFFECTED
+      // (this only gates entries) - a broken account must still be able to get its money out.
+      if (r.cloudCode === "no_risk_state" || r.cloudCode === "no_portfolio") {
+        if (++brokenStreak >= 3) {
+          budgetPausedUntil = Date.now() + BUDGET_PAUSE_MS;
+          bumpSkip("account-unreadable");
+          warn(`copytrade ACCOUNT UNREADABLE (${r.cloudCode}) x${brokenStreak} - pausing entries ${Math.round(BUDGET_PAUSE_MS / 60000)}min. This usually means the funder address does not match the account key; exits still run.`);
+          brokenStreak = 0;
+        }
+      } else if (r.cloudCode) { brokenStreak = 0; }   // any other verdict proves the account is readable
       warn(`copytrade ${kind} failed: ${why.slice(0, 120)}`); return false;
     }
     stats.fills++;
