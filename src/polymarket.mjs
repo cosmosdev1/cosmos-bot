@@ -102,7 +102,11 @@ const affSlotHit = (n, k) => Math.floor((n * k) / AFF_WINDOW) > Math.floor(((n -
 const capPct = (env, hard) => { const v = Number(process.env[env]); return Number.isFinite(v) && v > 0 ? Math.min(v, hard) : hard; };
 const MAX_TRADE_PCT = capPct("COSMOS_MAX_TRADE_PCT", 5);    // one fill: <=5% of portfolio (owner 2026-07-22)
 const MAX_HOUR_PCT  = capPct("COSMOS_MAX_HOUR_PCT", 40);    // rolling 60min buy-volume ceiling
-const MAX_DAY_PCT   = capPct("COSMOS_MAX_DAY_PCT", 100);    // rolling 24h buy-volume ceiling
+// 100 -> 250 (owner 2026-08-18): matched to the platform gate's CLOUD_MAX_DAY_PCT. These two must
+// move TOGETHER - the lower of the pair is what actually binds, so leaving the bot at 100 would
+// have self-limited every account before the gate was ever asked. Hourly stays 40%, so a day's
+// allowance still cannot be spent in one burst.
+const MAX_DAY_PCT   = capPct("COSMOS_MAX_DAY_PCT", 250);    // rolling 24h buy-volume ceiling
 const MAX_HOUR_BUYS = Math.min(Number(process.env.COSMOS_MAX_HOUR_BUYS) || 45, 45); // count backstop (legit peak ~38: copy 30 + qt 4 + cert 4)
 const MIN_FLOOR_USD = 2;                                    // never clamp a fill below the ~$1-2 min order — sub-$50 accounts must still trade
 let lastLocalPortfolio = 0;                                 // set ONLY by getBalanceUsd/getPortfolioValue (chain + Polymarket)
