@@ -452,6 +452,15 @@ async function marketableSellInner(cosmos, pm, pos, action = "STOP_LOSS", minCen
       return { mid, held: true, ok: false, status: 0, body: { skipped: "bid below TP floor" } };
     }
     sellPrice = Math.max(1, Math.min(99, Math.round(sellPrice)));
+    // DUST AT THE PRICED MOMENT (2026-08-18). The pre-flight guard in marketableSell checks
+    // shares x MID, but the order is priced at the BID - and a position that clears $1 at mid can
+    // fall under it at bid-1 (measured live: one bot, 59 identical gate `dust` denials in 2h,
+    // every cycle, through that exact gap). This is the same expression the gate denies on, so
+    // checking it here means never paying a round trip for an order that cannot be accepted.
+    // A skip, not a give-up: the price rising lifts the notional over $1 and the exit resumes.
+    if ((Number(pos.size_shares) * sellPrice) / 100 < 1) {
+      return { mid, sellPrice, held: true, ok: false, status: 0, body: { skipped: `below the $1 exchange minimum at the priced bid (${pos.size_shares} sh @ ${sellPrice}c)` } };
+    }
     const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
     if (r.ok) { try { await cosmos.meter({ ...r.meta, source: pos.source ?? null }); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
     // Definitive cloud refusal: every further attempt re-prices into another paid signature that the
