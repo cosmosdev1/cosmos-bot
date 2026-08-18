@@ -32,6 +32,9 @@ const WSS = (process.env.COSMOS_WSS_URLS || "wss://polygon-bor-rpc.publicnode.co
 const HTTP = (process.env.COSMOS_RPC_URL || "https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org")
   .split(",").map((s) => s.trim()).filter(Boolean);
 const WALLET_REFRESH_MS = 5 * 60_000;
+// Set ONLY by the hosted runner (src/runner.mjs). Self-hosted bots never see it, so their
+// behaviour is bit-for-bit what it was: their own socket, their own subscription.
+const HUB = process.env.COSMOS_CHAINHUB === "1" && typeof process.send === "function";
 
 async function rpc(method, params) {
   for (const url of HTTP) {
@@ -90,6 +93,10 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
       const changed = list.length !== wallets.length || list.some((w, i) => w.wallet !== wallets[i]?.wallet);
       wallets = list;
       byAddr = new Map(list.map((w) => [w.wallet, w]));
+      // In hub mode the PARENT owns the socket, so it needs our wallet set to build the union it
+      // subscribes to. Reported on every refresh; the hub debounces and only re-subscribes on a
+      // real change.
+      if (HUB) { try { process.send?.({ t: "wallets", list: list.map((w) => w.wallet) }); } catch { /* parent gone; watchdog covers */ } }
       return changed;
     } catch (e) { warn("chainwatch wallets:", e.message); return false; }
   }
@@ -265,13 +272,44 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     socket.onerror = down;
   }
 
+  // HUB MODE (Inc 1.5). The runner sets COSMOS_CHAINHUB=1 and keeps ONE socket for the whole
+  // machine, forwarding every matching log over IPC. We then open no socket of our own - which is
+  // the entire point: ~90 sockets, subscriptions and keepalives collapse to one. Filtering is
+  // unchanged, because handle() already drops any log whose recipient is not in OUR byAddr map.
+  //
+  // The danger this must not create: a hub that dies leaves every child deaf, with no error and no
+  // missing-fill alarm - the exact "looks healthy, copies nothing" failure the socket code fights
+  // everywhere else. So the hub beats every 20s, and if two minutes pass with no beat we assume it
+  // is gone and open our own socket. Falling back costs a little RPC; staying deaf costs trades.
+  const HUB_SILENCE_MS = Number(process.env.COSMOS_HUB_SILENCE_MS) || 120_000;
+  let lastBeat = 0, fellBack = false;
+  function startHubMode() {
+    lastBeat = Date.now();
+    process.on("message", (m) => {
+      if (!m || typeof m !== "object") return;
+      if (m.t === "beat") { lastBeat = Date.now(); return; }
+      if (m.t === "log" && m.log) { lastBeat = Date.now(); try { handle(m.log); } catch (e) { warn("chainwatch hub log:", e.message); } }
+    });
+    log(`chainwatch: HUB mode - ${wallets.length} wallets, socket owned by the runner`);
+    setInterval(() => {
+      if (fellBack || !isArmed()) return;
+      if (Date.now() - lastBeat > HUB_SILENCE_MS) {
+        fellBack = true;
+        warn(`chainwatch: no hub heartbeat for ${Math.round((Date.now() - lastBeat) / 1000)}s - opening our OWN socket (fallback)`);
+        connect();
+      }
+    }, 30_000).unref?.();
+  }
+
   (async function run() {
     await refreshWallets();
     if (!wallets.length) { log("chainwatch: no wallets to watch (copytrade off?)"); return; }
-    connect();
+    if (HUB) startHubMode(); else connect();
     setInterval(async () => {
       if (!isArmed()) return;
       const changed = await refreshWallets();
+      // In hub mode the parent re-subscribes for us when the union changes; closing a socket we do
+      // not own would be meaningless (and in fallback mode `ws` is ours again, so this still works).
       if (changed && ws) { try { ws.close(); } catch { /* reconnect handles it */ } }   // resubscribe with the new roster
     }, WALLET_REFRESH_MS);
     // WATCHDOG. Same reason as the confirm timeout: a watcher that is quietly not subscribed is
@@ -279,6 +317,12 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     // Say so out loud every 10 minutes, and self-heal if the subscription is gone.
     setInterval(() => {
       if (!isArmed()) return;
+      // In hub mode "subscribed" means the hub is beating; we have no socket of our own to check.
+      if (HUB && !fellBack) {
+        const age = Math.round((Date.now() - lastBeat) / 1000);
+        log(`chainwatch: alive (hub) · ${wallets.length} wallets · ${seenCount} fills seen · last hub beat ${age}s ago`);
+        return;
+      }
       if (sub) log(`chainwatch: alive · ${wallets.length} wallets · ${seenCount} fills seen`);
       else { warn("chainwatch: NOT subscribed — reconnecting"); if (ws) { try { ws.close(); } catch { /* ignore */ } } else connect(); }
     }, 10 * 60_000);

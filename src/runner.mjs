@@ -47,6 +47,24 @@ if (!SECRET) { console.error("[runner] RUNNER_SECRET is required"); process.exit
 const kids = new Map();
 const log = (...a) => console.log(new Date().toISOString(), "[runner]", ...a);
 
+// ---- SHARED CHAIN SUBSCRIPTION (Inc 1.5) ----
+// One socket for this whole box instead of one per child. Off by default so the first deploy is a
+// no-op; COSMOS_CHAINHUB=1 on the RUNNER turns it on for the children it spawns.
+const HUB_ENABLED = process.env.COSMOS_CHAINHUB === "1";
+/** userId -> string[] of wallets that child follows (reported over IPC) */
+const childWallets = new Map();
+let hub = null;
+function syncHubWallets() {
+  if (!hub) return;
+  hub.setWallets([...childWallets.values()].flat());
+}
+function broadcast(msg) {
+  for (const rec of kids.values()) {
+    if (!rec.child?.connected) continue;
+    try { rec.child.send(msg); } catch { /* a child mid-exit; its own watchdog covers it */ }
+  }
+}
+
 // SHARDING (scale build Inc 1.3, 2026-08-17): RUNNER_SHARD="i/N" gives this VM a disjoint,
 // stable slice of the fleet (hashed server-side on user_id). Unset = the whole fleet, as before.
 // Capacity now grows by adding VMs instead of raising one box's cap.
@@ -84,9 +102,18 @@ function childEnv(a) {
     COSMOS_ONESHOT: "1",
     COSMOS_NO_1271_RECOVERY: "1",
     COSMOS_DATA_DIR: join(DATA_ROOT, `u-${a.user_id}`),
+    // Inc 1.5: this box keeps ONE chain subscription and forwards logs over IPC, so the child must
+    // not open its own. Hosted-only by construction - a self-hosted bot never has this set.
+    ...(HUB_ENABLED ? { COSMOS_CHAINHUB: "1" } : {}),
   };
   delete env.POLYMARKET_PRIVATE_KEY;            // hosted children must NEVER inherit a local key
   delete env.RUNNER_SECRET;                     // and never see the fleet secret
+  // The metered endpoint belongs to the HUB alone (one socket, one keepalive). Children must not
+  // inherit it, or we are back to ~90 clients on a plan priced for one.
+  delete env.COSMOS_HUB_WSS;
+  delete env.COSMOS_HUB_RPC;
+  delete env.QUICKNODE_WSS;
+  delete env.QUICKNODE_HTTP;
   if (a.clob?.key) {
     env.CLOB_API_KEY = a.clob.key; env.CLOB_API_SECRET = a.clob.secret || ""; env.CLOB_PASSPHRASE = a.clob.passphrase || "";
   }
@@ -100,10 +127,16 @@ function childEnv(a) {
 
 function start(a) {
   try { mkdirSync(join(DATA_ROOT, `u-${a.user_id}`), { recursive: true }); } catch { /* child retries */ }
-  const child = spawn(process.execPath, [BOT], { env: childEnv(a), stdio: ["ignore", "pipe", "pipe"] });
+  // "ipc" adds a message channel (child.send / process.on("message")). It is what lets ONE socket
+  // on this box serve every child (chainhub, Inc 1.5) instead of ~90 sockets and ~90 keepalives.
+  const child = spawn(process.execPath, [BOT], { env: childEnv(a), stdio: ["ignore", "pipe", "pipe", "ipc"] });
   const tag = a.user_id.slice(0, 8);
   child.stdout.on("data", (d) => process.stdout.write(`[${tag}] ${d}`));
   child.stderr.on("data", (d) => process.stderr.write(`[${tag}] ${d}`));
+  // Children report the wallets they follow; the hub subscribes to the union of all of them.
+  child.on("message", (m) => {
+    if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); syncHubWallets(); }
+  });
   const rec = { child, startedAt: Date.now(), backoffMs: kids.get(a.user_id)?.backoffMs ?? 30_000, entry: a };
   child.on("exit", (code, sig) => {
     const uptimeS = Math.round((Date.now() - rec.startedAt) / 1000);
@@ -121,6 +154,8 @@ function stop(userId, why) {
   const rec = kids.get(userId);
   if (!rec) return;
   kids.delete(userId);
+  // Drop its wallets from the union too, or the hub keeps subscribing to whales nobody follows.
+  if (childWallets.delete(userId)) syncHubWallets();
   if (rec.child) {
     log(`stopping bot ${userId.slice(0, 8)} - ${why}`);
     rec.child.kill("SIGTERM");
@@ -188,7 +223,31 @@ function alertPlatform(note, count) {
   }).catch(() => {}).finally(() => clearTimeout(t));
 }
 
-log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}`);
+log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}${HUB_ENABLED ? ", chainhub ON" : ""}`);
+
+// Start the shared subscription BEFORE any child, so the first wallets reported find a live hub.
+// Loaded dynamically so a box with the hub off never even parses it.
+if (HUB_ENABLED) {
+  try {
+    const { startChainHub } = await import("./chainhub.mjs");
+    hub = startChainHub({
+      onLog: (l) => broadcast({ t: "log", log: l }),
+      onBeat: () => broadcast({ t: "beat" }),
+      log: (...a) => console.log(new Date().toISOString(), ...a),
+      warn: (...a) => console.warn(new Date().toISOString(), ...a),
+    });
+    setInterval(() => {
+      const s = hub.stats();
+      log(`chainhub: ${s.connected ? "connected" : "DISCONNECTED"} · ${s.wallets} wallets · ${s.delivered} logs delivered · ${kids.size} children`);
+    }, 10 * 60_000).unref?.();
+  } catch (e) {
+    // Never let a hub failure stop the fleet: with no hub the children hear no heartbeat and each
+    // opens its own socket after 2 minutes - exactly the pre-1.5 behaviour.
+    log("chainhub failed to start - children will fall back to their own sockets:", e?.message ?? e);
+    hub = null;
+  }
+}
+
 await reconcile();
 setInterval(() => { reconcile().catch((e) => log("reconcile error:", e?.message ?? e)); }, POLL_MS);
 
