@@ -189,11 +189,13 @@ const tooFarFromHisEntry = (sig, execCents) => {
 // TOP-UPS ARE EXEMPT: we can only be holding because we entered INSIDE the window, and the market
 // only moves closer to resolution from there.
 const V2_WINDOW_MS = (() => { const v = Number(process.env.COPY_V2_MAX_RESOLUTION_H); return (Number.isFinite(v) && v > 0 ? v : 4) * 3600_000; })();
-// FLOOR (owner 2026-08-18): never open with under an hour left. The 4h gate deliberately pushes
+// FLOOR (owner 2026-08-19, tightened 1h -> 30min): never open with under half an hour left. The 4h gate deliberately pushes
 // entries late, and the first dry run opened positions with SIX MINUTES to go - by then the price
 // encodes the outcome, the thesis has no room to play out, and a 99c fill pays fees both ways for
-// ~1c of upside. Below the floor the signal is DEAD for entry, not waiting: it can only get later.
-const V2_MIN_MS = (() => { const v = Number(process.env.COPY_V2_MIN_RESOLUTION_H); return (Number.isFinite(v) && v >= 0 ? v : 1) * 3600_000; })();
+// ~1c of upside. 30min still leaves the thesis room to play out while admitting the late-building
+// positions a 1h floor was cutting off. Below the floor the signal is DEAD for entry, not waiting:
+// it can only get later. The 20% price gate applies to these entries exactly as to any other.
+const V2_MIN_MS = (() => { const v = Number(process.env.COPY_V2_MIN_RESOLUTION_H); return (Number.isFinite(v) && v >= 0 ? v : 0.5) * 3600_000; })();
 // `v2` is passed IN, never read from an outer scope: V2() is defined inside the tick (it depends on
 // per-cycle server state), so referencing it from here threw "V2 is not defined" and aborted the
 // whole copytrade pass - caught live in the fleet logs minutes after deploy. A module-level helper
