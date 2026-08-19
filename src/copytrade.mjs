@@ -496,7 +496,24 @@ export function startCopyTrade(deps) {
     return s;
   };
 
+  // IN-FLIGHT LOCK (2026-08-19, second double-buy of the pilot). recentBuy is check-then-set across
+  // an await gap: fastOpen fires once per chainwatch event, so a whale stacking three adds in 3s
+  // spawned three concurrent fastOpens that ALL passed the cooldown check before the first buy()
+  // set it - sebastian bought the same token three times ($8.40 into a ~$3 intent). The retry fix
+  // could not catch this: these are three legitimate calls, not re-posts. The Set is checked and
+  // claimed SYNCHRONOUSLY at the top of buy() - no await between test and set, so only one caller
+  // per token can be in flight; the losers simply skip, and the next polled cycle re-sizes against
+  // the real position (target - held), so a genuine multi-add whale still gets his top-up.
+  const inFlightBuys = new Set();
   async function buy(sig, orderUsd, priceCents, kind, positions, existing, key = sig.condition_id) {
+    const tok = String(sig.token_id);
+    if (inFlightBuys.has(tok)) { bumpSkip("buy-in-flight"); return false; }
+    inFlightBuys.add(tok);
+    try {
+      return await buyLocked(sig, orderUsd, priceCents, kind, positions, existing, key);
+    } finally { inFlightBuys.delete(tok); }
+  }
+  async function buyLocked(sig, orderUsd, priceCents, kind, positions, existing, key = sig.condition_id) {
     const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(orderUsd, priceCents));
     const realUsd = (shares * priceCents) / 100;
     if (realUsd > (state.cash ?? 0)) return false;
