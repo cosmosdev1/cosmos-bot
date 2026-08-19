@@ -106,13 +106,22 @@ const affSlotHit = (n, k) => Math.floor((n * k) / AFF_WINDOW) > Math.floor(((n -
 // reduced by sells — so attacker-driven exits can't free the budget to buy again).
 const capPct = (env, hard) => { const v = Number(process.env[env]); return Number.isFinite(v) && v > 0 ? Math.min(v, hard) : hard; };
 const MAX_TRADE_PCT = capPct("COSMOS_MAX_TRADE_PCT", 5);    // one fill: <=5% of portfolio (owner 2026-07-22)
-const MAX_HOUR_PCT  = capPct("COSMOS_MAX_HOUR_PCT", 70);    // rolling 60min buy-volume ceiling (40 -> 70 with v2: its 4h window concentrates entries into bursts)
-// 100 -> 250 -> 800 (owner 2026-08-18, the second raise with v2): matched to the platform gate's
-// CLOUD_MAX_DAY_PCT. These two must move TOGETHER - the LOWER of the pair is what actually binds,
-// so leaving the bot behind would self-limit every account before the gate was ever asked. v2
-// enters only inside a 4h window, so the same dollar is meant to recycle many times a day; the
-// per-fill 5% clamp and the 70% hourly ceiling still bound any single burst.
-const MAX_DAY_PCT   = capPct("COSMOS_MAX_DAY_PCT", 800);    // rolling 24h buy-volume ceiling
+// PER STRATEGY (owner 2026-08-18). v2 enters only inside a 1h-4h window, so the same dollar is
+// meant to recycle several times a day; v1 parks capital for days and keeps the numbers it has
+// always run on. One bot process serves ONE user, so a module-level flag IS per-user here - and
+// v2 is a five-account pilot, so the wider envelope must not reach the other 83 bots.
+// setStrategyV2() is called each cycle from bot.mjs with the server's per-user answer.
+let V2_BUDGETS = false;
+export function setStrategyV2(on) { V2_BUDGETS = on === true; }
+const MAX_HOUR_PCT_V1 = capPct("COSMOS_MAX_HOUR_PCT", 40);  // rolling 60min buy-volume ceiling
+const MAX_HOUR_PCT_V2 = capPct("COSMOS_V2_MAX_HOUR_PCT", 70);
+const MAX_HOUR_PCT = () => (V2_BUDGETS ? MAX_HOUR_PCT_V2 : MAX_HOUR_PCT_V1);
+// Matched to the platform gate (CLOUD_MAX_DAY_PCT / CLOUD_V2_MAX_DAY_PCT). These must move TOGETHER
+// per strategy - the LOWER of the pair actually binds, so a mismatch silently self-limits the bot
+// before the gate is ever asked.
+const MAX_DAY_PCT_V1 = capPct("COSMOS_MAX_DAY_PCT", 250);   // rolling 24h buy-volume ceiling
+const MAX_DAY_PCT_V2 = capPct("COSMOS_V2_MAX_DAY_PCT", 800);
+const MAX_DAY_PCT = () => (V2_BUDGETS ? MAX_DAY_PCT_V2 : MAX_DAY_PCT_V1);
 const MAX_HOUR_BUYS = Math.min(Number(process.env.COSMOS_MAX_HOUR_BUYS) || 45, 45); // count backstop (legit peak ~38: copy 30 + qt 4 + cert 4)
 const MIN_FLOOR_USD = 2;                                    // never clamp a fill below the ~$1-2 min order — sub-$50 accounts must still trade
 let lastLocalPortfolio = 0;                                 // set ONLY by getBalanceUsd/getPortfolioValue (chain + Polymarket)
@@ -134,8 +143,8 @@ function riskClampBuy(sizeShares, price) {
   // so roomUsd < floor refused EVERY buy at ZERO spend ("rolling buy-volume cap (h 0/2)") — the same
   // bug class as the copy posCeil $1 floor, one layer deeper. With the floor, a tiny account places
   // ~one $2 clip per hour window instead of being silently dead.
-  const hourCap = port > 0 ? Math.max(MIN_FLOOR_USD, (port * MAX_HOUR_PCT) / 100) : MIN_FLOOR_USD;
-  const dayCap  = port > 0 ? Math.max(MIN_FLOOR_USD, (port * MAX_DAY_PCT) / 100) : MIN_FLOOR_USD;
+  const hourCap = port > 0 ? Math.max(MIN_FLOOR_USD, (port * MAX_HOUR_PCT()) / 100) : MIN_FLOOR_USD;
+  const dayCap  = port > 0 ? Math.max(MIN_FLOOR_USD, (port * MAX_DAY_PCT()) / 100) : MIN_FLOOR_USD;
   const hourSpent = spendWindow(3600e3), daySpent = spendWindow(86400e3);
   const hourBuys = spendLog.filter((b) => b.t >= Date.now() - 3600e3).length;
   if (hourBuys >= MAX_HOUR_BUYS) return { shares: 0, capped: true, reason: `hourly buy-count cap (${hourBuys}/${MAX_HOUR_BUYS})` };
@@ -529,6 +538,11 @@ export async function makePolymarket(config) {
       try { return await run; } finally { if (balInflight === run) balInflight = null; }
     },
     balanceBreakdown: () => lastBalanceBreakdown,
+    // Exposed on the RETURNED object, not just as a module export: bot.mjs holds the factory
+    // result (`pm`), so a module-level function would have been invisible to it and the optional
+    // call would have silently no-opped - leaving a pilot account on the v1 budgets forever with
+    // nothing in the logs to say so.
+    setStrategyV2,
 
     // Polymarket's OWN authoritative total portfolio value for the funder (cash + all open positions
     // marked to market + redeemable), via the data-api /value endpoint. This is far more reliable than
