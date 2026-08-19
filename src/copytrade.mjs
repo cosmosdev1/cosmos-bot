@@ -194,16 +194,20 @@ const V2_WINDOW_MS = (() => { const v = Number(process.env.COPY_V2_MAX_RESOLUTIO
 // encodes the outcome, the thesis has no room to play out, and a 99c fill pays fees both ways for
 // ~1c of upside. Below the floor the signal is DEAD for entry, not waiting: it can only get later.
 const V2_MIN_MS = (() => { const v = Number(process.env.COPY_V2_MIN_RESOLUTION_H); return (Number.isFinite(v) && v >= 0 ? v : 1) * 3600_000; })();
-const outsideV2Window = (sig) => {
-  if (!V2()) return false;
+// `v2` is passed IN, never read from an outer scope: V2() is defined inside the tick (it depends on
+// per-cycle server state), so referencing it from here threw "V2 is not defined" and aborted the
+// whole copytrade pass - caught live in the fleet logs minutes after deploy. A module-level helper
+// must not reach into function scope.
+const outsideV2Window = (sig, v2) => {
+  if (!v2) return false;
   const end = Date.parse(String(sig.end_date ?? ""));
   if (!Number.isFinite(end)) return false;          // unknown end date -> other gates decide, never guess
   const left = end - Date.now();
   return left > V2_WINDOW_MS || left < V2_MIN_MS;   // too early to enter, or too late to bother
 };
 /** Distinguishes the two for logging: "not yet" retries, "too late" never will. */
-const tooLateV2 = (sig) => {
-  if (!V2()) return false;
+const tooLateV2 = (sig, v2) => {
+  if (!v2) return false;
   const end = Date.parse(String(sig.end_date ?? ""));
   return Number.isFinite(end) && (end - Date.now()) < V2_MIN_MS;
 };
@@ -680,7 +684,7 @@ export function startCopyTrade(deps) {
     if (seen[seenKey]) return skip("buy-once-ever");
     // NOT YET, not never: the polled loop re-tests this signal every cycle and opens it the moment
     // it is inside the window and still clears everything else.
-    if (outsideV2Window(sig)) return skip(tooLateV2(sig)
+    if (outsideV2Window(sig, V2())) return skip(tooLateV2(sig, V2())
       ? `v2 window: only ${hoursLeft(sig).toFixed(2)}h left (<${V2_MIN_MS / 3600_000}h floor)`
       : `v2 window: resolves in ${hoursLeft(sig).toFixed(1)}h (>${V2_WINDOW_MS / 3600_000}h)`);
     target = Math.min(target, posCeil);                          // per-position ceiling on the opening clip too
@@ -796,7 +800,7 @@ export function startCopyTrade(deps) {
       } else {
         // v2 entry window - the "scan all the time" path. Skipping here costs nothing: this loop
         // runs every ~20s, so the position opens on the first cycle after the market crosses inside.
-        if (outsideV2Window(sig)) { if (!tooLateV2(sig)) stats.waiting++; continue; }
+        if (outsideV2Window(sig, V2())) { if (!tooLateV2(sig, V2())) stats.waiting++; continue; }
         target = Math.min(target, posCeil);                             // per-position ceiling on the opening clip
         if (target < MIN_ORDER_USD) continue;                           // first beat not reached (or capped below $1)
         if (!ONESHOT && openCopy >= MAX_OPEN) continue;
