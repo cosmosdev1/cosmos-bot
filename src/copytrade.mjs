@@ -336,6 +336,15 @@ const TIER_LADDER_ON = /^(1|true|yes|on)$/i.test(process.env.COPY_TIER_LADDER ||
 // candle market Polymarket lists is titled "<Asset> Up or Down - <date>, <time>-<time> ET". Covers
 // 5m/15m/hourly alike, per the earlier spec ("all crypto 5m/15m/hourly trades").
 const isCandleSig = (sig) => /up or down/i.test(String(sig?.market_question ?? ""));
+// Mirrors the server (lib/copytrade/strategy-v2.ts candleDurationFromTitle) so the two can never
+// disagree about what counts as a 15m or hourly candle: no time range in the title means hourly.
+function candleMinutesFromTitle(q) {
+  const r = /(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*-\s*(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*ET/i.exec(q);
+  if (!r) return 60;
+  const toMin = (h, m, ap) => { let hh = Number(h) % 12; if (/pm/i.test(ap)) hh += 12; return hh * 60 + Number(m ?? 0); };
+  const d = (toMin(r[4], r[5], r[6]) - toMin(r[1], r[2], r[3]) + 1440) % 1440;
+  return d > 0 ? d : 60;
+}
 
 function candleTarget(sig, portfolio) {
   const w = (sig.wallets ?? [])[0] ?? {};
@@ -582,9 +591,41 @@ export function startCopyTrade(deps) {
     if (cash - amountUsd < port * 0.06) return "buy would breach the 6% reserve floor";
     return false;
   }
+  // THE TIER IS COMPUTED HERE, NOT READ FROM THE SIGNAL (2026-08-19). tier_pct_resolved is stamped
+  // on a signal row SHARED by v1 and v2 users, so it can only ever carry ONE ladder - and it carries
+  // the legacy one (measured on the pilot's live feed: values of 0% and 1.5%, neither of which is a
+  // v2 tier). Sizing off it meant the pilot silently ran v1 percentages, and a 0% stamp meant "no
+  // entry" on 86 of 93 of its signals - the shift would have looked live while trading almost
+  // nothing. The whale's own percentile thresholds already ride on the signal in
+  // wallets[0].auto_tiers.v2, so a v2 bot resolves its own number and needs no schema change.
+  const V2_NC_PCTS = [5, 3, 2], V2_CANDLE_PCTS = [3, 2];
+  const pctFromBands = (cost, t, pcts) => {
+    if (!t) return null;
+    const ladder = [t.t1_usd, t.t2_usd, t.t3_usd];
+    for (let i = 0; i < pcts.length; i++) {
+      const th = Number(ladder[i]);
+      if (Number.isFinite(th) && cost >= th) return pcts[i];
+    }
+    return 0;                                   // below his lowest tier: no entry
+  };
+  function v2Pct(sig) {
+    const v2t = sig?.wallets?.[0]?.auto_tiers?.v2;
+    if (!v2t) return null;                      // thresholds not computed yet -> caller falls back
+    const cost = Number(sig.his_cost_usd) || 0;
+    if (isCandleSig(sig)) {
+      // Duration parsed exactly as the server does (strategy-v2.ts candleDurationFromTitle): a
+      // title with no time range is hourly. 5m and 4h are out of spec under v2 - sizing them off
+      // the candle ladder would trade markets the strategy explicitly excludes.
+      const dur = candleMinutesFromTitle(String(sig.market_question ?? ""));
+      if (dur !== 15 && dur !== 60) return 0;
+      return pctFromBands(cost, v2t.candle, V2_CANDLE_PCTS);
+    }
+    return pctFromBands(cost, v2t.nc, V2_NC_PCTS);
+  }
   function sizeFor(sig, unitBasis, portfolio) {
     if (V2()) {
-      const pct = Number(sig.tier_pct_resolved);
+      const own = v2Pct(sig);
+      const pct = own == null ? Number(sig.tier_pct_resolved) : own;
       if (!Number.isFinite(pct) || pct <= 0) return { target: 0, beats: null };
       return { target: Math.max(V2_FLOOR_USD, (portfolio || 0) * (pct / 100)), beats: null };
     }
