@@ -124,6 +124,18 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
       // A definitive cloud refusal (duplicate / signature cap / halt) cannot change on a re-post.
       // Retrying it wastes the loop and, on paths that re-price, real signature money.
       if (r.cloudDefinitive) { warn(`[cloud] entry refused (${r.cloudCode}) — not retrying`); return r; }
+      // BUYS NEVER BLIND-RETRY (2026-08-19, first v2 pilot entry). Each attempt signs a FRESH
+      // client_order_id, so nothing upstream dedupes a re-post - and an "error" here can be a
+      // timeout on an order that FILLED: sebastian's first tiered entry double-bought the same
+      // token 1s apart exactly this way ($8 into a $4 intent), proven by two signed cloud rows
+      // whose coids differ only in the attempt UUID. A missed buy self-corrects next cycle (the
+      // position store shows the real fill; top-ups/buy-once do the rest); a doubled buy is real
+      // money mis-sized. SELLS keep retrying - an exit must land, and selling twice fails safe
+      // (the second attempt has nothing left to sell).
+      if (String(args?.side || "").toUpperCase() === "BUY") {
+        warn(`[cloud] BUY attempt ambiguous (${r.cloudCode || r.status || "error"}) - NOT retrying; if it filled, next cycle sees the position`);
+        return r;
+      }
       if (i < attempts - 1) await sleep(cooldownMs);
     }
     return r; // last failure
