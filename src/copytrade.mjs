@@ -598,7 +598,9 @@ export function startCopyTrade(deps) {
   // entry" on 86 of 93 of its signals - the shift would have looked live while trading almost
   // nothing. The whale's own percentile thresholds already ride on the signal in
   // wallets[0].auto_tiers.v2, so a v2 bot resolves its own number and needs no schema change.
-  const V2_NC_PCTS = [5, 3, 2], V2_CANDLE_PCTS = [3, 2];
+  // 5/3/2 -> 4/3/2 with the widened ranks (owner 2026-08-19). The RANKS live server-side (they decide
+  // the dollar thresholds stamped on the signal); the bot only needs the matching percentages.
+  const V2_NC_PCTS = [4, 3, 2], V2_CANDLE_PCTS = [3, 2];
   const pctFromBands = (cost, t, pcts) => {
     if (!t) return null;
     const ladder = [t.t1_usd, t.t2_usd, t.t3_usd];
