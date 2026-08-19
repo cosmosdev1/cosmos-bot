@@ -200,20 +200,31 @@ const V2_MIN_MS = (() => { const v = Number(process.env.COPY_V2_MIN_RESOLUTION_H
 // per-cycle server state), so referencing it from here threw "V2 is not defined" and aborted the
 // whole copytrade pass - caught live in the fleet logs minutes after deploy. A module-level helper
 // must not reach into function scope.
+// THE WINDOW CLOCK (2026-08-19): wallets[0].event_at is the REAL event time, stamped by the server
+// (gameStartTime when earlier than endDate). end_date lies for tennis - a tournament/session stamp
+// shared by dozens of matches - so a window computed from it was fiction: 288 of 310 apparent
+// pass-throughs in one 24h audit were phantom. event_at when present, end_date as the fallback;
+// missing both -> other gates decide, never guess.
+const v2ClockMs = (sig) => {
+  const ev = Date.parse(String(sig?.wallets?.[0]?.event_at ?? ""));
+  if (Number.isFinite(ev)) return ev;
+  const end = Date.parse(String(sig?.end_date ?? ""));
+  return Number.isFinite(end) ? end : NaN;
+};
 const outsideV2Window = (sig, v2) => {
   if (!v2) return false;
-  const end = Date.parse(String(sig.end_date ?? ""));
-  if (!Number.isFinite(end)) return false;          // unknown end date -> other gates decide, never guess
+  const end = v2ClockMs(sig);
+  if (!Number.isFinite(end)) return false;          // unknown event time -> other gates decide, never guess
   const left = end - Date.now();
   return left > V2_WINDOW_MS || left < V2_MIN_MS;   // too early to enter, or too late to bother
 };
 /** Distinguishes the two for logging: "not yet" retries, "too late" never will. */
 const tooLateV2 = (sig, v2) => {
   if (!v2) return false;
-  const end = Date.parse(String(sig.end_date ?? ""));
+  const end = v2ClockMs(sig);
   return Number.isFinite(end) && (end - Date.now()) < V2_MIN_MS;
 };
-const hoursLeft = (sig) => ((Date.parse(String(sig.end_date ?? "")) - Date.now()) / 3600_000);
+const hoursLeft = (sig) => ((v2ClockMs(sig) - Date.now()) / 3600_000);
 const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position (owner 2026-08-04: enter at 3%, that is it)
 // PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
 // small on a ~$24 test account). The economics set this number, not caution: a hosted signature
