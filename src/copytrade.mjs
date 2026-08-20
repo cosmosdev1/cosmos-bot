@@ -34,6 +34,8 @@ const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy w
 // whale keeps adding we follow him up — scale-ins are capped only by the sanity ceiling.
 const MAX_ENTRY_CENTS = N("COPY_MAX_ENTRY_CENTS", 92); // new positions
 const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a position we already hold
+// How long to wait before re-asking a question the gate already answered deterministically.
+const DENY_COOLDOWN_MS = N("COPY_DENY_COOLDOWN_MS", 120_000);   // wait before re-asking a deterministic denial
 // ADD CEILING for scan-adopted signals (owner model 2026-07-22): an add must respect the same
 // ±20c-of-his-entry band as the open. Tier restamps arrive with no price check server-side, so
 // without this a whale growing his position while the price ran to 90c would have every bot
@@ -580,6 +582,18 @@ export function startCopyTrade(deps) {
           brokenStreak = 0;
         }
       } else if (r.cloudCode) { brokenStreak = 0; }   // any other verdict proves the account is readable
+
+      // DETERMINISTIC DENIALS GET A COOLDOWN (QA 2026-08-20). A verdict that is a pure function of
+      // (our price, the book) or (our exposure, the cap) cannot change on the next 20s tick, yet the
+      // loop re-asked every cycle: measured in one day, 998 of 1008 denials were futile repeats -
+      // 519 attempts over 3.5 HOURS on a single $2.75 order whose 55c limit sat against a 40c ask.
+      // Each one is a Turnkey signature attempt and a cloud_orders row.
+      // A COOLDOWN, NOT A BAN: books move and exposure frees, so the market is retried after it -
+      // just not 2.5 times a minute. Sized well under the shortest useful entry window.
+      if (r.cloudCode === "buy_above_book" || r.cloudCode === "market_concentration") {
+        recentBuy.set(sig.condition_id, Date.now() - COOLDOWN_MS + DENY_COOLDOWN_MS);
+        bumpSkip(`deny-cooldown:${r.cloudCode}`);
+      }
       warn(`copytrade ${kind} failed: ${why.slice(0, 120)}`); return false;
     }
     stats.fills++;
