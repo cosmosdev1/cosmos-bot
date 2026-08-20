@@ -40,7 +40,12 @@ const derivedMax = Math.max(4, Math.floor((os.totalmem() / 1048576 - 600) / 55))
 const MAX = Number(process.env.RUNNER_MAX) || derivedMax;
 // Boot ramp: children started per reconcile pass (~60s apart). 8/pass fills a 48-slot box in ~6
 // minutes while keeping the platform's boot load flat. Env-tunable for a cold-start hurry.
-const RAMP = Number(process.env.RUNNER_SPAWN_RAMP) || 8;
+// SPAWN RAMP, scaled to the roster (scale QA 2026-08-20). A flat 8 per ~60s reconcile pass means a
+// cold start takes N/8 minutes - fine at 93 (12 min), but 2,000 bots would sit DARK for 4h10m, and
+// the ramp applies to every restart and every deploy, not just first boot. Scaling with the cap
+// holds a full cold start near 20 minutes at any fleet size while still spreading the thundering
+// herd that the ramp exists to prevent.
+const RAMP = Number(process.env.RUNNER_SPAWN_RAMP) || Math.max(8, Math.ceil(MAX / 20));
 const DATA_ROOT = (process.env.COSMOS_DATA_DIR || "/data").replace(/\/$/, "");
 const POLL_MS = 60_000;
 const BOT = join(dirname(fileURLToPath(import.meta.url)), "bot.mjs");

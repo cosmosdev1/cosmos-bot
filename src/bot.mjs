@@ -903,7 +903,13 @@ async function cycle(cosmos, pm) {
   const dd = drawdownCheck(portfolioValue);
   qtState.ddHalt = dd.halt;
   if (dd.halt) warn(`DRAWDOWN BREAKER: portfolio $${portfolioValue.toFixed(0)} is ${(dd.dd * 100).toFixed(0)}% below the 12h high $${dd.high.toFixed(0)} — entries halted until recovery`);
-  const feed = await cosmos.signals().catch((e) => {
+  // HOSTED IS COPY-ONLY, so this feed is pure waste for it (scale QA 2026-08-20). /v1/signals serves
+  // ai/sport/quant/weather/top5 and NEVER a copytrade row, and the loop below discards every row whose
+  // source is not "copytrade" - so a hosted bot fetched it every 30s and threw all of it away. At 2,000
+  // bots that is ~67 requests/second against a 7-query fleet feed with no in-flight dedupe.
+  // The BLOCK still runs: qtState.sizing is set inside it and copytrade returns early without it, so
+  // we substitute an empty feed rather than skipping the code.
+  const feed = HOSTED ? { count: 0, signals: [] } : await cosmos.signals().catch((e) => {
     // Surface WHY the feed failed - especially the builder-guard 403, which tells the user
     // exactly what happened and how to fix it. Silence here looked like "0 signals" for no reason.
     warn("signal feed unavailable:", e.message);
@@ -1222,6 +1228,13 @@ async function cycle(cosmos, pm) {
 const SELF_UPDATE_MS = (Number(process.env.COSMOS_SELFUPDATE_SECONDS) || 600) * 1000;
 let lastUpdateCheck = Date.now();
 function maybeSelfUpdate() {
+  // HOSTED BOTS DO NOT SELF-UPDATE (scale QA 2026-08-20). On the hosted runner every child shares ONE
+  // checkout at /app/repo, and entrypoint.sh already pulls it at box level every 10 min. Each child
+  // doing its own git fetch + reset --hard against that shared tree means, at 2,000 children, ~3 git
+  // forks per SECOND all racing to reset the same working directory - and execSync blocks the
+  // child's event loop for up to its 20s timeout while it happens. Self-hosted bots keep it: there
+  // the watchdog is the only thing that reaches them.
+  if (HOSTED) return;
   if (Date.now() - lastUpdateCheck < SELF_UPDATE_MS) return;
   lastUpdateCheck = Date.now();
   try {
