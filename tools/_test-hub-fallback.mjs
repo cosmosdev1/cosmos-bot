@@ -6,15 +6,15 @@
 // already hold, which still needs the loop for top-ups and exit bookkeeping.
 const HUB_SILENCE_MS = 90_000;
 
-function makeChild() {
-  let hubSignals = null, hubAt = 0;
+function makeChild(v2 = true) {
+  let hubSignals = null, hubAt = 0, hubBeatAt = 0;
   const onMessage = (m) => {
     if (!m || typeof m !== "object") return;
-    if (m.t === "enterable" && Array.isArray(m.signals)) { hubSignals = m.signals; hubAt = Date.now(); return; }
-    if (m.t === "enterable-beat") { hubAt = Date.now(); }
+    if (m.t === "enterable" && Array.isArray(m.signals)) { hubSignals = m.signals; hubAt = Date.now(); hubBeatAt = hubAt; return; }
+    if (m.t === "enterable-beat") { hubBeatAt = Date.now(); }   // liveness only - NOT the data clock
   };
   const hubFresh = (now = Date.now()) => hubSignals !== null && (now - hubAt) < HUB_SILENCE_MS;
-  const keys = (now) => hubFresh(now)
+  const keys = (now) => (v2 && hubFresh(now))
     ? new Set(hubSignals.map((s) => `${s.condition_id}|${String(s.outcome).toLowerCase()}`))
     : null;
   /** returns true when the entry scan SKIPS this signal */
@@ -73,13 +73,24 @@ const B = { condition_id: "0xbbb", outcome: "No" };
   ck("held position survives an empty hub set", c.skips(A, { "0xaaa": { size_usd: 4 } }), false);
 }
 
-// 6. a beat alone refreshes the clock without changing the set
+// 6. A BEAT MUST NOT REVIVE A STALE SET. This is the case that was pinned WRONG before: a beat
+// used to refresh the data clock, so a permanently dead endpoint kept every child filtering
+// against a frozen list forever and the stale-fallback could never fire.
 {
   const c = makeChild();
   c.onMessage({ t: "enterable", signals: [A] });
-  c.onMessage({ t: "enterable-beat" });
-  ck("beat keeps the hub fresh", c.hubFresh(), true);
-  ck("beat does not widen the set", c.skips(B), true);
+  const later = Date.now() + HUB_SILENCE_MS + 1_000;
+  c.onMessage({ t: "enterable-beat" });                 // runner alive, endpoint dead
+  ck("beat does NOT revive a stale set", c.skips(B, {}, later), false);
+  ck("fresh data still filters normally", c.skips(B), true);
+}
+
+// 8. a v1 caller is NEVER filtered - the hub verdict is v2-only
+{
+  const c = makeChild(false);
+  c.onMessage({ t: "enterable", signals: [] });
+  ck("v1 caller ignores the hub entirely", c.skips(A), false);
+  ck("v1 caller ignores it even with a set", c.skips(B), false);
 }
 
 // 7. garbage messages are ignored

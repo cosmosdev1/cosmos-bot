@@ -42,7 +42,11 @@ export function startSignalHub({ fetchEnterable, broadcast, log = console.log, w
     if (stopped) return;
     try {
       const res = await fetchEnterable();
-      const signals = Array.isArray(res?.signals) ? res.signals : [];
+      // A 200 whose body has no `signals` array is a WRONG-SHAPE response (the 2026-08-02
+      // proxy-intercept class), not an empty market. Treating it as "nothing enterable" would make
+      // the whole box skip every entry for 90s. Fail instead, so children fall back.
+      if (!res || !Array.isArray(res.signals)) throw new Error("malformed payload: no signals array");
+      const signals = res.signals;
       lastOk = Date.now();
       lastCount = signals.length;
       consecutiveFails = 0;
@@ -63,7 +67,10 @@ export function startSignalHub({ fetchEnterable, broadcast, log = console.log, w
   timer = setInterval(pull, POLL_MS);
   // A heartbeat independent of the payload: children use it to tell "hub alive, nothing enterable"
   // apart from "hub dead".
-  beat = setInterval(() => { if (!stopped) broadcast({ t: "enterable-beat", at: Date.now() }); }, BEAT_MS);
+  // The beat is LIVENESS ONLY - it says "the runner is alive", never "the data is fresh". The child
+  // keeps a separate clock for data (QA 2026-08-20): a beat that refreshed the data clock let a
+  // permanently failing endpoint freeze every child's filter forever.
+  beat = setInterval(() => { if (!stopped) broadcast({ t: "enterable-beat", at: Date.now(), lastOk }); }, BEAT_MS);
   log(`signalhub: LIVE - one shared evaluation every ${POLL_MS / 1000}s for this whole box`);
 
   return {

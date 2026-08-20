@@ -237,11 +237,17 @@ const hoursLeft = (sig) => ((v2ClockMs(sig) - Date.now()) / 3600_000);
 // /copy-signals fetch. An empty broadcast is a real answer and keeps the clock fresh; no broadcast
 // at all is a failure and must not read as an empty market.
 const HUB_SIGNALS_SILENCE_MS = Number(process.env.COSMOS_SIGNALHUB_SILENCE_MS) || 90_000;
-let hubSignals = null, hubAt = 0;
+// TWO CLOCKS, DELIBERATELY (QA 2026-08-20). `hubAt` tracks when we last received DATA. A liveness
+// beat proves the runner is alive; it does NOT make a stale set fresh. Refreshing the data clock on
+// a beat meant that after ONE successful pull ever, a permanently 503-ing endpoint left every child
+// filtering against a frozen set for the life of the process - entries draining to zero as markets
+// left the window, while the logs printed a healthy "hub N cycles, M skipped". The stale-fallback
+// could never fire. Only real data moves `hubAt`.
+let hubSignals = null, hubAt = 0, hubBeatAt = 0;
 process.on("message", (m) => {
   if (!m || typeof m !== "object") return;
-  if (m.t === "enterable" && Array.isArray(m.signals)) { hubSignals = m.signals; hubAt = Date.now(); return; }
-  if (m.t === "enterable-beat") { hubAt = Date.now(); }
+  if (m.t === "enterable" && Array.isArray(m.signals)) { hubSignals = m.signals; hubAt = Date.now(); hubBeatAt = hubAt; return; }
+  if (m.t === "enterable-beat") { hubBeatAt = Date.now(); }
 });
 const hubFresh = () => hubSignals !== null && (Date.now() - hubAt) < HUB_SIGNALS_SILENCE_MS;
 const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position (owner 2026-08-04: enter at 3%, that is it)
@@ -832,7 +838,11 @@ export function startCopyTrade(deps) {
     // one of those back onto per-position /copy-exit calls - re-opening the heaviest load on the
     // platform (~3,840 queries/min fleet-wide) to save a cheaper one. So exits read the full feed
     // exactly as before, and only the ENTRY scan is narrowed to what the hub vouched for.
-    const hubOk = hubFresh();
+    // V2 CALLERS ONLY (QA 2026-08-20, found independently by two reviewers). /copy-enterable is a
+    // purely v2 verdict - the 30min-8h window and the v2 percentile ladder. v1 has no entry window
+    // at all and a different ladder, so applying this filter to a v1 bot would silently suppress
+    // almost everything it should buy: 88 of the 93 live bots, reading as a quiet market.
+    const hubOk = V2() && hubFresh();
     const enterableKeys = hubOk
       ? new Set(hubSignals.map((s) => `${s.condition_id}|${String(s.outcome).toLowerCase()}`))
       : null;

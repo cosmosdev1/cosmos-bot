@@ -58,6 +58,10 @@ const HUB_ENABLED = process.env.COSMOS_CHAINHUB === "1";
 // SIGNAL HUB (scale build 2026-08-20): one shared evaluation per box instead of one per child.
 // Off by default so the first deploy is a no-op; COSMOS_SIGNALHUB=1 turns it on.
 const SIGNALHUB_ENABLED = process.env.COSMOS_SIGNALHUB === "1";
+// The supervisor had NO top-level handlers while every child has both (bot.mjs). One unhandled
+// rejection here takes the entire fleet dark until Fly restarts it, then the ramp costs minutes.
+process.on("uncaughtException", (e) => console.error(new Date().toISOString(), "runner uncaught:", e?.stack ?? e));
+process.on("unhandledRejection", (e) => console.error(new Date().toISOString(), "runner unhandled rejection:", e?.stack ?? e));
 let hubToken = null;
 let sigHub = null;
 /** userId -> string[] of wallets that child follows (reported over IPC) */
@@ -143,7 +147,18 @@ function start(a) {
   try { mkdirSync(join(DATA_ROOT, `u-${a.user_id}`), { recursive: true }); } catch { /* child retries */ }
   // "ipc" adds a message channel (child.send / process.on("message")). It is what lets ONE socket
   // on this box serve every child (chainhub, Inc 1.5) instead of ~90 sockets and ~90 keepalives.
-  const child = spawn(process.execPath, [BOT], { env: childEnv(a), stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  let child;
+  try {
+    child = spawn(process.execPath, [BOT], { env: childEnv(a), stdio: ["ignore", "pipe", "pipe", "ipc"] });
+  } catch (e) {
+    // A supervisor that dies on a failed spawn is the wrong failure mode at any size: Fly restarts
+    // it, it spawns again, and the fleet crash-loops dark. Log and move on - the reconcile pass
+    // retries this child next minute. (QA 2026-08-20)
+    console.warn(new Date().toISOString(), `spawn failed for ${a.user_id?.slice(0, 8)}: ${e?.message ?? e}`);
+    return;
+  }
+  // Node emits 'error' ASYNCHRONOUSLY on spawn failure, and an unlistened 'error' event THROWS.
+  child.on("error", (e) => console.warn(new Date().toISOString(), `child ${a.user_id?.slice(0, 8)} error: ${e?.message ?? e}`));
   const tag = a.user_id.slice(0, 8);
   child.stdout.on("data", (d) => process.stdout.write(`[${tag}] ${d}`));
   child.stderr.on("data", (d) => process.stderr.write(`[${tag}] ${d}`));
