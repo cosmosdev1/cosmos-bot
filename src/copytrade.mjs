@@ -188,7 +188,7 @@ const tooFarFromHisEntry = (sig, execCents) => {
 //
 // TOP-UPS ARE EXEMPT: we can only be holding because we entered INSIDE the window, and the market
 // only moves closer to resolution from there.
-const V2_WINDOW_MS = (() => { const v = Number(process.env.COPY_V2_MAX_RESOLUTION_H); return (Number.isFinite(v) && v > 0 ? v : 4) * 3600_000; })();
+const V2_WINDOW_MS = (() => { const v = Number(process.env.COPY_V2_MAX_RESOLUTION_H); return (Number.isFinite(v) && v > 0 ? v : 8) * 3600_000; })();   // owner 2026-08-20: 4h -> 8h
 // FLOOR (owner 2026-08-19, tightened 1h -> 30min): never open with under half an hour left. The 4h gate deliberately pushes
 // entries late, and the first dry run opened positions with SIX MINUTES to go - by then the price
 // encodes the outcome, the thesis has no room to play out, and a 99c fill pays fees both ways for
