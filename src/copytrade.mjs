@@ -34,6 +34,8 @@ const COOLDOWN_MS = N("COPY_COOLDOWN_MS", 60_000); // per-market: don't re-buy w
 // whale keeps adding we follow him up — scale-ins are capped only by the sanity ceiling.
 const MAX_ENTRY_CENTS = N("COPY_MAX_ENTRY_CENTS", 92); // new positions
 const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a position we already hold
+// v2 entry ceiling: 99c TP minus 0.9%/leg fees leaves no room above this (owner 2026-08-20).
+const V2_MAX_ENTRY_CENTS = N("COPY_V2_MAX_ENTRY_CENTS", 97);
 // How long to wait before re-asking a question the gate already answered deterministically.
 const DENY_COOLDOWN_MS = N("COPY_DENY_COOLDOWN_MS", 120_000);   // wait before re-asking a deterministic denial
 // ADD CEILING for scan-adopted signals (owner model 2026-07-22): an add must respect the same
@@ -802,7 +804,16 @@ export function startCopyTrade(deps) {
     target = Math.min(target, posCeil);                          // per-position ceiling on the opening clip too
     if (target < MIN_ORDER_USD) return skip("per-position cap below $1 min");
     if (!ONESHOT && copyExposure(positions) + target > exposureCap) return skip("exposure cap ($" + copyExposure(positions).toFixed(2) + "+$" + target.toFixed(2) + ">$" + exposureCap.toFixed(2) + ")");
-    const capMax = String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS;   // sports band 3-99c (owner 2026-07-15)
+    // ENTRY CEILING (owner 2026-08-20). Never OPEN above 97c: the take-profit is 99c and the builder
+    // fee is 0.9% PER LEG, so a 98c entry round-trips at a loss no matter which way the market goes.
+    // Measured before this cap: 12 such buys in a week (~$45 that could not win), and the 90-99c band
+    // was a THIRD of all Turnkey signatures while converting to a real fill only 15% of the time -
+    // the most expensive and least productive slice of the book. Top-ups are NOT exempt: a top-up at
+    // 98c loses exactly as much as an open at 98c.
+    const capMax = Math.min(
+      V2() ? V2_MAX_ENTRY_CENTS : 99,
+      String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS,
+    );
     const cap = sig.is_pair
       ? Math.min(99, Number(sig.max_entry_cents) || 99)
       : Math.min(capMax, Number(sig.max_entry_cents) || capMax);
@@ -953,7 +964,10 @@ export function startCopyTrade(deps) {
         // hedge, not a directional bet. The 92c cap and 10c floor DON'T apply: a 96c/3c pair is a good
         // arb, and refusing the 96c half would leave us naked on the 3c half. The server has already
         // verified both legs together cost less than the $1 redemption; its max_entry_cents is the cap.
-        const capMax2 = String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS;  // sports band 3-99c (owner 2026-07-15)
+        const capMax2 = Math.min(
+          V2() ? V2_MAX_ENTRY_CENTS : 99,
+          String(sig.category).toUpperCase() === "SPORTS" ? 99 : MAX_ENTRY_CENTS,
+        );
         const cap = sig.is_pair
           ? Math.min(99, Number(sig.max_entry_cents) || 99)
           : Math.min(capMax2, Number(sig.max_entry_cents) || capMax2);
