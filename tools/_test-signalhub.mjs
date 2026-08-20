@@ -53,7 +53,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   ck("failure is counted, not swallowed", hub.stats().consecutiveFails > 0, true);
 }
 
-// ---- 4. a malformed payload is treated as empty, never as garbage passed downstream ----
+// ---- 4. a malformed payload FAILS - it is not an empty market ----
+// A 200 whose body has no signals array is the proxy-intercept class (2026-08-02). Treating it as
+// "nothing enterable" would make the whole box skip every entry for the silence window, so it must
+// be counted as a failure and broadcast nothing, letting children fall back.
 {
   const sent = [];
   const hub = startSignalHub({
@@ -63,8 +66,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   });
   await sleep(60);
   hub.stop();
-  const first = sent.find((m) => m.t === "enterable");
-  ck("non-array signals -> empty list, no crash", first?.signals, []);
+  ck("malformed 200 broadcasts nothing", sent.some((m) => m.t === "enterable"), false);
+  ck("malformed 200 counts as a failure", hub.stats().consecutiveFails > 0, true);
 }
 
 // ---- 5. recovery resets the failure counter ----
