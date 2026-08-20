@@ -225,6 +225,25 @@ const tooLateV2 = (sig, v2) => {
   return Number.isFinite(end) && (end - Date.now()) < V2_MIN_MS;
 };
 const hoursLeft = (sig) => ((v2ClockMs(sig) - Date.now()) / 3600_000);
+
+// ---- SIGNAL HUB (scale build 2026-08-20) ----
+// The runner evaluates the objectively-enterable set ONCE for the whole box and broadcasts it here,
+// instead of every child fetching and re-deriving the same thing (measured: 1,551 duplicate
+// evaluations per real order). What arrives is only the objective half - window, tier, price band.
+// Everything user-specific is still decided below, in THIS process: whether we follow the whale,
+// our cash and budgets, buy-once, concentration, and the signature itself.
+//
+// SILENCE MEANS FALL BACK, NEVER "NOTHING TO TRADE". If the hub stops speaking we resume our own
+// /copy-signals fetch. An empty broadcast is a real answer and keeps the clock fresh; no broadcast
+// at all is a failure and must not read as an empty market.
+const HUB_SIGNALS_SILENCE_MS = Number(process.env.COSMOS_SIGNALHUB_SILENCE_MS) || 90_000;
+let hubSignals = null, hubAt = 0;
+process.on("message", (m) => {
+  if (!m || typeof m !== "object") return;
+  if (m.t === "enterable" && Array.isArray(m.signals)) { hubSignals = m.signals; hubAt = Date.now(); return; }
+  if (m.t === "enterable-beat") { hubAt = Date.now(); }
+});
+const hubFresh = () => hubSignals !== null && (Date.now() - hubAt) < HUB_SIGNALS_SILENCE_MS;
 const ONESHOT_PCT = N("COPY_ONESHOT_PCT", 3);          // flat % of OUR portfolio per position (owner 2026-08-04: enter at 3%, that is it)
 // PRODUCTION FLOOR $5 (restored 2026-07-30 after the hosted prove-out, which ran at $2 to trade
 // small on a ~$24 test account). The economics set this number, not caution: a hosted signature
@@ -807,6 +826,17 @@ export function startCopyTrade(deps) {
     let feed;
     try { feed = await cosmos.copySignals(); } catch (e) { warn("copytrade feed:", e.message); return; }
     const signals = feed?.signals ?? [];
+    // THE HUB IS A FILTER, NOT A REPLACEMENT (deliberate). The personal feed stays the source of
+    // truth because the EXIT ladder rides on it: sell_seq for a position whose market is already
+    // past its event never appears in the enterable set, and swapping the feed out would push every
+    // one of those back onto per-position /copy-exit calls - re-opening the heaviest load on the
+    // platform (~3,840 queries/min fleet-wide) to save a cheaper one. So exits read the full feed
+    // exactly as before, and only the ENTRY scan is narrowed to what the hub vouched for.
+    const hubOk = hubFresh();
+    const enterableKeys = hubOk
+      ? new Set(hubSignals.map((s) => `${s.condition_id}|${String(s.outcome).toLowerCase()}`))
+      : null;
+    if (hubOk) stats.viaHub = (stats.viaHub ?? 0) + 1;
     // PUBLISH THE EXIT LADDER FROM THE FEED (DB-load fix 2026-08-06). Every signal row already
     // carries sell_seq, and the bot polls this feed every 20s - so bot.mjs can skip its per-position
     // /copy-exit call whenever the feed proves the ladder has not advanced past what the position
@@ -834,6 +864,13 @@ export function startCopyTrade(deps) {
 
     for (const sig of signals) {
       if (!sig.condition_id || !sig.token_id) continue;
+      // HUB SHORTCUT: when the box-wide evaluation is fresh, anything it did not vouch for cannot
+      // be entered by anyone, so skip the whole per-signal entry scan for it. Costs one Set lookup
+      // and removes the duplicated window/tier/price arithmetic this loop used to redo per child.
+      // ONLY applied to ENTRY candidates we do not already hold - a held position must still walk
+      // the loop below for top-ups and for the exit bookkeeping the feed drives.
+      if (enterableKeys && !positions[sig.condition_id]
+          && !enterableKeys.has(`${sig.condition_id}|${String(sig.outcome).toLowerCase()}`)) { stats.hubSkipped = (stats.hubSkipped ?? 0) + 1; continue; }
       // ADOPT-ONLY users see ONLY adopt signals. The whale-fill copies (kind "new") are aviv's alone.
       if (state.copyFills === false && sig.kind !== "adopt") continue;
       // hosted: only signals driven by one of THIS user's picked wallets (see refreshMyWallets)
@@ -924,7 +961,7 @@ export function startCopyTrade(deps) {
 
   (async function run() {
     log(`copytrade: engine ON · unit=${UNIT_FRACTION}x dashboard size · exposure≤${MAX_EXPOSURE_PCT}% · ${MIN_ENTRY_CENTS}-${MAX_ENTRY_CENTS}c entries · ≤${MAX_BUYS_PER_HOUR} buys/h · max ${MAX_OPEN} open · buy-once · poll ${POLL_MS}ms${DRY ? " · DRY RUN" : ""}`);
-    const si = setInterval(() => log(`copytrade … signals ${stats.signals} · opens ${stats.opens} · adds ${stats.adds} · fills ${stats.fills}${stats.waiting ? ` · waiting-for-window ${stats.waiting}` : ""}`), 120_000);
+    const si = setInterval(() => log(`copytrade … signals ${stats.signals} · opens ${stats.opens} · adds ${stats.adds} · fills ${stats.fills}${stats.viaHub ? ` · hub ${stats.viaHub} cycles, ${stats.hubSkipped ?? 0} skipped` : ""}${stats.waiting ? ` · waiting-for-window ${stats.waiting}` : ""}`), 120_000);
     while (alive) {
       const t0 = Date.now();
       try { await tick(); } catch (e) { warn("copytrade:", e?.message); }

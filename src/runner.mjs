@@ -55,6 +55,11 @@ const log = (...a) => console.log(new Date().toISOString(), "[runner]", ...a);
 // One socket for this whole box instead of one per child. Off by default so the first deploy is a
 // no-op; COSMOS_CHAINHUB=1 on the RUNNER turns it on for the children it spawns.
 const HUB_ENABLED = process.env.COSMOS_CHAINHUB === "1";
+// SIGNAL HUB (scale build 2026-08-20): one shared evaluation per box instead of one per child.
+// Off by default so the first deploy is a no-op; COSMOS_SIGNALHUB=1 turns it on.
+const SIGNALHUB_ENABLED = process.env.COSMOS_SIGNALHUB === "1";
+let hubToken = null;
+let sigHub = null;
 /** userId -> string[] of wallets that child follows (reported over IPC) */
 const childWallets = new Map();
 let hub = null;
@@ -182,7 +187,12 @@ async function reconcile() {
     if (a.skip) { log(`skip ${a.user_id.slice(0, 8)}: ${a.skip}`); continue; }
     if (!a.token || !(a.wallets > 0) || a.bot_enabled === false) continue;
     want.set(a.user_id, a);
+    // The signal hub calls /copy-enterable, which needs a bot token. The payload is identical for
+    // every caller (it is the objective enterable set, not anyone's feed), so any live token on
+    // this box serves. Refreshed from the roster each pass so a departing user cannot strand it.
+    hubToken = hubToken || a.token;
   }
+  if (hubToken && ![...want.values()].some((a) => a.token === hubToken)) hubToken = [...want.values()][0]?.token || null;
 
   for (const userId of [...kids.keys()]) {
     if (!want.has(userId)) stop(userId, "no longer on the roster (halted, disabled, or wallets cleared)");
@@ -236,6 +246,32 @@ log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}${HUB_ENAB
 
 // Start the shared subscription BEFORE any child, so the first wallets reported find a live hub.
 // Loaded dynamically so a box with the hub off never even parses it.
+if (SIGNALHUB_ENABLED) {
+  try {
+    const { startSignalHub } = await import("./signalhub.mjs");
+    sigHub = startSignalHub({
+      fetchEnterable: async () => {
+        if (!hubToken) throw new Error("no bot token on this box yet");
+        const r = await fetch(`${API}/api/v1/copy-enterable`, {
+          headers: { authorization: `Bearer ${hubToken}` },
+          signal: AbortSignal.timeout(12_000),
+        });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return await r.json();
+      },
+      broadcast,
+      log: (...a) => console.log(new Date().toISOString(), ...a),
+      warn: (...a) => console.warn(new Date().toISOString(), ...a),
+    });
+    setInterval(() => {
+      const s2 = sigHub.stats();
+      log(`signalhub: ${s2.ageMs == null ? "NEVER OK" : `last ok ${Math.round(s2.ageMs / 1000)}s ago`} · ${s2.lastCount} enterable · ${s2.consecutiveFails} fails · ${kids.size} children`);
+    }, 300_000);
+  } catch (e) {
+    console.warn("signalhub failed to start:", e?.message ?? e);
+  }
+}
+
 if (HUB_ENABLED) {
   try {
     const { startChainHub } = await import("./chainhub.mjs");
