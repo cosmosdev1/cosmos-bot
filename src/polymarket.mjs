@@ -530,9 +530,22 @@ export async function makePolymarket(config) {
         balCache = { at: Date.now(), usd: best };     // cache SUCCESS only
         return best;
       }
-      // Both sources unreadable or genuinely empty: fall back to last-known-good and do NOT cache,
-      // so the next cycle retries the network rather than serving a blip for 5 minutes.
-      return lastGoodBalance ?? 0; // never collapse sizing to 0 on a transient failure
+      // A FAILED READ AND A REAL ZERO ARE NOT THE SAME THING (2026-08-21). This used to return
+      // last-known-good for BOTH, which meant an account that genuinely emptied kept reporting its
+      // old balance for the life of the process - and kept sizing, signing and burning Turnkey
+      // signatures against money that was not there. Measured across the fleet: 4 accounts, 140
+      // signatures in 7 days, zero fills, every one claiming cash while the chain, Polymarket and
+      // the CLOB ledger all said $0. One of them had never held a cent in its life.
+      //
+      // `null` means the source did not answer; `0` means it answered and the wallet is empty. So:
+      //   - at least one source answered ->  believe it, even when the answer is zero
+      //   - nothing answered             ->  keep the blip protection this fallback exists for
+      const answered = onchain != null || clob != null;
+      if (answered) {
+        lastGoodBalance = 0;
+        return 0;
+      }
+      return lastGoodBalance ?? 0; // both sources unreadable: never collapse sizing on a blip
       })();
       if (!fresh) balInflight = run;
       try { return await run; } finally { if (balInflight === run) balInflight = null; }
