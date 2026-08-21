@@ -495,12 +495,19 @@ export async function makePolymarket(config) {
           }
         } catch { sum = null; }
         if (sum == null) {
+          // A FAILED per-token read is UNKNOWN, not $0 (2026-08-21). `.catch(() => 0n)` here
+          // laundered every RPC failure into a zero balance, which meant `onchain` could never be
+          // null - so the "both sources unreadable" protection below was unreachable dead code, and
+          // a total RPC outage read as "the wallet is empty". A token read that fails poisons the
+          // whole sum to unknown; a partial sum would under-report (pUSD is where most deposits
+          // actually sit, e.g. $109-$329 measured on three live funders today).
           sum = 0;
           for (const token of USDC_ADDRESSES) {
-            const raw = await publicClient
-              .readContract({ address: token, abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [funder] })
-              .catch(() => 0n);
-            sum += Number(raw) / 1e6; // USDC = 6 decimals
+            try {
+              const raw = await publicClient
+                .readContract({ address: token, abi: ERC20_BALANCE_ABI, functionName: "balanceOf", args: [funder] });
+              sum += Number(raw) / 1e6; // USDC = 6 decimals
+            } catch { sum = null; break; }
           }
         }
         onchain = sum;
@@ -540,12 +547,28 @@ export async function makePolymarket(config) {
       // `null` means the source did not answer; `0` means it answered and the wallet is empty. So:
       //   - at least one source answered ->  believe it, even when the answer is zero
       //   - nothing answered             ->  keep the blip protection this fallback exists for
-      const answered = onchain != null || clob != null;
-      if (answered) {
+      // WALLET-AWARE ZERO (2026-08-21, replacing this morning's version measured to be a
+      // regression). For a proxy/1271 wallet, tradeable cash lives in the CLOB ledger and the
+      // funder can legitimately read $0 on-chain forever - so "on-chain answered zero" proves
+      // NOTHING while the CLOB read failed: believing it would zero out a funded account on any
+      // CLOB blip (71 of 105 fleet accounts are POLY_1271; the pilot itself would silently stop
+      // entering via the min-portfolio floor). The zero is believable only when every source that
+      // could actually hold this wallet's cash answered:
+      //   - CLOB answered (any wallet kind)  -> its ledger is authoritative for tradeable cash,
+      //     and the on-chain leg was also read this cycle: an empty answer here is real.
+      //   - CLOB failed but this account has never had CLOB creds provisioned (client absent) ->
+      //     on-chain is the only source there is; believe its answer.
+      //   - CLOB failed on a provisioned account -> UNKNOWN. Keep last-known-good, exactly the
+      //     blip protection this fallback has always existed for.
+      // `client` is always constructed (creds or not), so the provisioning signal is the creds
+      // themselves: without them every CLOB call 401s forever and on-chain is the only real source.
+      const clobProvisioned = !!creds;
+      const zeroIsReal = clob != null || (!clobProvisioned && onchain != null);
+      if (zeroIsReal) {
         lastGoodBalance = 0;
         return 0;
       }
-      return lastGoodBalance ?? 0; // both sources unreadable: never collapse sizing on a blip
+      return lastGoodBalance ?? 0; // the source that could hold the cash did not answer: hold the line
       })();
       if (!fresh) balInflight = run;
       try { return await run; } finally { if (balInflight === run) balInflight = null; }
