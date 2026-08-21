@@ -697,6 +697,13 @@ export function startCopyTrade(deps) {
   }
   function sizeFor(sig, unitBasis, portfolio) {
     if (V2()) {
+      // MINIMUM PORTFOLIO APPLIES TO v2 TOO (2026-08-21). The v2 branch returns before the ONESHOT
+      // guard below, so an account under the floor still sized to V2_FLOOR_USD and attempted - the
+      // gate then refused it "portfolio_too_small" every cycle. Latent while v2 was five hand-picked
+      // accounts, all comfortably above the line; the moment it went fleet-wide (median portfolio
+      // $32) it became 730 of 743 denials in six minutes, each one a database write and a serverless
+      // invocation for an account that CANNOT trade. Same line the app warns on.
+      if (ONESHOT && !(portfolio >= ONESHOT_MIN_PORTFOLIO_USD)) return { target: 0, beats: null };
       const own = v2Pct(sig);
       const pct = own == null ? Number(sig.tier_pct_resolved) : own;
       if (!Number.isFinite(pct) || pct <= 0) return { target: 0, beats: null };
