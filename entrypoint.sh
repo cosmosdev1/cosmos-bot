@@ -59,7 +59,29 @@ start_bot() {
   # @polymarket/clob-client-v2) are pure JS and need no build scripts; ws's optional native addons
   # are skipped harmlessly. npm install remains only as the fallback for a lock desync, so a bad
   # lockfile can never brick the fleet - it logs loudly instead.
-  npm ci --omit=dev --ignore-scripts --no-audit --no-fund --silent     || { echo "[launcher] npm ci failed (lock desync?) - falling back to npm install"; npm install --omit=dev --ignore-scripts --no-audit --no-fund --silent || true; }
+  # INSTALL IS VERIFIED OR THE BOT DOES NOT START (fleet crash 2026-08-21/22). A network blip
+  # mid-install left node_modules half-written, the old `|| true` started the runner on the broken
+  # tree anyway, and every child then died at boot on MODULE_NOT_FOUND - a fleet-wide crash-loop
+  # that could never heal, because the surviving runner never re-triggers an install. Now: give any
+  # straggler children time to die before touching the tree (their SIGKILL fallback is 10s), retry
+  # the install with a canary require of real deps, and if the tree still cannot be verified, WAIT
+  # and retry rather than start broken - a delayed start costs minutes, a broken start costs the
+  # whole fleet.
+  sleep 12
+  INSTALL_OK=0
+  for ATTEMPT in 1 2 3 4; do
+    if [ "$ATTEMPT" = "4" ]; then rm -rf node_modules; fi   # last resort: clean slate
+    npm ci --omit=dev --ignore-scripts --no-audit --no-fund --silent       || npm install --omit=dev --ignore-scripts --no-audit --no-fund --silent || true
+    if node -e "['viem','ws','form-data','asynckit'].forEach(function(m){require.resolve(m)})" 2>/dev/null; then
+      INSTALL_OK=1; break
+    fi
+    echo "[launcher] dependency tree failed verification (attempt $ATTEMPT); retrying in 20s"
+    sleep 20
+  done
+  if [ "$INSTALL_OK" != "1" ]; then
+    echo "[launcher] REFUSING to start on a broken dependency tree - will retry on the next cycle"
+    return 1 2>/dev/null || true
+  fi
   node "$ENTRY" &
   BOT_PID=$!
   echo "[launcher] bot started (pid $BOT_PID) @ $(git rev-parse --short HEAD 2>/dev/null || echo '?')"

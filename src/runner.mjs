@@ -99,6 +99,7 @@ async function roster() {
     qs.set("cap", String(MAX));
     const url = `${API}/api/cloud/runner/roster?${qs.toString()}`;
     const r = await fetch(url, { headers: { "x-runner-secret": SECRET }, signal: ctl.signal });
+    netOk();   // ANY http answer proves our sockets work - the wedge watchdog only fires on silence
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
     return Array.isArray(j?.accounts) ? j.accounts : null;
@@ -175,6 +176,7 @@ function start(a) {
   child.on("exit", (code, sig) => {
     const uptimeS = Math.round((Date.now() - rec.startedAt) / 1000);
     log(`bot ${tag} exited code=${code} sig=${sig} uptime=${uptimeS}s`);
+    noteChildExit(uptimeS);
     // A child that survived 10+ minutes earns a fresh backoff; a crash loop doubles up to 10 min.
     rec.backoffMs = uptimeS > 600 ? 30_000 : Math.min(rec.backoffMs * 2, 600_000);
     rec.child = null;
@@ -323,3 +325,40 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
     setTimeout(() => process.exit(0), 2_000);
   });
 }
+
+// SELF-HEAL EXITS (fleet crash + network wedge, 2026-08-21/22). Two failure shapes proved that a
+// LIVE runner can preside over a dead fleet forever, because the launcher only reinstalls/restarts
+// when the RUNNER process dies:
+//   1. broken dependency tree: every child exits within seconds of boot, the runner keeps
+//      respawning them into the same wall - it must exit so the launcher re-runs the verified
+//      install;
+//   2. exhausted sockets after a thrash: 98 children alive with every network call failing
+//      instantly for half an hour - processes must be recycled to get fresh descriptors.
+// Both paths exit THROUGH dieClean so children are stopped first: the launcher swaps node_modules
+// right after the runner dies, and an orphan reading a half-written tree is exactly how the first
+// crash spread. Children also self-exit on IPC disconnect as a belt-and-braces (bot.mjs).
+function dieClean(reason) {
+  log(`SELF-HEAL EXIT: ${reason} - stopping ${kids.size} bots, launcher will reinstall+restart`);
+  for (const userId of [...kids.keys()]) stop(userId, "self-heal restart");
+  setTimeout(() => process.exit(1), 11_500);   // > the 10s SIGKILL fallback in stop()
+}
+
+// crash-storm detector: N children dying young in a short window = the TREE is broken, not a bot.
+let quickDeaths = 0, quickDeathsResetAt = 0;
+export function noteChildExit(uptimeS) {
+  const now = Date.now();
+  if (now > quickDeathsResetAt) { quickDeaths = 0; quickDeathsResetAt = now + 2 * 60_000; }
+  if (uptimeS < 10) {
+    quickDeaths++;
+    if (quickDeaths >= 6) dieClean(`${quickDeaths} children died within seconds in under 2 minutes (broken tree?)`);
+  } else if (uptimeS > 60) {
+    quickDeaths = 0;   // a healthy child disproves the broken-tree theory
+  }
+}
+
+// network-wedge watchdog: when OUR OWN api calls fail non-stop, the process sockets are gone.
+let lastNetOk = Date.now();
+export const netOk = () => { lastNetOk = Date.now(); };
+setInterval(() => {
+  if (Date.now() - lastNetOk > 10 * 60_000) dieClean("no successful API call in 10 minutes (socket wedge?)");
+}, 60_000).unref();

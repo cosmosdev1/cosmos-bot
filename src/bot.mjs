@@ -51,6 +51,15 @@ const HOSTED = process.env.COSMOS_SIGNER === "remote" || process.env.COSMOS_SIGN
 // and keep running — money safety lives server-side (risk gate, 2-signature cap), not in crash
 // semantics. Legacy self-hosted bots keep stock behaviour (standing rule: gate on the signer).
 if (HOSTED) {
+// NO ORPHANS (fleet crash 2026-08-21/22): hosted children are spawned with an IPC channel. If the
+// runner dies - crash, self-heal exit, launcher update - the channel closes, and a child that
+// keeps running becomes an orphan trading unsupervised while the launcher swaps node_modules under
+// its feet (lazy requires then read a half-written tree; that is how one broken install became a
+// fleet-wide crash-loop). The invariant is simple: no runner -> no children.
+if (typeof process.connected === "boolean") {
+  process.on("disconnect", () => { console.error("runner IPC closed - exiting with it"); process.exit(0); });
+}
+
   process.on("unhandledRejection", (e) => console.error("[fatal-averted] unhandledRejection:", e?.stack || e));
   process.on("uncaughtException", (e) => console.error("[fatal-averted] uncaughtException:", e?.stack || e));
 }
