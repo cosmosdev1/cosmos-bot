@@ -230,6 +230,12 @@ const v2ClockMs = (sig) => {
 };
 const outsideV2Window = (sig, v2) => {
   if (!v2) return false;
+  // CRYPTO HAS NO TIME FRAME (owner ruling 2026-08-23): candles are exempt from the 30min-8h
+  // window entirely - both ends. This also resolves the long-pending 15m question: the 30-min
+  // floor structurally banned every 15m candle (0 of 350 measured); with the exemption they trade.
+  // A candle rides the chainwatch fast path and lives minutes-to-an-hour - the window was designed
+  // for event markets and never fit them.
+  if (isCandleSig(sig)) return false;
   const end = v2ClockMs(sig);
   if (!Number.isFinite(end)) return false;          // unknown event time -> other gates decide, never guess
   const left = end - Date.now();
@@ -237,7 +243,7 @@ const outsideV2Window = (sig, v2) => {
 };
 /** Distinguishes the two for logging: "not yet" retries, "too late" never will. */
 const tooLateV2 = (sig, v2) => {
-  if (!v2) return false;
+  if (!v2 || isCandleSig(sig)) return false;
   const end = v2ClockMs(sig);
   return Number.isFinite(end) && (end - Date.now()) < V2_MIN_MS;
 };
