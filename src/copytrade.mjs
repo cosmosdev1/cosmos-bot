@@ -26,6 +26,10 @@ import { log, warn } from "./log.mjs";
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const DRY = process.env.COPYTRADE_DRY === "1";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
+// How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
+// so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
+const FEED_MIN_MS = N("COPY_FEED_MIN_MS", 45_000);
+let lastFeed = null, lastFeedAt = 0;
 const MAX_OPEN = N("COPY_MAX_OPEN", Infinity);    // owner 2026-07-15: NO position-count cap at all. The 20%% exposure cap (dust-free) is the only guard now. Set COPY_MAX_OPEN to re-impose a count limit.
 const MIN_ORDER_USD = N("COPY_MIN_USD", 1);       // Polymarket ~$1 min order = "the first beat"
 const MIN_ADD_USD = N("COPY_MIN_ADD_USD", 1);     // smallest scale-in increment worth an order
@@ -880,8 +884,22 @@ export function startCopyTrade(deps) {
     if (state.copytrade === false) return;                       // server turned the engine off -> stop trading
     if (Date.now() < budgetPausedUntil) return;                  // budget breaker: no entries until the window frees
     if (state.cash == null || state.sizing == null) return;      // no cycle data yet
+    // FEED FETCH IS DECOUPLED FROM THE CYCLE (owner 2026-08-23: "crypto must be very fast").
+    // The obvious saving - slow the whole cycle from 20s to 60s - would have cut invocations 3x but
+    // ALSO aged state.cash/state.sizing, which the chainwatch fast path reads to size a candle
+    // entry; crypto would have been sizing off up-to-60s-old cash. So the CYCLE stays at 20s (fast
+    // path keeps fresh money data) and only the FEED fetch is throttled to FEED_MIN_MS. The server
+    // caches that feed for 45s anyway, so two of every three fetches were returning a byte-identical
+    // answer - this drops them without losing a single signal. Exits ride the feed and are
+    // minute-scale, so a <=45s refresh is well inside their tolerance.
     let feed;
-    try { feed = await cosmos.copySignals(); } catch (e) { warn("copytrade feed:", e.message); return; }
+    const feedAge = Date.now() - lastFeedAt;
+    if (feedAge >= FEED_MIN_MS || !lastFeed) {
+      try { feed = await cosmos.copySignals(); lastFeed = feed; lastFeedAt = Date.now(); }
+      catch (e) { warn("copytrade feed:", e.message); return; }
+    } else {
+      feed = lastFeed;   // inside the server's own cache window - identical bytes, no request
+    }
     const signals = feed?.signals ?? [];
     // THE HUB IS A FILTER, NOT A REPLACEMENT (deliberate). The personal feed stays the source of
     // truth because the EXIT ladder rides on it: sell_seq for a position whose market is already
