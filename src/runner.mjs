@@ -65,6 +65,11 @@ const HUB_ENABLED = process.env.COSMOS_CHAINHUB === "1";
 const SIGNALHUB_ENABLED = process.env.COSMOS_SIGNALHUB === "1";
 // The supervisor had NO top-level handlers while every child has both (bot.mjs). One unhandled
 // rejection here takes the entire fleet dark until Fly restarts it, then the ramp costs minutes.
+// NETWORK LIVENESS (declared early on purpose - the roster fetch calls netOk() during startup,
+// long before the watchdog block near the bottom of this file is evaluated).
+let lastNetOk = Date.now();
+export const netOk = () => { lastNetOk = Date.now(); };
+
 process.on("uncaughtException", (e) => console.error(new Date().toISOString(), "runner uncaught:", e?.stack ?? e));
 process.on("unhandledRejection", (e) => console.error(new Date().toISOString(), "runner unhandled rejection:", e?.stack ?? e));
 let hubToken = null;
@@ -356,9 +361,11 @@ export function noteChildExit(uptimeS) {
   }
 }
 
-// network-wedge watchdog: when OUR OWN api calls fail non-stop, the process sockets are gone.
-let lastNetOk = Date.now();
-export const netOk = () => { lastNetOk = Date.now(); };
+// network-wedge watchdog: the timer lives here, but lastNetOk/netOk are declared at the TOP of the
+// file (2026-08-23 fix). `const netOk = ...` in TDZ meant the FIRST roster fetch - which runs long
+// before this line is evaluated - threw "Cannot access 'netOk' before initialization", so the
+// runner could never fetch its roster and the whole fleet sat dark. A watchdog must never be able
+// to break the thing it watches.
 setInterval(() => {
   if (Date.now() - lastNetOk > 10 * 60_000) dieClean("no successful API call in 10 minutes (socket wedge?)");
 }, 60_000).unref();
