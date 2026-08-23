@@ -170,12 +170,25 @@ const hisAvgCents = (sig) => {
 // live signals were refused, and 15% were refused at the whale's OWN price (his avg 19c, market 20c
 // -> "32% away"). Compare the executable mid, and floor the tolerance at 5c so spread/rounding on a
 // single-digit-cent market can never trip a percentage rule.
-const tooFarFromHisEntry = (sig, execCents) => {
-  if (sig.is_pair) return false;
+// PAIR FIRST-LEG GATE (owner 2026-08-23, with the candle-whale wiring): a pair used to be FULLY
+// exempt from the 20% band - but the exemption exists to protect the SECOND leg (refusing it
+// leaves half a hedge naked), not to let the FIRST leg chase a market that already ran. Now the
+// first leg of a pair is banded exactly like a non-crypto entry, and only a leg whose sibling we
+// ALREADY HOLD stays exempt - completing the hedge is mandatory at any price.
+const tooFarFromHisEntry = (sig, execCents, holdsSibling = false) => {
+  if (sig.is_pair && holdsSibling) return false;
   const avg = hisAvgCents(sig);
   if (avg == null || !(execCents > 0)) return false;
   const tol = Math.max(avg * COPY_GAP_REL, 5);
   return Math.abs(execCents - avg) > tol;
+};
+// Do we hold the OTHER side of this signal's market? primary slot with a different outcome, or a
+// complementary-key slot under the same condition with a different token.
+const holdsPairSibling = (positions, sig) => {
+  const prim = positions[sig.condition_id];
+  if (prim && String(prim.outcome).toLowerCase() !== String(sig.outcome).toLowerCase()) return true;
+  const ownComp = `${sig.condition_id}#${sig.token_id}`;
+  return Object.keys(positions).some((k) => k.startsWith(sig.condition_id + "#") && k !== ownComp);
 };
 
 // ---- v2 ENTRY WINDOW (owner 2026-08-18) ----
@@ -835,7 +848,7 @@ export function startCopyTrade(deps) {
     // already in at his price, and the add is sized off his growing conviction, so the add path
     // above uses addCapFor() and never reaches this test. Under v2 the gate is unconditional
     // (previously ONESHOT-only), because v2 IS the strategy - the flag no longer selects behaviour.
-    if ((ONESHOT || V2()) && tooFarFromHisEntry(sig, execC)) return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
+    if ((ONESHOT || V2()) && tooFarFromHisEntry(sig, execC, holdsPairSibling(positions, sig))) return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
     { const rb = v2ReserveBlocked(sig, target); if (rb) return skip(rb); }
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
@@ -984,7 +997,7 @@ export function startCopyTrade(deps) {
         if (px == null) continue;
         // Same first-leg gate as the fast path (owner 2026-08-18): unconditional under v2, and the
         // polled ADD path above is likewise exempt because it is already in the position.
-        if ((ONESHOT || V2()) && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px)) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
+        if ((ONESHOT || V2()) && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px, holdsPairSibling(positions, sig))) continue;   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
         if (v2ReserveBlocked(sig, target)) continue;
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
