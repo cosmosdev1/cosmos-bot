@@ -779,6 +779,46 @@ async function maybeStartEngines(settings, pm, cosmos) {
     const { startCopyTrade } = await import("./copytrade.mjs");
     startCopyTrade({ pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state: qtState });
   }
+  // ---- DEDICATED TAKE-PROFIT LOOP (owner 2026-08-23) ----
+  // "sell every position at 98c+ automatically, check every 60 seconds, and don't weigh the bot
+  // down." The reason it must not ride the main cycle: a position that prints 98c holds it for a
+  // MEDIAN OF 4 MINUTES (p10 = 1 minute), and the main cycle also does feed work, exits, advice and
+  // reporting - measured median gap 31s but with a long tail. Worse, a winner we do not sell is
+  // redeemed at resolution, which pays Cosmos no builder fee at all: 186 winners printed a
+  // tradeable 98c+ in 7 days and never had a single sell order created.
+  //
+  // Deliberately CHEAP, because it runs every minute forever:
+  //   - it touches NO platform endpoint (no /account, no feed, no advice) - CLOB prices only;
+  //   - it only prices positions that could actually be sold: copytrade source, live shares, and
+  //     entry+1 <= 99 (a 99c entry can never fill above itself, so pricing it is pure waste);
+  //   - prices are read through pm.getPriceCents, which is already cached per token;
+  //   - it reuses copyExitStep, so the sell path, guards and reporting stay in ONE place;
+  //   - one position per tick at most, so a burst can never stampede the gate;
+  //   - it never runs concurrently with itself, and any throw is swallowed.
+  if (wantCopy && !engines.tpLoop) {
+    engines.tpLoop = true;
+    const TP_MS = Number(process.env.COPY_TP_LOOP_MS) || 60_000;
+    const TP_AT = Number(process.env.COPY_TP_LOOP_CENTS) || 98;
+    let busy = false;
+    setInterval(async () => {
+      if (busy || qtState.copytrade === false) return;
+      busy = true;
+      try {
+        const positions = store.load();
+        const mine = Object.values(positions).filter((p) =>
+          p && p.source === "copytrade" && Number(p.size_shares) > 0 && (Number(p.entry_cents) || 0) + 1 <= 99);
+        for (const pos of mine) {
+          const cur = await pm.getPriceCents(pos.token_id).catch(() => null);
+          if (cur == null || cur < TP_AT) continue;
+          log(`TP-loop: ${pos.outcome} at ${cur}c (>=${TP_AT}) - selling`);
+          await copyExitStep(cosmos, pm, positions, pos).catch((e) => warn("TP-loop sell:", e?.message ?? e));
+          break;                                   // one per tick: the next tick is 60s away
+        }
+      } catch (e) { warn("TP-loop:", e?.message ?? e); }
+      finally { busy = false; }
+    }, TP_MS).unref?.();
+    log(`TP-loop: ON - every ${TP_MS / 1000}s, selling any copy position at >=${TP_AT}c`);
+  }
   if (wantCert && !engines.cert15) {
     engines.cert15 = true;
     const { startCert15 } = await import("./cert15.mjs");
