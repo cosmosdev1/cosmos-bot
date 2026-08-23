@@ -20,5 +20,14 @@ ck("kill switch COPY_GENERIC_EXITS=1 restores the fall-through", reachesGenericE
 ck("kill switch accepts 'true'", reachesGenericExits({ source: "copytrade", v2: true, envOverride: "true" }), true);
 ck("an unset kill switch keeps the protection on", reachesGenericExits({ source: "copytrade", v2: true, envOverride: "" }), false);
 
+// THE BRAIN IS NEVER EVEN ASKED (owner 2026-08-23: "cancel it entirely"). Excluding copy positions
+// from the advice batch is the stronger guarantee - no verdict exists, so none can be acted on,
+// and it drops the server call too.
+const askedForAdvice = ({ source, v2 }) => !(source === "copytrade" && v2);
+ck("v2 copy position is not even sent to the exit brain", askedForAdvice({ source: "copytrade", v2: true }), false);
+ck("v1 copy position still gets advice (untouched)", askedForAdvice({ source: "copytrade", v2: false }), true);
+ck("quant still gets advice", askedForAdvice({ source: "quant", v2: true }), true);
+ck("sports still gets advice", askedForAdvice({ source: "sports", v2: true }), true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail?1:0);

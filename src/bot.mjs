@@ -1028,7 +1028,16 @@ async function cycle(cosmos, pm) {
   // --- EXITS FIRST (so stops fire before we spend on entries or hit the rate limit). ---
   // Precompute the "Cosmos AI" exit verdicts for ALL positions in ONE batch call (was one POST per
   // position -> a per-token 429 storm that force-sold held positions at -50%).
-  const adviceMap = await batchAdvice(cosmos, settings, Object.values(positions));
+  // COPY POSITIONS ARE NEVER PRICED BY THE OLD EXIT BRAIN (owner 2026-08-23: "cancel it entirely -
+  // only the whale rule and selling at 98c+"). lib/exit-brain.ts is not an AI at all: it is two
+  // constants - a hard stop at -55% from entry that fires REGARDLESS of the whales, and a +60%
+  // target. Under v2 that is simply the wrong model: if the whale still holds, a drawdown is noise
+  // and the position runs to resolution. Measured tonight, it booked real losses at 17c and 36c on
+  // positions whose whale had not sold a single share.
+  // Excluding them here also means we stop asking the server about them at all - fewer calls, and
+  // no chance a future edit re-wires a verdict we do not want.
+  const adviceCandidates = Object.values(positions).filter((p) => !(p?.source === "copytrade" && V2ForThisBot()));
+  const adviceMap = await batchAdvice(cosmos, settings, adviceCandidates);
   // BATCH THE PRICE READS TOO (scale build Inc 1.12, 2026-08-17): one getMidpoints call primes
   // every open position's mid for this pass, instead of one CLOB round trip per position per
   // cycle (the heaviest load we put on the exchange, and the audit's ceiling #16 - throttled
@@ -1112,6 +1121,9 @@ async function cycle(cosmos, pm) {
       // salvage at minute 85+ when the favorite isn't winning, rest to resolution) - NOT the
       // user's TP/SL settings.
       if (pos.source === "sports") { await sportsExitStep(cosmos, pm, positions, pos); continue; }
+      // (unreachable for v2 copy positions - they `continue` above - but if that guard is ever
+      // edited away, this keeps the old brain off them.)
+      if (pos.source === "copytrade" && V2ForThisBot()) continue;
       v = await decideExit(cosmos, pm, settings, pos, edge.cur, adviceMap.get(pos.condition_id));
     }
     if (!v || v.action === "HOLD") continue;
