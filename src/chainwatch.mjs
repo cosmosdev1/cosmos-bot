@@ -114,9 +114,25 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
   //   * after 3 consecutive FAILED checks (errors, not refusals) the fast path stands down for
   //     60s and lets the cron's slow path carry — it re-finds every fill ~6min later anyway.
   let checkFails = 0, standdownUntil = 0;
+  // DETERMINISTIC STAGGER (2026-08-23). One whale fill fans out to EVERY bot that follows him, and
+  // each child calls /copy-check independently: after the 12-whale base roster that went from ~30
+  // concurrent calls per fill to ~103, all landing inside the same second. The server work is
+  // already memoised (book 2s, market 3s, wallet row cached) - the cost was pure QUEUEING, and
+  // measured vet latency went from ~4s to a p50 of 43s and p90 of 69s, which silently breaks the
+  // crypto fast path the owner just prioritised.
+  // Spreading the same calls over ~2.5s cuts peak concurrency by an order of magnitude while adding
+  // at most 2.5s to any one fill. The offset is a hash of THIS bot's identity, not random: stable
+  // across restarts, evenly spread across the fleet, and never re-orders the same bot against
+  // itself. Candles keep the front of the window - they are the latency-critical class.
+  const selfTag = String(process.env.COSMOS_USER_ID || process.env.COSMOS_BOT_TAG || Math.random());
+  let h = 0; for (let i = 0; i < selfTag.length; i++) h = (h * 31 + selfTag.charCodeAt(i)) >>> 0;
+  const STAGGER_MS = Number(process.env.COSMOS_CHECK_STAGGER_MS) || 2_500;
+  const myOffset = STAGGER_MS ? h % STAGGER_MS : 0;
+
   async function onFill(w, tokenId, shares, l) {
     if (Date.now() < standdownUntil) return;   // server is struggling — slow path covers this fill
     const t0 = Date.now();
+    if (myOffset) await new Promise((r) => setTimeout(r, myOffset));
     let res;
     for (let a = 0; ; a++) {
       try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); checkFails = 0; break; }
