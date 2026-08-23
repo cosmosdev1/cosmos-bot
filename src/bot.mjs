@@ -826,6 +826,10 @@ async function maybeStartEngines(settings, pm, cosmos) {
   }
 }
 
+// The bot learns its strategy from /v1/account each cycle (qtState.strategyV2). One helper so the
+// exit path and the sizing path can never disagree about which strategy this bot is running.
+function V2ForThisBot() { return qtState.strategyV2 === true; }
+
 let lastSkipFlush = 0;   // copy-skip telemetry cadence (see the heartbeat block below)
 async function cycle(cosmos, pm) {
   const account = await cosmos.account();
@@ -1087,6 +1091,18 @@ async function cycle(cosmos, pm) {
     // the whale, NOT the user's TP/SL or the AI advice brain or the horizon stop.
     if (pos.source === "copytrade" && !v) continue;
     // HORIZON STOP: dead-money positions get sold no matter what the TP/SL settings say.
+    // THE COPY EXIT PATH IS AUTHORITATIVE FOR COPY POSITIONS (owner 2026-08-23).
+    // v2's spec has exactly two exits: the whale's peak-shares ratchet, and the hard take-profit.
+    // But when copyExitStep declined to act, execution fell through to the GENERIC exits below -
+    // the horizon stop and decideExit's TP/SL-or-AI verdict - which can sell at any price at all.
+    // Measured tonight: two copy positions sold at 17c and 36c while the whale still held 100% of
+    // his peak (sell_seq=0). That is the "exit for nothing" the owner asked me to hunt: it books a
+    // real loss for the user on a position the strategy says to hold, and it is not in the spec.
+    // 48 of 48 accounts run an AI tp/sl mode, so this was live fleet-wide.
+    // COPY_GENERIC_EXITS=1 restores the old fall-through if this ever needs reverting.
+    const copyOwnsExit = pos.source === "copytrade" && V2ForThisBot() &&
+      !/^(1|true|yes|on)$/i.test(process.env.COPY_GENERIC_EXITS || "");
+    if (copyOwnsExit) continue;      // ratchet + take-profit already had their say this cycle
     if (!v) {
       const hz = horizonVerdict(pos, edge.cur);
       if (hz) v = { action: "STOP_LOSS", reason: `HORIZON: ${hz}` };
