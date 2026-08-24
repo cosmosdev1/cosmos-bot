@@ -216,7 +216,10 @@ const V2_WINDOW_MS = (() => { const v = Number(process.env.COPY_V2_MAX_RESOLUTIO
 // ~1c of upside. 30min still leaves the thesis room to play out while admitting the late-building
 // positions a 1h floor was cutting off. Below the floor the signal is DEAD for entry, not waiting:
 // it can only get later. The 20% price gate applies to these entries exactly as to any other.
-const V2_MIN_MS = (() => { const v = Number(process.env.COPY_V2_MIN_RESOLUTION_H); return (Number.isFinite(v) && v >= 0 ? v : 0.5) * 3600_000; })();
+// ENTRY WINDOW FLOOR 30min -> 15min (owner 2026-08-24). Must match the platform's
+// V2_MIN_RESOLUTION_MS - the bot enforces the window, so a mismatch here silently reinstates the
+// old floor for the whole fleet. The 8h ceiling and the 20% price gate are unchanged.
+const V2_MIN_MS = (() => { const v = Number(process.env.COPY_V2_MIN_RESOLUTION_H); return (Number.isFinite(v) && v >= 0 ? v : 0.25) * 3600_000; })();
 // `v2` is passed IN, never read from an outer scope: V2() is defined inside the tick (it depends on
 // per-cycle server state), so referencing it from here threw "V2 is not defined" and aborted the
 // whole copytrade pass - caught live in the fleet logs minutes after deploy. A module-level helper
