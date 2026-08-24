@@ -400,7 +400,14 @@ const TIER_LADDER_ON = /^(1|true|yes|on)$/i.test(process.env.COPY_TIER_LADDER ||
 // copy_signals carries no event_slug, so market_question is the only identifier available; every
 // candle market Polymarket lists is titled "<Asset> Up or Down - <date>, <time>-<time> ET". Covers
 // 5m/15m/hourly alike, per the earlier spec ("all crypto 5m/15m/hourly trades").
-const isCandleSig = (sig) => /up or down/i.test(String(sig?.market_question ?? ""));
+// READ EVERY TITLE FIELD, not just one (2026-08-24). The fast path builds its signal from the
+// copy-check response and the polled path from copy_signals; if either ever names the title
+// differently, a one-field check silently reclassifies every candle as an event market and the
+// 30min-8h window bans it. That is exactly the failure this line just had for a day - a stray
+// backspace character sat where the a \b word boundary belonged, so the regex never matched and
+// NO candle was ever exempt. Fail OPEN across field names now.
+const candleTitle = (sig) => String(sig?.market_question ?? sig?.title ?? sig?.question ?? sig?.q ?? "");
+const isCandleSig = (sig) => /\bup or down\b/i.test(candleTitle(sig));
 // Mirrors the server (lib/copytrade/strategy-v2.ts candleDurationFromTitle) so the two can never
 // disagree about what counts as a 15m or hourly candle: no time range in the title means hourly.
 function candleMinutesFromTitle(q) {

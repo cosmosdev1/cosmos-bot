@@ -7,7 +7,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
-import { withSignContext } from "./remote-signer.mjs";
+import { withSignContext, signedOrderRowId, reportOrderOutcome } from "./remote-signer.mjs";
 import { makeCosmos } from "./cosmos.mjs";
 import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
@@ -116,6 +116,34 @@ const entryFails = new Map(); // condition_id -> 4xx count (in-memory; a restart
 // COSMOS CLOUD: this call is ONE economic decision, so it carries ONE triggerId for its whole retry
 // loop. The platform gate keys idempotency on (intent + triggerId), so these retries collapse to a
 // single reservation and can never double-fill. In local mode the context is simply unused.
+// CLOSE OUT THE cloud_orders ROW (2026-08-24). The platform signs every order through
+// /api/cloud/sign and books the intent against the 7% per-market cap and the hour/day budgets. It
+// has no way to see the CLOB, so until something reports back, an attempt that filled and an
+// attempt that died look identical and BOTH keep spending budget for 24h. Measured the morning this
+// was found: 1,920 signed orders in a day, none ever resolved, $15,155 booked for positions that do
+// not exist, 403 (user, market) pairs wedged, and three accounts that connected that day unable to
+// place a single trade because their own failures had eaten every cap.
+//
+// Fire-and-forget: the order is already placed and bookkeeping must never delay the next decision.
+function closeOutCloudOrder(r, kind) {
+  const orderRowId = signedOrderRowId();
+  if (!orderRowId) return;                        // nothing was signed (local refusal, dust, halt)
+  const m = r?.meta || {};
+  // The REALISED fill, never the request: extractFill has already reduced meta.size/price to what
+  // actually matched, partials included. A denial filled nothing, which is the whole point.
+  const filledSizeUsd = kind === "filled"
+    ? (Number(m.size) || 0) * ((Number(m.price) || 0) / 100)
+    : 0;
+  reportOrderOutcome({
+    base: process.env.COSMOS_SIGN_URL || config?.cosmosBase || config?.cosmos?.baseUrl || "",
+    token: config?.cosmosToken || process.env.COSMOS_TOKEN || "",
+    orderRowId,
+    filledSizeUsd,
+    polymarketOrderId: r?.body?.polymarket?.orderID ?? null,
+    error: kind === "filled" ? null : (r?.cloudCode || r?.body?.polymarket?.error || r?.status || "not filled"),
+  }).catch(() => {});
+}
+
 async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
   // FLEET BREAKER = ENTRIES ONLY (scale build Inc 0.2, 2026-08-17). A tripped breaker used to
   // arrive as bot_enabled=false (the master stop) and froze EXITS at the worst possible moment.
@@ -129,10 +157,10 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
     let r;
     for (let i = 0; i < attempts; i++) {
       r = await pm.placeOrder(args);
-      if (r.ok) return r;
+      if (r.ok) { closeOutCloudOrder(r, "filled"); return r; }
       // A definitive cloud refusal (duplicate / signature cap / halt) cannot change on a re-post.
       // Retrying it wastes the loop and, on paths that re-price, real signature money.
-      if (r.cloudDefinitive) { warn(`[cloud] entry refused (${r.cloudCode}) — not retrying`); return r; }
+      if (r.cloudDefinitive) { warn(`[cloud] entry refused (${r.cloudCode}) — not retrying`); closeOutCloudOrder(r, "denied"); return r; }
       // BUYS NEVER BLIND-RETRY (2026-08-19, first v2 pilot entry). Each attempt signs a FRESH
       // client_order_id, so nothing upstream dedupes a re-post - and an "error" here can be a
       // timeout on an order that FILLED: sebastian's first tiered entry double-bought the same
@@ -142,6 +170,16 @@ async function placeWithRetry(pm, args, attempts = 5, cooldownMs = 150) {
       // money mis-sized. SELLS keep retrying - an exit must land, and selling twice fails safe
       // (the second attempt has nothing left to sell).
       if (String(args?.side || "").toUpperCase() === "BUY") {
+        // TELL THE PLATFORM WHAT THE EXCHANGE DID (2026-08-24). `rejected` means the CLOB
+        // answered and refused, and a readable zero-size fill means it matched nothing - both
+        // are a definitive ZERO, so report it and hand the account back the exposure it never
+        // used. Anything else here is genuinely UNKNOWN (a timeout, a response with no fill
+        // info) and may really have filled: reporting zero for those would under-count real
+        // exposure against the 7% cap, so we stay silent and let the platform keep counting it
+        // in full until CLOUD_OUTCOME_TTL_MS - the fail-closed side of the trade.
+        const definitelyNothing = r?.rejected === true
+          || (r?.meta && r.meta.fill_unknown !== true && Number(r.meta.size) === 0);
+        if (definitelyNothing) closeOutCloudOrder(r, "denied");
         warn(`[cloud] BUY attempt ambiguous (${r.cloudCode || r.status || "error"}) - NOT retrying; if it filled, next cycle sees the position`);
         return r;
       }

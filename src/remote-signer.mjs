@@ -40,7 +40,21 @@ const store = new AsyncLocalStorage();
 
 /** Run `fn` with the sign context bound to this one decision. One decision = one triggerId. */
 export function withSignContext({ triggerId, conditionId } = {}, fn) {
-  return store.run({ triggerId: triggerId ?? null, conditionId: conditionId ?? "" }, fn);
+  return store.run({ triggerId: triggerId ?? null, conditionId: conditionId ?? "", orderRowId: null }, fn);
+}
+
+/**
+ * The cloud_orders row this decision signed, so the caller can report what the EXCHANGE did with it.
+ *
+ * Until 2026-08-24 nothing ever did. Every signed order sat at status `signed` forever with a null
+ * fill, and the platform's risk gate - which cannot see the CLOB - charged all of them against the
+ * 7% per-market cap and the hour/day budgets for a full day. Measured that morning: 1,920 signed
+ * orders in 24h, none in any later state, $15,155 of notional booked for positions that do not
+ * exist, 403 (user, market) pairs wedged shut. Three accounts that connected that day never traded
+ * at all - their own failed attempts had eaten every cap they had.
+ */
+export function signedOrderRowId() {
+  return store.getStore()?.orderRowId ?? null;
 }
 
 // BigInt-safe JSON (order amounts are often BigInt in viem's message).
@@ -99,6 +113,35 @@ function withDomainType(types, domain) {
   return { EIP712Domain: d, ...types };
 }
 
+/**
+ * Tell the platform what the exchange did with the signed order. Best-effort and non-throwing: the
+ * order is already placed, and bookkeeping must never break a trading loop or delay a decision.
+ * `filledSizeUsd: 0` is the important case - it says the exchange took nothing, which is what stops
+ * a dead attempt from eating the per-market cap for a day. It does NOT refund the signature: that
+ * was really spent, and the per-trade signature cap still counts it.
+ */
+export async function reportOrderOutcome({ base, token, orderRowId, filledSizeUsd, polymarketOrderId, error }) {
+  if (!base || !token || !orderRowId) return false;
+  try {
+    let b = String(base); while (b.endsWith("/")) b = b.slice(0, -1);
+    const url = b + "/api/cloud/sign/outcome";
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        orderRowId,
+        filledSizeUsd: Math.max(0, Number(filledSizeUsd) || 0),
+        polymarketOrderId: polymarketOrderId ?? null,
+        error: error ? String(error).slice(0, 400) : null,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    return r.ok;
+  } catch {
+    return false;   // the gate falls back to counting it in full for CLOUD_OUTCOME_TTL_MS
+  }
+}
+
 export function makeRemoteSigner(config) {
   const base = String(process.env.COSMOS_SIGN_URL || config?.cosmosBase || config?.cosmos?.baseUrl || "").replace(/\/$/, "");
   const token = config?.cosmosToken || config?.cosmos?.token || process.env.COSMOS_TOKEN || "";
@@ -123,7 +166,13 @@ export function makeRemoteSigner(config) {
       err.cloudCode = "unreachable";
       throw err;
     }
-    if (r.ok && d.ok && d.signature) return d.signature;
+    if (r.ok && d.ok && d.signature) {
+      // Remember which cloud_orders row this was so reportOrderOutcome() can close it out. Only an
+      // ORDER signature has one; a ClobAuth has no order row and leaves the slot null.
+      const ctx = store.getStore();
+      if (ctx && d.orderRowId) ctx.orderRowId = String(d.orderRowId);
+      return d.signature;
+    }
     // Definitive outcomes (duplicate / denied / approver refusal) MUST NOT be retried into a
     // double-fill. Surface a typed error so placeWithRetry can stop rather than re-post.
     const err = new Error(`cloud sign ${d.code || `http_${r.status}`}: ${d.reason || d.error || "no signature"}`);
