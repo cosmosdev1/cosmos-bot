@@ -136,6 +136,13 @@ export function makeCosmos(config) {
     // shares, the server returns SELL_PARTIAL with that fraction (of our original) + a seq (once per step).
     async copyExit(pos) {
       const q = new URLSearchParams({ cid: pos.condition_id, outcome: String(pos.outcome ?? ""), seq: String(pos.copy_seq ?? 0) });
+      // WHICH WHALE THIS POSITION IS BOUND TO (owner 2026-08-25). copy_signals holds ONE row per
+      // (market, outcome, track) and its driver can legitimately change hands once the previous
+      // whale is out - so the row's CURRENT owner is not necessarily the whale we bought with. The
+      // server used to read sg.wallets[0] and answer from whoever holds the row now, which means a
+      // stranger's exit could dump a position we entered following someone still holding. Sending
+      // the binding lets the server refuse that. Old bots omit it and behave exactly as before.
+      if (pos.copy_wallet) q.set("w", String(pos.copy_wallet).toLowerCase());
       // ONE-SHOT (hosted): ask for the two-step exit (half out at -50% from his peak, the rest when he
       // is gone) instead of the 10-step ladder, which costs ~10 signatures per position. Self-hosted
       // bots leave COSMOS_ONESHOT unset and never send this, so their behaviour is unchanged.

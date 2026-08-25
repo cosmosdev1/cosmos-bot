@@ -820,6 +820,15 @@ export function startCopyTrade(deps) {
       // NEVER REBUY AFTER AN EXIT (owner 2026-08-13): once ANY mirror-sell fired on this signal,
       // adds are dead for good - a top-up after our own exit would buy back what we just sold.
       if (V2() && (Number(sig.sell_seq) || 0) > 0) return skip("no adds after an exit (v2)");
+      // ONLY THE WHALE WE ENTERED WITH MAY GROW THIS POSITION (owner 2026-08-25). One signal row per
+      // (market, outcome, track) is shared by every whale in the track, and its driver can change
+      // hands once the previous one is out. Sizing a top-up off a DIFFERENT whale's money-in means
+      // adding to our position on someone else's conviction - and the exit ratchet would then be
+      // riding a whale we never chose. The other side of the market is unaffected: it is a separate
+      // row and may be entered on its own tier by anyone.
+      const driver = String(sig.wallets?.[0]?.wallet || "").toLowerCase();
+      const boundTo = String(mine.copy_wallet || "").toLowerCase();
+      if (boundTo && driver && driver !== boundTo) return skip("add: signal driver " + driver.slice(0, 10) + " is not the whale we entered with");
       const held = Number(mine.size_usd) || 0;
       // Never let one position grow past the per-position ceiling, whatever the target says.
       let add = Math.min(target, posCeil) - held;
