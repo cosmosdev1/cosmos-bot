@@ -792,7 +792,21 @@ export function startCopyTrade(deps) {
     // TRACE EVERY REFUSAL (deep-check forensics): the server logs every verdict, but the bot refused
     // silently — 38 approved markets got no order in 24h and NOTHING said why. One line per skip.
     const skip = (why) => { bumpSkip(why); log(`copytrade fast-skip ${sig.category} ${sig.outcome}: ${why} · ${String(sig.market_question || "").slice(0, 32)}`); };
-    if (!(target > 0)) return skip("beats=0 (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " vs avg $" + Math.round(Number(sig.wallets?.[0]?.avg_trade_usd) || 0) + ")");
+    // SAY WHICH GATE REFUSED. This printed "beats=0" for every zero target, including under v2 where
+    // there are no beats at all - sizeFor returns { beats: null } long before the beat ladder - and
+    // it printed avg_trade_usd, a v1 concept, next to it. "beats=0" is 82% of all fleet skips, so
+    // the single most common thing the fleet says about itself was named after a retired strategy.
+    // The same mislabelling on the server ("conflict: opposite side bigger" covering the retired
+    // one-whale lock) sent a whole day's investigation to the wrong place.
+    if (!(target > 0)) {
+      if (V2()) {
+        const pct = v2Pct(sig) ?? Number(sig.tier_pct_resolved);
+        return skip(!(state.portfolio >= ONESHOT_MIN_PORTFOLIO_USD)
+          ? "portfolio $" + Math.round(state.portfolio || 0) + " under the $" + ONESHOT_MIN_PORTFOLIO_USD + " floor"
+          : "below his tier ladder (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " -> " + (Number.isFinite(pct) ? pct + "%" : "no tiers computed") + ")");
+      }
+      return skip("beats=0 (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " vs avg $" + Math.round(Number(sig.wallets?.[0]?.avg_trade_usd) || 0) + ")");
+    }
     // pre-kickoff window is the LEGACY model; one-shot buys in-play behind the gap band instead
     if (!ONESHOT && sportsWindowClosed(sig)) return skip(`pre-game window closed (<${SPORTS_MIN_LEFT_MIN}m to kickoff)`);
 
