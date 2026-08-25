@@ -1125,7 +1125,18 @@ async function cycle(cosmos, pm) {
     // EDGE RULES FIRST, for EVERY position type - sports included. Sports used to skip straight
     // to the server strategy, so the 97c+ lock-in and <=3c salvage never fired on them.
     const edge = await edgeExit(pm, pos);
-    if (edge.action === "HOLD") continue; // book gone - resolution auto-redeems
+    // "resolution auto-redeems" is NOT true for hosted wallets (measured 2026-08-25). Positions sit
+    // claimable for days: 400h, 256h, 208h across 6 accounts, $131 in total. Polymarket clears them
+    // in batches when someone opens the UI, not on a schedule.
+    // We still hold, and holding is still right - a winner redeems at 100c while any pre-resolution
+    // sell gives up the last cents PLUS the fee, so selling early is a losing trade. What we cannot
+    // do is CLAIM it: redeemPositions credits msg.sender only, so the call must come from the user's
+    // deposit wallet, and the enclave policy denies SIGN_TRANSACTION outright (and cannot be
+    // narrowed - the policy engine reads EIP-712 fields and cannot parse a proxy execute's nested
+    // calldata; pinning `to` to ConditionalTokens would also authorise its ERC-1155 safeTransferFrom).
+    // So the money is detected and reported instead: tools/audit/_redeem-sweep.mjs raises an alarm,
+    // and the user can claim it in one click from Polymarket's own UI.
+    if (edge.action === "HOLD") continue; // book gone - hold to resolution (see _redeem-sweep.mjs)
     let v = edge.action ? edge : null;
     // WEATHER: edge rules ONLY - the 98c take-profit or the <=3c salvage. NEVER AI advice, the
     // -50% fallback, a manual SL, or the horizon stop. A near-certain bracket bet just holds to
