@@ -523,13 +523,24 @@ async function marketableSellInner(cosmos, pm, pos, action = "STOP_LOSS", minCen
       return { mid, sellPrice, held: true, ok: false, status: 0, body: { skipped: `below the $1 exchange minimum at the priced bid (${pos.size_shares} sh @ ${sellPrice}c)` } };
     }
     const r = await pm.placeOrder({ tokenId: pos.token_id, side: "SELL", sizeShares: pos.size_shares, priceCents: sellPrice, orderType: "FAK" });
-    if (r.ok) { try { await cosmos.meter({ ...r.meta, source: pos.source ?? null }); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
+    // TELL THE PLATFORM WHAT THE EXCHANGE DID. This path never did, so every signed SELL sat at
+    // status `signed` with a null fill forever - the exact bug fixed for BUYS on 2026-08-24 and
+    // left standing on this side. Measured 2026-08-25: zero sell fills recorded across twelve
+    // hours, which made it impossible to tell a sell that filled from one that never landed while
+    // diagnosing a fleet-wide halt.
+    if (r.ok) { closeOutCloudOrder(r, "filled"); try { await cosmos.meter({ ...r.meta, source: pos.source ?? null }); } catch { /* order placed; meter best-effort */ } return { mid, sellPrice, ...r }; }
     // Definitive cloud refusal: every further attempt re-prices into another paid signature that the
     // gate will refuse anyway. Stop and let the caller retry on a later cycle.
-    if (r.cloudDefinitive) { warn(`[cloud] exit refused (${r.cloudCode}) — not repricing`); return { mid, sellPrice, ...r }; }
+    if (r.cloudDefinitive) { warn(`[cloud] exit refused (${r.cloudCode}) — not repricing`); closeOutCloudOrder(r, "denied"); return { mid, sellPrice, ...r }; }
     last = r;
     if (attempt < 4) await sleep(200);
   }
+  // Out of re-price attempts. Report a DEFINITIVE zero only - the exchange answered and refused, or
+  // it answered with a readable zero-size fill. Anything else (a timeout, a reply with no fill info)
+  // may really have sold, and claiming zero there would hand back exposure we are still carrying.
+  const nothing = last?.rejected === true
+    || (last?.meta && last.meta.fill_unknown !== true && Number(last.meta.size) === 0);
+  if (nothing) closeOutCloudOrder(last, "denied");
   return { mid, ...last };
 }
 
