@@ -42,8 +42,12 @@ const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a positio
 const V2_MAX_ENTRY_CENTS = N("COPY_V2_MAX_ENTRY_CENTS", 97);
 // How long to wait before re-asking a question the gate already answered deterministically.
 const DENY_COOLDOWN_MS = N("COPY_DENY_COOLDOWN_MS", 120_000);   // wait before re-asking a deterministic denial
-// A market that has not OPENED yet is a different kind of "no" - it stays no for hours, not seconds.
-const PREOPEN_COOLDOWN_MS = N("COPY_PREOPEN_COOLDOWN_MS", 20 * 60_000);
+// A venue that will not match is a different kind of "no" than a book that moved - it stays no for
+// minutes at least. Ten, not twenty: the cooldown is also what delays our RECOVERY, and during the
+// 2026-08-26 outage a twenty-minute wait would have kept us out of markets for a third of an hour
+// after Polymarket came back. Ten still cuts the wasted signature attempts by more than half while
+// putting us back in the book within one bot cycle of the venue returning.
+const PREOPEN_COOLDOWN_MS = N("COPY_PREOPEN_COOLDOWN_MS", 10 * 60_000);
 // ADD CEILING for scan-adopted signals (owner model 2026-07-22): an add must respect the same
 // ±20c-of-his-entry band as the open. Tier restamps arrive with no price check server-side, so
 // without this a whale growing his position while the price ran to 90c would have every bot
