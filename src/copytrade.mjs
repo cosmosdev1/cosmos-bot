@@ -42,6 +42,14 @@ const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a positio
 const V2_MAX_ENTRY_CENTS = N("COPY_V2_MAX_ENTRY_CENTS", 97);
 // How long to wait before re-asking a question the gate already answered deterministically.
 const DENY_COOLDOWN_MS = N("COPY_DENY_COOLDOWN_MS", 120_000);   // wait before re-asking a deterministic denial
+// VENUE-LEVEL BACKOFF. Tracks which distinct markets have answered "not matching" recently; enough
+// of them at once means the exchange, not the markets.
+const venueRefusals = new Map();                                   // cid -> when it refused
+let venueBackoffUntil = 0;
+const VENUE_WINDOW_MS = N("COPY_VENUE_WINDOW_MS", 5 * 60_000);
+const VENUE_MIN_MARKETS = N("COPY_VENUE_MIN_MARKETS", 3);
+const VENUE_BACKOFF_MS = N("COPY_VENUE_BACKOFF_MS", 5 * 60_000);
+
 // A venue that will not match is a different kind of "no" than a book that moved - it stays no for
 // minutes at least. Ten, not twenty: the cooldown is also what delays our RECOVERY, and during the
 // 2026-08-26 outage a twenty-minute wait would have kept us out of markets for a third of an hour
@@ -651,6 +659,22 @@ export function startCopyTrade(deps) {
       if (/trading is disabled|not accepting orders|market is closed/i.test(exErr)) {
         recentBuy.set(sig.condition_id, Date.now() - COOLDOWN_MS + PREOPEN_COOLDOWN_MS);
         bumpSkip("deny-cooldown:market-not-open-yet");
+        // ONE MARKET IS A MARKET. SEVERAL AT ONCE IS THE VENUE.
+        // Per-market cooldowns all start together during an outage and therefore all EXPIRE
+        // together - measured 2026-08-26, that produced a herd of 70 refused orders in ten minutes,
+        // every one a paid signature against an exchange known to be down, and each one eating a
+        // per-trade signature cap that then locks the market out for 24 HOURS even after the venue
+        // returns. Distinct markets refusing inside one window is evidence about the venue, not
+        // about any market, so back the whole engine off briefly.
+        // Deliberately NOT a halt: it is short, it self-clears, nobody has to press anything, and
+        // exits are untouched throughout - a venue that cannot match cannot fill a sell either, but
+        // the moment it can, the exit path must already be live.
+        venueRefusals.set(sig.condition_id, Date.now());
+        for (const [cid, at] of venueRefusals) if (Date.now() - at > VENUE_WINDOW_MS) venueRefusals.delete(cid);
+        if (venueRefusals.size >= VENUE_MIN_MARKETS && Date.now() > venueBackoffUntil) {
+          venueBackoffUntil = Date.now() + VENUE_BACKOFF_MS;
+          warn(`[venue] ${venueRefusals.size} markets refused as not-matching inside ${Math.round(VENUE_WINDOW_MS / 60000)}min - pausing ENTRIES ${Math.round(VENUE_BACKOFF_MS / 60000)}min. Exits keep running.`);
+        }
       }
       warn(`copytrade ${kind} failed: ${why.slice(0, 120)}`); return false;
     }
@@ -880,6 +904,9 @@ export function startCopyTrade(deps) {
     }
     const key = primary ? compKey : sig.condition_id;             // opposite side held -> composite key
     if (positions[key]) return skip("already hold this side");
+    // The venue itself is not matching (see the backoff above). Checked before anything that costs
+    // a signature, and only on ENTRIES - an exit must stay armed for the instant matching resumes.
+    if (Date.now() < venueBackoffUntil) return skip("venue not matching - entries paused " + Math.ceil((venueBackoffUntil - Date.now()) / 60000) + "min");
     const seenKey = compKey;
     if (seen[seenKey]) return skip("buy-once-ever");
     // NOT YET, not never: the polled loop re-tests this signal every cycle and opens it the moment
