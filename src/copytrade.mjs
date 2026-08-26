@@ -56,6 +56,9 @@ const VENUE_BACKOFF_MS = N("COPY_VENUE_BACKOFF_MS", 5 * 60_000);
 // after Polymarket came back. Ten still cuts the wasted signature attempts by more than half while
 // putting us back in the book within one bot cycle of the venue returning.
 const PREOPEN_COOLDOWN_MS = N("COPY_PREOPEN_COOLDOWN_MS", 10 * 60_000);
+// Crypto cash reserve, in percent. 0 disables it (owner 2026-08-26).
+const RESERVE_PCT = N("COPY_V2_RESERVE_PCT", 0);
+const RESERVE_AFTER_PCT = N("COPY_V2_RESERVE_AFTER_PCT", 0);
 // ADD CEILING for scan-adopted signals (owner model 2026-07-22): an add must respect the same
 // ±20c-of-his-entry band as the open. Tier restamps arrive with no price check server-side, so
 // without this a whale growing his position while the price ran to 90c would have every bot
@@ -747,8 +750,14 @@ export function startCopyTrade(deps) {
     if (!V2() || isCandleSig(sig)) return false;
     const port = state.portfolio || 0, cash = state.cash ?? 0;
     if (!(port > 0)) return false;
-    if (cash < port * 0.10) return "cash under the 10% crypto reserve";
-    if (cash - amountUsd < port * 0.06) return "buy would breach the 6% reserve floor";
+    // RESERVE REMOVED (owner 2026-08-26), and no longer hardcoded. It kept 10% back so a candle
+    // signal would always find cash; the owner's call is that it cost more than it bought - nine of
+    // nineteen reporting bots were sitting under the line, declining entries while the whales ran
+    // at 210 fills per ten minutes. Both numbers are env-tunable now, so putting it back is a
+    // config change rather than a deploy.
+    const pctBefore = RESERVE_PCT, pctAfter = RESERVE_AFTER_PCT;
+    if (pctBefore > 0 && cash < port * (pctBefore / 100)) return `cash under the ${pctBefore}% crypto reserve`;
+    if (pctAfter > 0 && cash - amountUsd < port * (pctAfter / 100)) return `buy would breach the ${pctAfter}% reserve floor`;
     return false;
   }
   // THE TIER IS COMPUTED HERE, NOT READ FROM THE SIGNAL (2026-08-19). tier_pct_resolved is stamped
