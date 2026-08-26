@@ -42,6 +42,8 @@ const MAX_ADD_CENTS = N("COPY_MAX_ADD_CENTS", 97);     // scaling into a positio
 const V2_MAX_ENTRY_CENTS = N("COPY_V2_MAX_ENTRY_CENTS", 97);
 // How long to wait before re-asking a question the gate already answered deterministically.
 const DENY_COOLDOWN_MS = N("COPY_DENY_COOLDOWN_MS", 120_000);   // wait before re-asking a deterministic denial
+// A market that has not OPENED yet is a different kind of "no" - it stays no for hours, not seconds.
+const PREOPEN_COOLDOWN_MS = N("COPY_PREOPEN_COOLDOWN_MS", 20 * 60_000);
 // ADD CEILING for scan-adopted signals (owner model 2026-07-22): an add must respect the same
 // ±20c-of-his-entry band as the open. Tier restamps arrive with no price check server-side, so
 // without this a whale growing his position while the price ran to 90c would have every bot
@@ -628,6 +630,21 @@ export function startCopyTrade(deps) {
       if (r.cloudCode === "buy_above_book" || r.cloudCode === "market_concentration") {
         recentBuy.set(sig.condition_id, Date.now() - COOLDOWN_MS + DENY_COOLDOWN_MS);
         bumpSkip(`deny-cooldown:${r.cloudCode}`);
+      }
+      // THE EXCHANGE SAYING "trading is disabled" IS ALSO DETERMINISTIC, and for far longer than a
+      // book moving. It appeared the moment the roster gained a candle-only whale (2026-08-26): a
+      // pre-buy of a FUTURE candle is explicitly allowed by the spec - crypto is exempt from the
+      // entry window at both ends - but a candle hours from its own start has not opened for
+      // trading, so Polymarket refuses it. Measured that morning: 186 refusals, 39% of every order
+      // placed, spread over ten markets - roughly eighteen paid signature attempts each for an
+      // answer that could not change for hours.
+      // Longer cooldown than a price denial, because the thing being waited on is the market
+      // OPENING rather than a book ticking. Still a cooldown and not a ban: the moment it opens,
+      // the next pass takes it.
+      const exErr = String(r.body?.polymarket?.error ?? r.error ?? "");
+      if (/trading is disabled|not accepting orders|market is closed/i.test(exErr)) {
+        recentBuy.set(sig.condition_id, Date.now() - COOLDOWN_MS + PREOPEN_COOLDOWN_MS);
+        bumpSkip("deny-cooldown:market-not-open-yet");
       }
       warn(`copytrade ${kind} failed: ${why.slice(0, 120)}`); return false;
     }
