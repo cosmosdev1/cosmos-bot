@@ -632,15 +632,17 @@ export function startCopyTrade(deps) {
         bumpSkip(`deny-cooldown:${r.cloudCode}`);
       }
       // THE EXCHANGE SAYING "trading is disabled" IS ALSO DETERMINISTIC, and for far longer than a
-      // book moving. It appeared the moment the roster gained a candle-only whale (2026-08-26): a
-      // pre-buy of a FUTURE candle is explicitly allowed by the spec - crypto is exempt from the
-      // entry window at both ends - but a candle hours from its own start has not opened for
-      // trading, so Polymarket refuses it. Measured that morning: 186 refusals, 39% of every order
-      // placed, spread over ten markets - roughly eighteen paid signature attempts each for an
-      // answer that could not change for hours.
-      // Longer cooldown than a price denial, because the thing being waited on is the market
-      // OPENING rather than a book ticking. Still a cooldown and not a ban: the moment it opens,
-      // the next pass takes it.
+      // book moving. Seen on 2026-08-26 at 39% of every order placed - and the cause was not ours:
+      // Polymarket stopped matching around 04:00 UTC. Measured across 39 unrelated tracked wallets,
+      // ZERO fills in the following two hours against a wall of them in the hour before - a cliff,
+      // not a quiet night. Books stayed full and the markets still reported accepting_orders=true.
+      // The first diagnosis blamed pre-buys of future candles, which was wrong; the error only
+      // looked new because the fleet had been halted through the outage and started placing the
+      // moment it was released.
+      // The cooldown is right regardless of which of the two it is: an exchange that will not match
+      // is not going to change its mind inside a 20-second tick, and every re-ask costs a paid
+      // signature. Longer than a price denial because what is being waited on is the venue coming
+      // back rather than a book ticking. Still a cooldown and not a ban.
       const exErr = String(r.body?.polymarket?.error ?? r.error ?? "");
       if (/trading is disabled|not accepting orders|market is closed/i.test(exErr)) {
         recentBuy.set(sig.condition_id, Date.now() - COOLDOWN_MS + PREOPEN_COOLDOWN_MS);
