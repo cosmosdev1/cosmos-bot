@@ -582,6 +582,15 @@ export function startCopyTrade(deps) {
   // the real position (target - held), so a genuine multi-add whale still gets his top-up.
   const inFlightBuys = new Set();
   async function buy(sig, orderUsd, priceCents, kind, positions, existing, key = sig.condition_id) {
+    // THE VENUE BACKOFF LIVES HERE, at the one chokepoint every entry passes through. It was first
+    // placed on a single call site and covered one of FOUR - the fast path's open, but not its add,
+    // nor either of the polled path's. The refusals carried on at 87 per ten minutes with the pause
+    // supposedly armed, which is what showed the gate was in the wrong place rather than wrong.
+    // Every one of those is a paid enclave signature and a step toward wedging that market for 24h.
+    if (Date.now() < venueBackoffUntil) {
+      bumpSkip("venue not matching - entries paused " + Math.ceil((venueBackoffUntil - Date.now()) / 60000) + "min");
+      return false;
+    }
     const tok = String(sig.token_id);
     if (inFlightBuys.has(tok)) { bumpSkip("buy-in-flight"); return false; }
     inFlightBuys.add(tok);
@@ -904,9 +913,6 @@ export function startCopyTrade(deps) {
     }
     const key = primary ? compKey : sig.condition_id;             // opposite side held -> composite key
     if (positions[key]) return skip("already hold this side");
-    // The venue itself is not matching (see the backoff above). Checked before anything that costs
-    // a signature, and only on ENTRIES - an exit must stay armed for the instant matching resumes.
-    if (Date.now() < venueBackoffUntil) return skip("venue not matching - entries paused " + Math.ceil((venueBackoffUntil - Date.now()) / 60000) + "min");
     const seenKey = compKey;
     if (seen[seenKey]) return skip("buy-once-ever");
     // NOT YET, not never: the polled loop re-tests this signal every cycle and opens it the moment
