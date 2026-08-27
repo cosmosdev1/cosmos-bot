@@ -403,7 +403,14 @@ if (HUB_ENABLED) {
   try {
     const { startChainHub } = await import("./chainhub.mjs");
     hub = startChainHub({
-      onLog: (l) => broadcast({ t: "log", log: l }),
+      onLog: (l) => {
+        // THE MULTIPLIER'S DENOMINATOR. The hub receives each on-chain fill ONCE and fans it to
+        // every child. sum(cc) across children divided by this is the events x bots multiplier the
+        // audit inferred at ~96.6x. Counting it here rather than in a child is the whole point:
+        // a child can only ever see its own copy.
+        fleetMetrics.hubEv = (fleetMetrics.hubEv || 0) + 1;
+        broadcast({ t: "log", log: l });
+      },
       onBeat: () => broadcast({ t: "beat" }),
       log: (...a) => console.log(new Date().toISOString(), ...a),
       warn: (...a) => console.warn(new Date().toISOString(), ...a),

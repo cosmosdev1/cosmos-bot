@@ -14,7 +14,8 @@
 // of percent, not to bill anyone, so bucket precision is ample.
 
 export const KEYS = Object.freeze([
-  "ev",        // unique chain events this process received from the hub
+  "ev",        // chain events this CHILD was handed (summed across children = delivery fan-out)
+  "hubEv",     // DISTINCT chain events the hub received - runner only, the multiplier's denominator
   "cc",        // /v1/copy-check calls actually issued        <- fan-out numerator
   "ccFail",    // copy-check calls that threw after retries
   "sig",       // signals seen in the copy feed
