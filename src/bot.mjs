@@ -102,6 +102,11 @@ const qtState = { cash: null, portfolio: 0, deployed: 0, sizing: null, ddHalt: f
 // Hard floor per trade: Polymarket's ~$1 minimum order. Any computed size below this is bumped up
 // to $1 (e.g. 3% of a $10 balance = $0.30 still trades at $1), as long as there's room.
 const MIN_TRADE_USD = 2;
+// The GATE's floor, not the bot's user-facing policy floor. risk.ts denies a BUY below
+// MIN_PORTFOLIO_USD - 5; mirroring that exactly is what keeps this guard incapable of suppressing an
+// order the server would have allowed. Env-tunable so it can be moved with the server if the server
+// moves, and disabled outright without a deploy.
+const ENTRY_PORTFOLIO_FLOOR_USD = Number(process.env.COPY_ENTRY_FLOOR_USD) || 50;
 
 // Cosmos-RUN engine sources (server-curated, time-sensitive strategy entries - quant strikes,
 // weather ladders, in-play sports). These are never "stale backlog": their caps and expiries
@@ -1245,6 +1250,30 @@ async function cycle(cosmos, pm) {
       if (HOSTED && s.source !== "copytrade") continue;
       if (seen[s.condition_id] || positions[s.condition_id] || heldCids.has(s.condition_id)) continue; // already evaluated / held (any side)
       if (Object.keys(positions).length >= (config.maxConcurrent ?? 10)) break; // full — leave for when a slot frees
+
+      // PORTFOLIO FLOOR ON THIS PATH TOO (2026-08-27). copytrade.mjs guards its entry loop with the
+      // $55 floor; THIS loop - which still handles source "copytrade" on hosted bots - never did.
+      // Measured: two accounts at $42.90 and $38.15 emitted ~1,333 BUY attempts an hour, every one
+      // refused "portfolio_too_small", each costing a request, a gate evaluation and a cloud_orders
+      // row for an account that cannot trade. The hard $2 floor below is why every one of those
+      // orders was exactly $2.
+      //
+      // THE THRESHOLD IS THE GATE'S, NOT THE BOT'S POLICY FLOOR. risk.ts refuses below
+      // MIN_PORTFOLIO_USD - 5 ($50), deliberately: bot and gate compute the portfolio from slightly
+      // different compositions, and the $5 gap stops an honest account flapping on the cents between
+      // them. Suppressing at $55 here would have been a REGRESSION - shadow-measured, account
+      // 901f253d sits at $50.78 and had 31 server-ALLOWED buys in 24h that a $55 guard would have
+      // silently killed. At $50 the invariant holds: this can only suppress an order the gate would
+      // itself refuse.
+      //
+      // It is an OPTIMISATION, not an authorisation: the server remains the authority and still
+      // applies its own floor to everything that does get sent. A stale local value only ever costs
+      // one cycle, because the portfolio is re-read every pass.
+      if (Number.isFinite(portfolioValue) && portfolioValue < ENTRY_PORTFOLIO_FLOOR_USD) {
+        logSkipOnce("portfolio-floor", "floor",
+          `skip entries: portfolio $${portfolioValue.toFixed(2)} under the $${ENTRY_PORTFOLIO_FLOOR_USD} gate floor`);
+        break;                                   // nothing in this loop can pass; stop scanning
+      }
 
       let sizeUsd = sizeForSignal(sizing, s, portfolioValue, deployed);
       // Floor to Polymarket's ~$1 minimum order so SMALL balances still trade instead of being
