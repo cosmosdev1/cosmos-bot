@@ -23,6 +23,7 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseProcStat } from "./proc.mjs";
+import { merge as mMerge, emptyAggregate as mEmpty } from "./metrics.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -52,6 +53,30 @@ const POLL_MS = 60_000;
 const BOT = join(dirname(fileURLToPath(import.meta.url)), "bot.mjs");
 
 if (!SECRET) { console.error("[runner] RUNNER_SECRET is required"); process.exit(1); }
+
+// STAGE 1 FLEET METRICS. One in-memory aggregate for the whole box, flushed as ONE row per minute.
+// Never per event: that is what made scan_runs a 3.5M-row problem.
+let fleetMetrics = mEmpty();
+const METRICS_MS = Number(process.env.COSMOS_METRICS_MS) || 60_000;
+
+async function flushMetrics() {
+  const m = fleetMetrics;
+  fleetMetrics = mEmpty();                       // swap first: a slow POST must not lose the next interval
+  m.kids = kids.size;
+  if (!m.ev && !m.cc && !m.reap) return;         // nothing happened - do not write a row saying so
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), 15_000);
+  try {
+    await fetch(`${API}/api/cloud/runner/metrics`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-runner-secret": SECRET },
+      body: JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner" }),
+      signal: ctl.signal,
+    });
+  } catch { /* observability must never disturb the fleet; this interval is simply lost */ }
+  finally { clearTimeout(t); }
+}
+if (METRICS_MS > 0) setInterval(() => { flushMetrics().catch(() => {}); }, METRICS_MS).unref?.();
 
 /** userId -> { child, startedAt, backoffMs, entry } */
 const kids = new Map();
@@ -177,6 +202,9 @@ function start(a) {
   // Children report the wallets they follow; the hub subscribes to the union of all of them.
   child.on("message", (m) => {
     if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); syncHubWallets(); }
+    // STAGE 1: a child's counter DELTA for the last interval. Merged in memory; nothing is written
+    // per message. merge() drops unknown keys, so one misbehaving child cannot inflate cardinality.
+    else if (m?.t === "metrics" && m.m) mMerge(fleetMetrics, m.m);
   });
   const rec = { child, startedAt: Date.now(), backoffMs: kids.get(a.user_id)?.backoffMs ?? 30_000, entry: a };
   child.on("exit", (code, sig) => {
@@ -264,7 +292,7 @@ function reapOrphans() {
       if (!(ageS > ORPHAN_MIN_AGE_S)) continue;
       try {
         process.kill(pid, "SIGKILL");
-        killed++;
+        killed++; fleetMetrics.reap = (fleetMetrics.reap || 0) + 1;
         log(`ORPHAN REAPED pid ${pid} (bot.mjs, ppid 1 - its supervisor died and left it running)`);
       } catch (e) {
         log(`orphan pid ${pid} could not be killed: ${e.code || e.message}`);

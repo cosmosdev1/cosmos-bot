@@ -9,6 +9,7 @@ import { pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { withSignContext, signedOrderRowId, reportOrderOutcome } from "./remote-signer.mjs";
 import { makeCosmos } from "./cosmos.mjs";
+import { snapshot as metricsSnapshot } from "./metrics.mjs";
 import { makePolymarket } from "./polymarket.mjs";
 import * as store from "./store.mjs";
 import { log, warn, err } from "./log.mjs";
@@ -58,6 +59,14 @@ if (HOSTED) {
 // fleet-wide crash-loop). The invariant is simple: no runner -> no children.
 if (typeof process.connected === "boolean") {
   process.on("disconnect", () => { console.error("runner IPC closed - exiting with it"); process.exit(0); });
+  // STAGE 1 METRICS FLUSH. Deltas, over the IPC channel that already exists, once a minute. No
+  // database write happens here at all - the runner aggregates every child and writes ONE row for
+  // the whole box. A dropped flush costs one interval and can never double-count, because snapshot()
+  // resets. Wrapped so instrumentation can never take a trading process down.
+  const METRICS_MS = Number(process.env.COSMOS_METRICS_MS) || 60_000;
+  if (METRICS_MS > 0) setInterval(() => {
+    try { process.send?.({ t: "metrics", m: metricsSnapshot() }); } catch { /* parent gone; watchdog covers */ }
+  }, METRICS_MS).unref?.();
 }
 
   process.on("unhandledRejection", (e) => console.error("[fatal-averted] unhandledRejection:", e?.stack || e));

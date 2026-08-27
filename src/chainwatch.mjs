@@ -34,6 +34,7 @@ const HTTP = (process.env.COSMOS_RPC_URL || "https://polygon-bor-rpc.publicnode.
 const WALLET_REFRESH_MS = 5 * 60_000;
 // Set ONLY by the hosted runner (src/runner.mjs). Self-hosted bots never see it, so their
 // behaviour is bit-for-bit what it was: their own socket, their own subscription.
+import { inc, observe } from "./metrics.mjs";
 const HUB = process.env.COSMOS_CHAINHUB === "1" && typeof process.send === "function";
 
 async function rpc(method, params) {
@@ -130,14 +131,21 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
   const myOffset = STAGGER_MS ? h % STAGGER_MS : 0;
 
   async function onFill(w, tokenId, shares, l) {
+    // STAGE 1: the two terms of the fan-out multiplier, counted at the only place both are visible.
+    // "ev" is one whale fill THIS child was handed; "cc" is a copy-check actually issued for it.
+    // Fleet-wide, sum(cc) / distinct(ev) is the events x bots multiplier the audit put at ~96.6x and
+    // Stage 4 must drive toward ~1x. Counted before the standdown return so a struggling server
+    // shows as ev >> cc rather than as a silent hole in both.
+    inc("ev");
     if (Date.now() < standdownUntil) return;   // server is struggling — slow path covers this fill
     const t0 = Date.now();
     if (myOffset) await new Promise((r) => setTimeout(r, myOffset));
     let res;
     for (let a = 0; ; a++) {
-      try { res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); checkFails = 0; break; }
+      try { inc("cc"); res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); checkFails = 0; observe(Date.now() - t0); break; }
       catch (e) {
         if (a >= 2) {
+          inc("ccFail");
           if (++checkFails >= 3) { standdownUntil = Date.now() + 60_000; warn("chainwatch: 3 checks failed in a row - fast path stands down 60s (slow path covers)"); }
           else warn(`chainwatch check failed ${a + 1}x (giving up; slow path covers):`, e.message);
           return;

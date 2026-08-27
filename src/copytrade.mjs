@@ -25,6 +25,7 @@ import { log, warn } from "./log.mjs";
 
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const DRY = process.env.COPYTRADE_DRY === "1";
+import { inc as mInc } from "./metrics.mjs";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
 // How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
 // so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
@@ -1047,7 +1048,7 @@ export function startCopyTrade(deps) {
       // ONLY applied to ENTRY candidates we do not already hold - a held position must still walk
       // the loop below for top-ups and for the exit bookkeeping the feed drives.
       if (enterableKeys && !positions[sig.condition_id]
-          && !enterableKeys.has(`${sig.condition_id}|${String(sig.outcome).toLowerCase()}`)) { stats.hubSkipped = (stats.hubSkipped ?? 0) + 1; continue; }
+          && !enterableKeys.has(`${sig.condition_id}|${String(sig.outcome).toLowerCase()}`)) { stats.hubSkipped = (stats.hubSkipped ?? 0) + 1; mInc("skip"); continue; }
       // ADOPT-ONLY users see ONLY adopt signals. The whale-fill copies (kind "new") are aviv's alone.
       if (state.copyFills === false && sig.kind !== "adopt") continue;
       // hosted: only signals driven by one of THIS user's picked wallets (see refreshMyWallets)
