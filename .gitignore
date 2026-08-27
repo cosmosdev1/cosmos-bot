@@ -15,3 +15,4 @@ qtable-live.env
 fleet-priv.pem
 *.pem
 .proveout.env
+tools/tmp/
