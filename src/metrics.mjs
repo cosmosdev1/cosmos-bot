@@ -42,8 +42,15 @@ let histSum = 0, histN = 0;
 
 /** Add to a counter. An unknown key is IGNORED - that is what keeps cardinality fixed. */
 export function inc(key, n = 1) {
+  // TOTAL BY CONSTRUCTION. These calls sit inside the try that wraps copyCheck in the trading path,
+  // so a throw here would be caught and misread as a failed copy-check - instrumentation turning
+  // itself into a trade decision. Number(Symbol) and Number(null-prototype object) both throw during
+  // conversion, and `key in obj` throws for a key that cannot become a primitive, so both are guarded
+  // rather than assumed. Unreachable from today's call sites; guarded so a future one cannot regress it.
+  if (typeof key !== "string") return false;
   if (!(key in counters)) return false;
-  const v = Number(n);
+  let v;
+  try { v = Number(n); } catch { return false; }
   if (!Number.isFinite(v)) return false;
   counters[key] += v;
   return true;
@@ -51,7 +58,8 @@ export function inc(key, n = 1) {
 
 /** Record a latency observation in milliseconds. */
 export function observe(ms) {
-  const v = Number(ms);
+  let v;
+  try { v = Number(ms); } catch { return false; }        // Symbol / null-prototype object
   if (!Number.isFinite(v) || v < 0) return false;
   for (let i = 0; i < BUCKETS.length; i++) {
     if (v <= BUCKETS[i]) { hist[i]++; break; }
@@ -89,7 +97,8 @@ export function snapshot() {
 /** Merge a child's delta into an aggregate. Unknown keys are dropped, so a bad child cannot inflate cardinality. */
 export function merge(into, delta) {
   for (const k of KEYS) {
-    const v = Number(delta?.[k]);
+    let v;
+    try { v = Number(delta?.[k]); } catch { continue; }   // a child could send anything
     if (Number.isFinite(v)) into[k] = (into[k] || 0) + v;
   }
   const l = delta?.lat;
