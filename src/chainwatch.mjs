@@ -35,6 +35,7 @@ const WALLET_REFRESH_MS = 5 * 60_000;
 // Set ONLY by the hosted runner (src/runner.mjs). Self-hosted bots never see it, so their
 // behaviour is bit-for-bit what it was: their own socket, their own subscription.
 import { inc, observe } from "./metrics.mjs";
+import { tokensFromLog } from "./fills.mjs";
 const HUB = process.env.COSMOS_CHAINHUB === "1" && typeof process.send === "function";
 
 async function rpc(method, params) {
@@ -54,30 +55,7 @@ async function rpc(method, params) {
 const pad32 = (addr) => "0x" + addr.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 const words = (hex) => (hex.replace(/^0x/, "").match(/.{64}/g) ?? []);
 
-// TransferSingle: data = [id, value]. TransferBatch: data = [idsOffset, valsOffset, len, ...ids, len, ...vals]
-function tokensFromLog(l) {
-  const w = words(l.data);
-  if (l.topics[0] === T_SINGLE) {
-    if (w.length < 2) return [];
-    return [{ tokenId: BigInt("0x" + w[0]).toString(), shares: Number(BigInt("0x" + w[1])) / 1e6 }];
-  }
-  if (l.topics[0] === T_BATCH) {
-    try {
-      const idsAt = Number(BigInt("0x" + w[0])) / 32;
-      const valsAt = Number(BigInt("0x" + w[1])) / 32;
-      const n = Number(BigInt("0x" + w[idsAt]));
-      const out = [];
-      for (let i = 0; i < n; i++) {
-        out.push({
-          tokenId: BigInt("0x" + w[idsAt + 1 + i]).toString(),
-          shares: Number(BigInt("0x" + w[valsAt + 1 + i])) / 1e6,
-        });
-      }
-      return out;
-    } catch { return []; }
-  }
-  return [];
-}
+// tokensFromLog now lives in ./fills.mjs so the runner's denominator and this parser cannot drift.
 
 // Start the watcher. `onSignal(signal, meta)` gets a fully vetted signal from the server; the caller
 // executes it with the same guards + sizing as the polled feed.

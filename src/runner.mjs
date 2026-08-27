@@ -24,6 +24,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseProcStat } from "./proc.mjs";
 import { merge as mMerge, emptyAggregate as mEmpty } from "./metrics.mjs";
+import { qualifyingFillIds } from "./fills.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -57,13 +58,33 @@ if (!SECRET) { console.error("[runner] RUNNER_SECRET is required"); process.exit
 // STAGE 1 FLEET METRICS. One in-memory aggregate for the whole box, flushed as ONE row per minute.
 // Never per event: that is what made scan_runs a 3.5M-row problem.
 let fleetMetrics = mEmpty();
+// Distinct qualifying fill identities seen this interval. Bounded by fills/minute (tens), cleared on
+// every flush - it is a COUNT that leaves, never a growing label set.
+let fillIds = new Set();
+// Which children reported this interval. Stage 4 must be able to tell a COMPLETE interval from a
+// PARTIAL one: cc arrives from children over lossy IPC while the denominator is counted here, so a
+// silent child biases the multiplier DOWNWARD - the direction that would fake success.
+let reporters = new Set();
+let metricSeq = 0;
+// Distinguishes "the runner restarted" from "an interval went missing": the sequence restarts at 0
+// under a new boot id, rather than looking like a gap.
+const BOOT_ID = Math.random().toString(36).slice(2, 10);
+const isWatchedAddr = (a) => watchedAddrs.has(String(a || "").toLowerCase());
+let watchedAddrs = new Set();
 const METRICS_MS = Number(process.env.COSMOS_METRICS_MS) || 60_000;
 
 async function flushMetrics() {
   const m = fleetMetrics;
   fleetMetrics = mEmpty();                       // swap first: a slow POST must not lose the next interval
   m.kids = kids.size;
-  if (!m.ev && !m.cc && !m.reap) return;         // nothing happened - do not write a row saying so
+  m.fills = fillIds.size;                        // distinct qualifying fills: the Stage 4 denominator
+  m.reporters = reporters.size;
+  m.seq = ++metricSeq;
+  m.boot = BOOT_ID;
+  m.complete = kids.size > 0 && reporters.size >= kids.size ? 1 : 0;
+  fillIds = new Set();
+  reporters = new Set();
+  if (!m.ev && !m.cc && !m.reap && !m.fills) return;   // nothing happened - do not write a row saying so
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 15_000);
   try {
@@ -105,7 +126,9 @@ const childWallets = new Map();
 let hub = null;
 function syncHubWallets() {
   if (!hub) return;
-  hub.setWallets([...childWallets.values()].flat());
+  const union = [...childWallets.values()].flat();
+  watchedAddrs = new Set(union.map((w) => String(w || "").toLowerCase()));
+  hub.setWallets(union);
 }
 function broadcast(msg) {
   for (const rec of kids.values()) {
@@ -204,7 +227,7 @@ function start(a) {
     if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); syncHubWallets(); }
     // STAGE 1: a child's counter DELTA for the last interval. Merged in memory; nothing is written
     // per message. merge() drops unknown keys, so one misbehaving child cannot inflate cardinality.
-    else if (m?.t === "metrics" && m.m) mMerge(fleetMetrics, m.m);
+    else if (m?.t === "metrics" && m.m) { mMerge(fleetMetrics, m.m); reporters.add(a.user_id); }
   });
   const rec = { child, startedAt: Date.now(), backoffMs: kids.get(a.user_id)?.backoffMs ?? 30_000, entry: a };
   child.on("exit", (code, sig) => {
@@ -408,7 +431,11 @@ if (HUB_ENABLED) {
         // every child. sum(cc) across children divided by this is the events x bots multiplier the
         // audit inferred at ~96.6x. Counting it here rather than in a child is the whole point:
         // a child can only ever see its own copy.
-        fleetMetrics.hubEv = (fleetMetrics.hubEv || 0) + 1;
+        fleetMetrics.hubEv = (fleetMetrics.hubEv || 0) + 1;      // raw logs - operational, NOT the denominator
+        // THE STAGE 4 DENOMINATOR. Distinct QUALIFYING FILLS, which is the unit that produces one
+        // copy-check each. One TransferBatch log carries several, so counting logs would understate
+        // fan-out. Uses the same parser chainwatch uses, so numerator and denominator cannot diverge.
+        for (const id of qualifyingFillIds(l, isWatchedAddr)) fillIds.add(id);
         broadcast({ t: "log", log: l });
       },
       onBeat: () => broadcast({ t: "beat" }),
