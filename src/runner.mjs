@@ -252,7 +252,7 @@ function reapOrphans() {
       // Match what the runner actually spawns - argv[0] a node binary, argv[1] the bot entrypoint -
       // rather than "the string bot.mjs appears somewhere". A command line like
       // `grep -r bot.mjs /app/repo/src/` contains it too, and this function sends SIGKILL.
-      const argv = cmd.split(" ").filter(Boolean);
+      const argv = cmd.split("\0").filter(Boolean);
       if (argv.length < 2) continue;
       if (!/(^|\/)node(\.exe)?$/.test(argv[0]) && !argv[0].includes("node")) continue;
       if (!argv.slice(1).some((a) => a.endsWith("/bot.mjs") || a === "bot.mjs")) continue;
