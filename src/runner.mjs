@@ -21,7 +21,8 @@
 // signature per attempt - proven during the 2026-07-30 prove-out).
 
 import { spawn } from "node:child_process";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
+import { parseProcStat } from "./proc.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -205,7 +206,78 @@ function stop(userId, why) {
   }
 }
 
+function uptimeSeconds() {
+  try { return Number(readFileSync("/proc/uptime", "utf8").split(" ")[0]) || 0; } catch { return 0; }
+}
+
+const ORPHAN_MIN_AGE_S = Number(process.env.COSMOS_ORPHAN_MIN_AGE_S) || 120;
+
+// ---- ORPHAN REAPER (2026-08-27) ----------------------------------------------------------------
+// MEASURED: four bot.mjs processes were running with ppid 1 while 103 healthy children carried the
+// live runner's pid. They were burning 40-42% of a core EACH - 82% of a two-core box - against a
+// median healthy bot of 0.28%, and their users each had a second, supervised process. Two bots on
+// one wallet produced 147 duplicate order pairs (no double-fill; the signature cap and FAK held).
+//
+// HOW THEY SURVIVE: stop() sends SIGTERM and schedules SIGKILL on an .unref()'d timer. An unref'd
+// timer does not hold the event loop open, so if the runner exits inside that 10s grace window the
+// SIGKILL never fires. The child - stuck in a loop that never yields, which is why it ignored both
+// SIGTERM and the IPC 'disconnect' - is then reparented to init, and stop()'s `if (!rec) return`
+// guarantees no future runner will ever look at it again.
+//
+// WHY ppid === 1 IS THE TEST: this box runs exactly one runner, and children are spawn()ed directly
+// (no double-fork), so every legitimate child carries the runner's pid as its parent. Reparenting to
+// init happens only when the supervisor died. Deliberately NOT "ppid !== my pid": that would also
+// match a second runner's children if the topology ever grows, and killing another supervisor's
+// bots is a far worse failure than leaving an orphan alive one more pass.
+//
+// Linux-only and best-effort by construction: no /proc, or any read failure, means reap nothing.
+// COSMOS_NO_ORPHAN_REAP=1 disables it without a deploy.
+function reapOrphans() {
+  if (/^(1|true|yes|on)$/i.test(process.env.COSMOS_NO_ORPHAN_REAP || "")) return 0;
+  let killed = 0;
+  try {
+    if (!existsSync("/proc")) return 0;                  // not Linux - nothing to scan
+    const me = process.pid;
+    const nowUp = uptimeSeconds();                       // read ONCE: a per-process read would let
+    if (!(nowUp > 0)) return 0;                          // the age cutoff drift mid-scan
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const pid = Number(entry);
+      if (pid === me || pid === 1) continue;
+      let cmd = "", stat = "";
+      try {
+        cmd = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+        stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      } catch { continue; }                                  // vanished mid-scan, or not ours to read
+      // Match what the runner actually spawns - argv[0] a node binary, argv[1] the bot entrypoint -
+      // rather than "the string bot.mjs appears somewhere". A command line like
+      // `grep -r bot.mjs /app/repo/src/` contains it too, and this function sends SIGKILL.
+      const argv = cmd.split(" ").filter(Boolean);
+      if (argv.length < 2) continue;
+      if (!/(^|\/)node(\.exe)?$/.test(argv[0]) && !argv[0].includes("node")) continue;
+      if (!argv.slice(1).some((a) => a.endsWith("/bot.mjs") || a === "bot.mjs")) continue;
+      const info = parseProcStat(stat);
+      if (!info || info.ppid !== 1) continue;                // supervised by someone - leave it
+      // AGE GUARD: a genuine orphan is old by definition - it outlived its supervisor. Refusing to
+      // touch anything young removes every startup race in one line, at the cost of one extra pass.
+      const ageS = nowUp - info.startTimeS;
+      if (!(ageS > ORPHAN_MIN_AGE_S)) continue;
+      try {
+        process.kill(pid, "SIGKILL");
+        killed++;
+        log(`ORPHAN REAPED pid ${pid} (bot.mjs, ppid 1 - its supervisor died and left it running)`);
+      } catch (e) {
+        log(`orphan pid ${pid} could not be killed: ${e.code || e.message}`);
+      }
+    }
+  } catch (e) {
+    log(`orphan reap skipped: ${e.message}`);                // never let this break a reconcile pass
+  }
+  return killed;
+}
+
 async function reconcile() {
+  reapOrphans();                                     // before roster(): a wedged box must recover even if the API is down
   const list = await roster();
   if (!list) return; // transient server trouble: keep current children running untouched
 
