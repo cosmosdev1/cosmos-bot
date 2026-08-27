@@ -725,6 +725,39 @@ export async function makePolymarket(config) {
       // "sell 1.0 but only hold 0.48"). A size that rounds to 0 is un-sellable dust -> report it so
       // the caller stops retrying (it settles on its own at resolution).
       let size = Math.floor(sizeShares * 100) / 100;
+      // MARKET-BUY MAKER-AMOUNT PRECISION (2026-08-27). The venue states the rule in its own
+      // rejection: "the market buy orders maker amount supports a max accuracy of 2 decimals, taker
+      // amount a max of 4 decimals". Flooring SHARES to 2 decimals does not bound the PRODUCT -
+      // 14.46 shares x $0.19 = $2.7474 - so 460 market buys in 24h were refused outright. Measured
+      // separation was total: every >2dp market BUY was rejected, none ever filled, and no SELL was
+      // ever rejected, which is why this is BUY-ONLY.
+      //
+      // With price = c/100 and size = k/100 the maker amount is k*c/10000, which lands on a whole
+      // cent exactly when k*c is divisible by 100. So the share step a price demands is
+      // 100/gcd(c,100) hundredths: whole shares at 19c, 0.25 at 56c, 0.02 at 50c. Computed in
+      // integers, so no float can reintroduce the precision it exists to remove.
+      //
+      // The guard is POSITIVE (=== "BUY", case-insensitively) rather than != "SELL": callers pass
+      // `side` through unnormalised, so a negative test would quantise anything that was not the exact
+      // string "SELL". Anything unrecognised must fall through to the existing behaviour, not into a
+      // path that resizes it.
+      //
+      // ALWAYS ROUNDS DOWN. Satisfying a precision rule must never increase intended spend or
+      // position size. Shadowed over 24h of real orders: 460/460 failures become valid, 727/727
+      // already-valid buys unchanged to the cent, zero orders increased, zero floored to dust.
+      // Median size drift 1.19%, worst 19.03% - and every one of those currently fails entirely,
+      // so the alternative is a 100% loss, not none.
+      if (String(side).toUpperCase() === "BUY") {
+        const cents = Math.round(price * 100);                 // the CLAMPED price actually sent
+        const gcd = (a, b) => (b ? gcd(b, a % b) : a);
+        const step = 100 / gcd(cents, 100);                    // in hundredths of a share
+        const k = Math.floor(Math.round(size * 100) / step) * step;
+        const quantised = k / 100;
+        if (quantised !== size) {
+          console.log(`[polymarket] buy size ${size} -> ${quantised} so the maker amount lands on a whole cent at ${cents}c (step ${step / 100})`);
+          size = quantised;
+        }
+      }
       if (!(size > 0)) {
         return { ok: false, status: 400, body: { polymarket: { error: "size below sellable minimum (dust)" } }, meta: { market: tokenId, side: side.toLowerCase(), size: 0, price: priceCents } };
       }
