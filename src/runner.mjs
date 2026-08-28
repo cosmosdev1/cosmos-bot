@@ -23,6 +23,7 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseProcStat } from "./proc.mjs";
+import { deriveCap } from "./admission.mjs";
 import { merge as mMerge, emptyAggregate as mEmpty } from "./metrics.mjs";
 import { qualifyingFillIds } from "./fills.mjs";
 import { join, dirname } from "node:path";
@@ -31,16 +32,15 @@ import os from "node:os";
 
 const API = (process.env.COSMOS_API || "https://try-cosmos.com").replace(/\/$/, "");
 const SECRET = process.env.RUNNER_SECRET || "";
-// CAP FROM THE MACHINE, not a stale hardcode (scale build Inc 0.5, 2026-08-17). The cap and the
-// box diverged twice (60 runnable vs cap 48, ~$1,050 of accounts silently unmanaged; and the
-// 08-05 OOM the other direction). Default = what the memory actually supports at ~80MB/child
-// with 600MB reserved for OS + runner. RUNNER_MAX still overrides when set explicitly.
-// 80MB/child was a conservative guess; MEASURED 2026-08-18 on the live box it is ~39MB (88
-// children used 3.4GB above a ~600MB base). Budgeting 55MB keeps a wide margin over the measurement
-// while no longer under-provisioning a box by half - the 08-05 OOM taught the cost of being too
-// generous, and the 08-11 starvation taught the cost of being too stingy.
-const derivedMax = Math.max(4, Math.floor((os.totalmem() / 1048576 - 600) / 55));
-const MAX = Number(process.env.RUNNER_MAX) || derivedMax;
+// CAP FROM THE MACHINE, not a stale hardcode (scale build Inc 0.5, 2026-08-17), and since stage 2F
+// (2026-08-28) from BOTH resources: min(memory, cpu), each budgeted from the measured distribution's
+// tail with explicit headroom. The single 55 MB/child constant this replaces was read once, 16
+// minutes after a restart, and implied 22 GB at its own cap on a 15.6 GB box. Derivation, the
+// measurements and every knob live in ./admission.mjs; the result is logged at boot below so the
+// cap in force is never a guess. RUNNER_MAX still overrides when set explicitly.
+const ADMISSION = deriveCap({ totalMemMB: os.totalmem() / 1048576, nproc: os.cpus().length || 1, env: process.env });
+const MAX = ADMISSION.cap;
+console.log(`[runner] admission cap ${ADMISSION.detail} · binding: ${ADMISSION.binding}`);
 // Boot ramp: children started per reconcile pass (~60s apart). 8/pass fills a 48-slot box in ~6
 // minutes while keeping the platform's boot load flat. Env-tunable for a cold-start hurry.
 // SPAWN RAMP, scaled to the roster (scale QA 2026-08-20). A flat 8 per ~60s reconcile pass means a
