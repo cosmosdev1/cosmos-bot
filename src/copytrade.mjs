@@ -16,6 +16,7 @@
 // Spawned from main() ONLY when COPYTRADE_ENABLED=1 (per-deployment gate). DRY: COPYTRADE_DRY=1 logs
 // would-be fills and places nothing. Positions are tagged source:"copytrade".
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { floorGuardVerdict } from "./floor-guard.mjs";
 import { targetPctForHolding } from "./candle-sizing.mjs";
 // FIX (2026-08-03, first live fleet): oneShotTarget called pctFromAutoTiers and read TIER_MAX_PCT
 // with NEITHER in scope - a ReferenceError on every non-candle one-shot copy, so the hosted fleet
@@ -602,7 +603,39 @@ export function startCopyTrade(deps) {
       return await buyLocked(sig, orderUsd, priceCents, kind, positions, existing, key);
     } finally { inFlightBuys.delete(tok); }
   }
+  // STAGE 2G - ENTRY FLOOR GUARD (2026-08-28). Sits at the one chokepoint both entry paths share,
+  // so it covers the chainwatch fast path that the Stage 2C guard (polled path only) never saw.
+  // Rebuilds the sign gate's own portfolio composition from the bot's cash and raw /value - NOT the
+  // bot's `portfolio`, which values positions at cost and is why one account asked the gate 723
+  // times in 2.5h believing $64 while the gate read $28. Refuses locally only when clearly under
+  // the gate's real line ($50 - margin); the band above is the server's; anything uncertain fails
+  // OPEN. The verdict is computed on every attempt; it ACTS only when the server has switched
+  // enforcement on (settings.entry_floor_guard, no restart) and is logged either way so the
+  // LOCAL x SERVER matrix can be read off real attempts. BUY only - this function is BUY only.
+  let shadow2gN = 0;
+  const SHADOW_2G_MAX = Number(process.env.COPY_2G_SHADOW_MAX ?? 60);
+  const floorGuard = () => floorGuardVerdict({ cash: state.cash, pmValue: state.pmValue, portfolioAt: state.portfolioAt, env: process.env });
+  const shadow2g = (fg, r) => {
+    if (shadow2gN >= SHADOW_2G_MAX) return;
+    shadow2gN++;
+    const why = r ? String(r.body?.polymarket?.error ?? r.error ?? "") : "";
+    const m = why.match(/portfolio \$([0-9.]+) is under/);
+    const server = r == null ? "suppressed" : r.ok ? "allow" : (r.cloudCode === "portfolio_too_small" || m) ? "deny-floor" : `other:${r.cloudCode || r.status || "?"}`;
+    log(`[2g] ${JSON.stringify({ local: fg.verdict, gateLike: fg.gateLike == null ? null : Number(fg.gateLike.toFixed(2)), line: fg.line,
+      portMax: Number((state.portfolio || 0).toFixed(2)), cash: state.cash, pm: state.pmValue,
+      ageS: state.portfolioAt ? Math.round((Date.now() - state.portfolioAt) / 1000) : null,
+      server, serverUsd: m ? Number(m[1]) : null, delta: m && fg.gateLike != null ? Number((fg.gateLike - Number(m[1])).toFixed(2)) : null,
+      enforced: state.entryFloorGuard === true })}${shadow2gN === SHADOW_2G_MAX ? " (2g cap reached)" : ""}`);
+  };
+  let floorSkipLoggedAt = 0;
   async function buyLocked(sig, orderUsd, priceCents, kind, positions, existing, key = sig.condition_id) {
+    const fg = floorGuard();
+    if (fg.verdict === "deny" && state.entryFloorGuard === true) {
+      bumpSkip("under-floor (local guard)");
+      if (Date.now() - floorSkipLoggedAt > 300_000) { floorSkipLoggedAt = Date.now(); log(`copytrade skip entries: ${fg.reason} - the gate would refuse this; not asking`); }
+      shadow2g(fg, null);
+      return false;
+    }
     const shares = Math.max(Math.ceil(100 / priceCents), sharesFor(orderUsd, priceCents));
     const realUsd = (shares * priceCents) / 100;
     if (realUsd > (state.cash ?? 0)) return false;
@@ -614,6 +647,7 @@ export function startCopyTrade(deps) {
     // positions snapshot, so without this a sub-second race could double-buy the same signal.
     recentBuy.set(sig.condition_id, Date.now());
     const r = await placeWithRetry(pm, { tokenId: sig.token_id, side: "BUY", sizeShares: shares, priceCents, orderType: "FAK" }, 2, 100);
+    shadow2g(fg, r);   // stage 2G: local verdict beside the server's, one bounded line per attempt
     if (!r.ok) {
       // Failed FAK must NOT burn the full 60s cooldown (deep-check #6): on a 5-min candle that lockout
       // IS the missed entry. Leave a 5s breather, then either path may retry while the market lives.

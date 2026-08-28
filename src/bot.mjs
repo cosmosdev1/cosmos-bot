@@ -97,7 +97,8 @@ const BUY_BACKLOG = config.buyBacklogOnStart === true || process.env.COSMOS_BUY_
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const sharesFor = (usd, cents) => Math.floor((usd * 100) / Math.max(1, cents));
 // Live cycle state shared with the qtable fast loop (updated every 30s cycle; the 5s loop reads it).
-const qtState = { cash: null, portfolio: 0, deployed: 0, sizing: null, ddHalt: false };
+const qtState = { cash: null, portfolio: 0, deployed: 0, sizing: null, ddHalt: false,
+  pmValue: null, portfolioAt: null, entryFloorGuard: false };   // stage 2G inputs (see copytrade buyLocked)
 
 // Hard floor per trade: Polymarket's ~$1 minimum order. Any computed size below this is bumped up
 // to $1 (e.g. 3% of a $10 balance = $0.30 still trades at $1), as long as there's room.
@@ -824,6 +825,8 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // TIERED COPY v2: server-delivered so one Vercel flip moves the WHOLE fleet (hosted + legacy) in
   // a cycle. The local env var stays as a dev override.
   qtState.strategyV2 = settings.strategy_v2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");
+  // STAGE 2G: server-controlled like every engine flag (shadow unless it says enforce), env override for a self-hosted test.
+  qtState.entryFloorGuard = settings.entry_floor_guard === true || /^(1|true|yes|on)$/i.test(process.env.COPY_2G_ENFORCE || "");
   // The rolling buy-volume governors differ per strategy (v2 recycles inside a 1h-4h window), and
   // the server decides per user - so tell the risk clamp which profile this account is on, every
   // cycle. Without this the bot would self-limit at the v1 numbers no matter what the gate allows,
@@ -1013,6 +1016,11 @@ async function cycle(cosmos, pm) {
   const positionsValue = Math.max(Number(pmValue) || 0, deployed);
   const portfolioValue = balance + positionsValue;
   qtState.cash = balance; qtState.portfolio = portfolioValue; qtState.deployed = deployed;
+  // STAGE 2G: the raw /value and the moment it was read, kept SEPARATELY from `portfolio` (which
+  // is max(/value, cost) and must stay that way for sizing). The entry floor guard rebuilds the
+  // sign gate's composition - cash + /value - from these; a null here means it stays silent.
+  qtState.pmValue = Number.isFinite(Number(pmValue)) ? Number(pmValue) : null;
+  qtState.portfolioAt = Date.now();
   // PER-ACCOUNT DRAWDOWN BREAKER (server-independent): halt THIS bot's entries while its own portfolio
   // is >30% below its rolling 12h high. Exits keep running. Re-evaluated every cycle; latches until a
   // real recovery. This is the individual case of the fleet rule and needs no server.
