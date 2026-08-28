@@ -277,15 +277,28 @@ export async function makePolymarket(config) {
   // the API key's address, so the EOA-bound `creds` above are rejected with "maker address not
   // allowed, please use the deposit wallet flow". Ported from the validated qtable-live tester —
   // without this, every new-style Polymarket account fails 100% of its orders.
+  // STAGE 2E FIX SWITCHES. COPY_2E_FIX=0 disables the precision floor without a code push (a Fly
+  // secret reaches every child through the runner's process.env). COPY_2E_CANARY_PCT limits it to a
+  // deterministic slice of signers so a partial rollout can be widened without touching code.
+  const FIX_2E_ON = !/^(0|false|off|no)$/i.test(String(process.env.COPY_2E_FIX ?? "1"));
+  const FIX_2E_CANARY_PCT = Math.max(0, Math.min(100, Number(process.env.COPY_2E_CANARY_PCT ?? 100)));
+  const gcd2e = (a, b) => (b ? gcd2e(b, a % b) : a);
+  function fix2eApplies(signerAddr) {
+    if (!FIX_2E_ON) return false;
+    if (FIX_2E_CANARY_PCT >= 100) return true;
+    // stable bucket per signer: the same account is always in or always out of the canary
+    const h = String(signerAddr || "").toLowerCase().slice(-8);
+    return (parseInt(h, 16) || 0) % 100 < FIX_2E_CANARY_PCT;
+  }
   const TRACE_2E_MAX = Number(process.env.COPY_2E_TRACE_MAX ?? 25);
-let trace2eN = 0;
-function trace2e(f) {
-  if (trace2eN >= TRACE_2E_MAX) return;
-  trace2eN++;
-  console.log(`[2e-trace] ${JSON.stringify(f)}${trace2eN === TRACE_2E_MAX ? " (trace cap reached, no further 2e lines)" : ""}`);
-}
+  let trace2eN = 0;
+  function trace2e(f) {
+    if (trace2eN >= TRACE_2E_MAX) return;
+    trace2eN++;
+    console.log(`[2e-trace] ${JSON.stringify(f)}${trace2eN === TRACE_2E_MAX ? " (trace cap reached, no further 2e lines)" : ""}`);
+  }
 
-const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has to be the address of the API/i;
+  const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has to be the address of the API/i;
   // Funder-bound creds may be INJECTED like the EOA-bound set (policy v2, 2026-07-30): the platform
   // caches them per hosted account (cloud_accounts.clob_deposit_*), and hosted every L1 header is a
   // paid enclave ClobAuth signature — injection makes a deposit-wallet boot cost zero.
@@ -740,6 +753,7 @@ const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has
       // "sell 1.0 but only hold 0.48"). A size that rounds to 0 is un-sellable dust -> report it so
       // the caller stops retrying (it settles on its own at resolution).
       let size = Math.floor(sizeShares * 100) / 100;
+      let sizePre2e = null;   // size after every clamp and before the precision floor (trace only)
       // STAGE 2E REVERTED 2026-08-28. A quantiser sat here that floored BUY size to 100/gcd(c,100)
       // hundredths of a share so that size*price would land on a whole cent. It was shadowed over 24h
       // of real orders and looked airtight (460/460 reconstructed failures became valid, nothing
@@ -767,6 +781,37 @@ const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has
         }
         if (rc.capped) { console.warn(`[risk] BUY clamped: ${rc.reason} · token ${String(tokenId).slice(0, 12)}`); size = Math.floor(rc.shares * 100) / 100; }
         if (!(size > 0)) return { ok: false, status: 400, body: { polymarket: { error: "local risk cap: clamped to dust" } }, meta: { market: tokenId, side: "buy", size: 0, price: priceCents, risk_capped: true } };
+
+        // MARKET-BUY PRECISION FLOOR (stage 2E, 2026-08-28). The venue judges a market buy by its
+        // maker amount, shares x price, and refuses anything that is not a whole cent: "the market
+        // buy orders maker amount supports a max accuracy of 2 decimals". With price = c/100 and
+        // size = k/100 the maker is k*c/10000, a whole cent exactly when k*c % 100 == 0.
+        //
+        // The clamp above is what breaks that. sharesFor() hands us whole shares, which always
+        // satisfy it; the clamp rewrites size to an arbitrary 2-decimal share count whose product
+        // with the price usually is not a whole cent. Every one of 1,095 "invalid amounts" since
+        // 08-20 violated k*c%100==0 and every one of 3,538 fills satisfied it - including 27 fills
+        // with FRACTIONAL shares, which is why this floors to the price's step and does not simply
+        // force whole shares. Confirmed live 2026-08-28 (docs/stage2e-trace-preregistration.md).
+        //
+        // THIS MUST STAY THE LAST THING THAT TOUCHES `size` BEFORE THE ORDER IS BUILT. The first
+        // attempt (f0913a0) sat above the clamp and was silently overwritten by it - dead code on
+        // exactly the orders it existed for. Round DOWN only: a precision rule may never raise
+        // spend or exposure. Proven a no-op on every already-valid input over c=1..99, k<=20000.
+        if (fix2eApplies(address)) {
+          const cc = Math.round(price * 100);
+          if (Math.abs(price * 100 - cc) < 1e-9) {          // whole-cent price: the model applies
+            const kk = Math.round(size * 100);
+            const step = 100 / gcd2e(cc, 100);              // hundredths of a share
+            const k2 = Math.floor(kk / step) * step;
+            if (k2 !== kk) {
+              sizePre2e = size;
+              size = k2 / 100;
+              console.log(`[2e-fix] buy ${sizePre2e} -> ${size} sh @${cc}c (step ${step / 100}) so the maker lands on a whole cent`);
+              if (!(size > 0)) return { ok: false, status: 400, body: { polymarket: { error: "precision floor: clamped to dust" } }, meta: { market: tokenId, side: "buy", size: 0, price: priceCents, risk_capped: true } };
+            }
+          }
+        }
       }
       const ot = orderType === "FOK" ? OrderType.FOK : orderType === "GTC" ? OrderType.GTC : OrderType.FAK;
       // ROTATION: k of every 36 orders carry the affiliate's builder code (when one is set),
@@ -790,9 +835,11 @@ const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has
             const gg = (a, b) => (b ? gg(b, a % b) : a);
             const step = 100 / gg(cc, 100);
             const k2 = Math.floor(kk / step) * step;
-            return { tok: String(tokenId).slice(0, 12), cents: cc, sizeSent: size, k: kk,
+            const pre = sizePre2e ?? size;
+            return { tok: String(tokenId).slice(0, 12), cents: cc, sizePre: pre, sizeSent: size, k: kk,
                      mod: (kk * cc) % 100, maker: Number((kk * cc / 10000).toFixed(6)),
-                     propSize: k2 / 100, propMod: (k2 * cc) % 100, noop: k2 === kk };
+                     adjusted: sizePre2e !== null, driftPct: sizePre2e === null ? 0 : Number((100 * (pre - size) / pre).toFixed(3)),
+                     gcd1: gg(cc, 100) === 1, propSize: k2 / 100, propMod: (k2 * cc) % 100, noop: k2 === kk };
           })() : null;
           const resp = await c.createAndPostOrder(
             { tokenID: tokenId, price, side: side === "SELL" ? Side.SELL : Side.BUY, size },
