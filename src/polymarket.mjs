@@ -277,7 +277,15 @@ export async function makePolymarket(config) {
   // the API key's address, so the EOA-bound `creds` above are rejected with "maker address not
   // allowed, please use the deposit wallet flow". Ported from the validated qtable-live tester —
   // without this, every new-style Polymarket account fails 100% of its orders.
-  const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has to be the address of the API/i;
+  const TRACE_2E_MAX = Number(process.env.COPY_2E_TRACE_MAX ?? 25);
+let trace2eN = 0;
+function trace2e(f) {
+  if (trace2eN >= TRACE_2E_MAX) return;
+  trace2eN++;
+  console.log(`[2e-trace] ${JSON.stringify(f)}${trace2eN === TRACE_2E_MAX ? " (trace cap reached, no further 2e lines)" : ""}`);
+}
+
+const DEPOSIT_ERR = /deposit wallet|maker address not allowed|signer address has to be the address of the API/i;
   // Funder-bound creds may be INJECTED like the EOA-bound set (policy v2, 2026-07-30): the platform
   // caches them per hosted account (cloud_accounts.clob_deposit_*), and hosted every L1 header is a
   // paid enclave ClobAuth signature — injection makes a deposit-wallet boot cost zero.
@@ -714,6 +722,13 @@ export async function makePolymarket(config) {
       }
     },
 
+    // STAGE 2E LIVE TRACE - TEMPORARY AND BOUNDED. Remove once the invariant is confirmed.
+    // Console only, never the database: a per-event DB write is what made scan_runs a 3.5M-row
+    // problem. Hard-capped per process (default 25) so a busy bot cannot turn this into a log flood,
+    // and it carries no secrets - numeric amounts plus a 12-char token prefix for correlation.
+    // Purpose: prove on REAL venue-bound orders that k*c%100 != 0 is what the venue rejects, and
+    // that the proposed floor is a no-op on orders that already satisfy it.
+
     // Sign an order locally and POST it DIRECTLY to Polymarket (your IP/region — not a server's).
     // FAK (Fill-And-Kill) = take whatever liquidity exists at this price NOW and cancel the rest;
     // the bot passes a *marketable* price (above mid to buy / below mid to sell). createAndPostOrder
@@ -766,11 +781,29 @@ export async function makePolymarket(config) {
         const c = affC || client;                                  // no aff client -> Cosmos client
         const meta = { market: tokenId, side: side.toLowerCase(), size, price: priceCents, builder_code_used: affC ? affCode : BUILDER_CODE };
         try {
+          // Snapshot the FINAL size - after riskClampBuy, after every clamp, immediately before the
+          // order is built. This is the exact quantity the venue judges, and the place the reverted
+          // fix should have been: it sat before the clamp, which then overwrote it.
+          const t2e = side !== "SELL" ? (() => {
+            const cc = Math.round(price * 100);
+            const kk = Math.round(size * 100);
+            const gg = (a, b) => (b ? gg(b, a % b) : a);
+            const step = 100 / gg(cc, 100);
+            const k2 = Math.floor(kk / step) * step;
+            return { tok: String(tokenId).slice(0, 12), cents: cc, sizeSent: size, k: kk,
+                     mod: (kk * cc) % 100, maker: Number((kk * cc / 10000).toFixed(6)),
+                     propSize: k2 / 100, propMod: (k2 * cc) % 100, noop: k2 === kk };
+          })() : null;
           const resp = await c.createAndPostOrder(
             { tokenID: tokenId, price, side: side === "SELL" ? Side.SELL : Side.BUY, size },
             undefined, // options: let the client resolve tickSize + negRisk per market
             ot,
           );
+          if (t2e) {
+            const blob = (() => { try { return JSON.stringify(resp ?? {}); } catch { return ""; } })();
+            trace2e({ ...t2e, invalidAmounts: /invalid amounts/i.test(blob),
+                      rejected: Boolean(resp && (resp.error || resp.success === false)) });
+          }
           // V2 returns { error, status } on failure (throwOnError is off by default); the CLOB can
           // also answer 200 with success:false — both mean the placement itself failed, nothing filled.
           // rejected:true = the CLOB ANSWERED and said "not accepted" — the one failure class where a
