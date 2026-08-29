@@ -36,6 +36,7 @@ const WALLET_REFRESH_MS = 5 * 60_000;
 // behaviour is bit-for-bit what it was: their own socket, their own subscription.
 import { inc, observe } from "./metrics.mjs";
 import { tokensFromLog } from "./fills.mjs";
+import { startS4Child } from "./s4-child.mjs";
 const HUB = process.env.COSMOS_CHAINHUB === "1" && typeof process.send === "function";
 
 async function rpc(method, params) {
@@ -59,7 +60,16 @@ const words = (hex) => (hex.replace(/^0x/, "").match(/.{64}/g) ?? []);
 
 // Start the watcher. `onSignal(signal, meta)` gets a fully vetted signal from the server; the caller
 // executes it with the same guards + sizing as the polled feed.
-export function startChainWatch({ cosmos, onSignal, isArmed }) {
+export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
+  // STAGE 4 SHADOW: pairs this child's own copy-check answer with the hub's neutral result and
+  // counts the discrepancy class. Observational only - it has no path to onSignal.
+  const s4 = startS4Child({ inc, log, warn, send: (m) => { try { process.send?.(m); } catch { /* not under the runner */ } },
+    ctx: (wallet, neutral) => {
+      const base = typeof s4Ctx === "function" ? s4Ctx() : {};
+      const mem = Array.isArray(neutral?.WHALE_TRACK_MEMBERSHIPS) ? neutral.WHALE_TRACK_MEMBERSHIPS : [];
+      return { copytrade: isArmed() === true, followsWallet: byAddr.has(String(wallet || "").toLowerCase()), diamondBlocked: false,
+        hosted: base.hosted === true, v2: base.v2 === true, group: base.group ?? (mem.find((g) => g < 1000) ?? mem[0] ?? 1) };
+    } });
   let wallets = [];          // [{wallet, username}]
   let byAddr = new Map();
   let ws = null, sub = null, urlIx = 0, alive = false, seenCount = 0, lastBlock = 0;
@@ -108,7 +118,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
   const STAGGER_MS = Number(process.env.COSMOS_CHECK_STAGGER_MS) || 2_500;
   const myOffset = STAGGER_MS ? h % STAGGER_MS : 0;
 
-  async function onFill(w, tokenId, shares, l) {
+  async function onFill(w, tokenId, shares, l, fillId) {
     // STAGE 1: the two terms of the fan-out multiplier, counted at the only place both are visible.
     // "ev" is one whale fill THIS child was handed; "cc" is a copy-check actually issued for it.
     // Fleet-wide, sum(cc) / distinct(ev) is the events x bots multiplier the audit put at ~96.6x and
@@ -124,6 +134,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
       catch (e) {
         if (a >= 2) {
           inc("ccFail");
+          if (fillId) s4.recordOld(fillId, { ok: false, reason: "copy-check failed", wallet: w.wallet });
           if (++checkFails >= 3) { standdownUntil = Date.now() + 60_000; warn("chainwatch: 3 checks failed in a row - fast path stands down 60s (slow path covers)"); }
           else warn(`chainwatch check failed ${a + 1}x (giving up; slow path covers):`, e.message);
           return;
@@ -132,6 +143,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
       }
     }
     const ms = Date.now() - t0;
+    if (fillId) s4.recordOld(fillId, { ok: Boolean(res?.ok), reason: res?.reason ?? null, signal: res?.ok ? res.signal : null, wallet: w.wallet });
     if (!res?.ok) {
       log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> SKIP (${res?.reason ?? "no"}) · ${ms}ms`);
       return;
@@ -158,7 +170,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
       const equal = Math.max(...shs) - Math.min(...shs) <= Math.max(...shs) * 0.01;
       if (distinct && equal) { log(`chainwatch: ${w.username} SPLIT mint (${fills.length} legs × ${shs[0].toFixed(0)} sh) — not a trade, skipped`); return; }
     }
-    for (const f of fills) { seenCount++; onFill(w, f.tokenId, f.shares, l); }   // fire-and-forget: never block the socket
+    for (const f of fills) { seenCount++; onFill(w, f.tokenId, f.shares, l, f.fillId); }   // fire-and-forget: never block the socket
   }
   function handle(l) {
     const key = `${l.transactionHash}#${l.logIndex}`;
@@ -175,7 +187,8 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     const k = `${l.transactionHash}|${w.wallet}`;
     let e = txBuf.get(k);
     if (!e) { e = { w, l, fills: [], timer: setTimeout(() => { txBuf.delete(k); flushFills(e); }, 350) }; txBuf.set(k, e); }
-    for (const { tokenId, shares } of tokensFromLog(l)) if (shares > 0) e.fills.push({ tokenId, shares });
+    // STAGE 4: the fill id uses the index into tokensFromLog (same rule as the hub's qualifyingFillIds)
+    tokensFromLog(l).forEach(({ tokenId, shares }, i) => { if (shares > 0) e.fills.push({ tokenId, shares, fillId: `${l.transactionHash}#${l.logIndex}#${i}` }); });
   }
 
   // BACKFILL THE RECONNECT GAP. A subscription only pushes what happens while you are listening, and
@@ -290,6 +303,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed }) {
     process.on("message", (m) => {
       if (!m || typeof m !== "object") return;
       if (m.t === "beat") { lastBeat = Date.now(); return; }
+      if (m.t === "s4" || m.t === "s4replay") { try { s4.onMessage(m); } catch (e) { warn("s4 child:", e.message); } return; }   // stage 4 shadow: compare only
       if (m.t === "log" && m.log) { lastBeat = Date.now(); try { handle(m.log); } catch (e) { warn("chainwatch hub log:", e.message); } }
     });
     log(`chainwatch: HUB mode - ${wallets.length} wallets, socket owned by the runner`);

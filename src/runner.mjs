@@ -25,7 +25,8 @@ import { mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseProcStat } from "./proc.mjs";
 import { deriveCap } from "./admission.mjs";
 import { merge as mMerge, emptyAggregate as mEmpty } from "./metrics.mjs";
-import { qualifyingFillIds } from "./fills.mjs";
+import { qualifyingFillIds, fillsFromLog } from "./fills.mjs";
+import { startS4Hub } from "./s4-hub.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
@@ -58,6 +59,8 @@ if (!SECRET) { console.error("[runner] RUNNER_SECRET is required"); process.exit
 // STAGE 1 FLEET METRICS. One in-memory aggregate for the whole box, flushed as ONE row per minute.
 // Never per event: that is what made scan_runs a 3.5M-row problem.
 let fleetMetrics = mEmpty();
+let s4Mode = process.env.COSMOS_S4_MODE || "shadow";      // off | shadow | canary | on (only shadow exists in code)
+let s4 = null;                                              // stage 4 shadow hub, started with the chainhub below
 // Distinct qualifying fill identities seen this interval. Bounded by fills/minute (tens), cleared on
 // every flush - it is a COUNT that leaves, never a growing label set.
 let fillIds = new Set();
@@ -84,14 +87,14 @@ async function flushMetrics() {
   m.complete = kids.size > 0 && reporters.size >= kids.size ? 1 : 0;
   fillIds = new Set();
   reporters = new Set();
-  if (!m.ev && !m.cc && !m.reap && !m.fills) return;   // nothing happened - do not write a row saying so
+  if (!m.ev && !m.cc && !m.reap && !m.fills && !m.s4Sent && !m.s4Recv) return;   // nothing happened - do not write a row saying so
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 15_000);
   try {
     await fetch(`${API}/api/cloud/runner/metrics`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-runner-secret": SECRET },
-      body: JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner" }),
+      body: JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: s4 ? s4.drainSamples(20) : [] }),
       signal: ctl.signal,
     });
   } catch { /* observability must never disturb the fleet; this interval is simply lost */ }
@@ -156,6 +159,7 @@ async function roster() {
     netOk();   // ANY http answer proves our sockets work - the wedge watchdog only fires on silence
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
+    if (typeof j?.s4_mode === "string") s4Mode = j.s4_mode;   // stage 4 mode, server-served, no restart
     return Array.isArray(j?.accounts) ? j.accounts : null;
   } catch (e) {
     log("roster fetch failed:", e?.message ?? e);
@@ -228,6 +232,9 @@ function start(a) {
     // STAGE 1: a child's counter DELTA for the last interval. Merged in memory; nothing is written
     // per message. merge() drops unknown keys, so one misbehaving child cannot inflate cardinality.
     else if (m?.t === "metrics" && m.m) { mMerge(fleetMetrics, m.m); reporters.add(a.user_id); }
+    // STAGE 4 SHADOW: a child saw a sequence gap and asks for the ring; or forwards a bounded sample.
+    else if (m?.t === "s4gap" && s4) { s4.replay(child, Number(m.from) || 0, Number(m.to) || 0); }
+    else if (m?.t === "s4sample" && s4 && m.s) { s4.sample({ ...m.s, user: String(a.user_id).slice(0, 8) }); }
   });
   const rec = { child, startedAt: Date.now(), backoffMs: kids.get(a.user_id)?.backoffMs ?? 30_000, entry: a };
   child.on("exit", (code, sig) => {
@@ -436,12 +443,18 @@ if (HUB_ENABLED) {
         // copy-check each. One TransferBatch log carries several, so counting logs would understate
         // fan-out. Uses the same parser chainwatch uses, so numerator and denominator cannot diverge.
         for (const id of qualifyingFillIds(l, isWatchedAddr)) fillIds.add(id);
+        // STAGE 4 SHADOW: one evaluation per fill, broadcast as a neutral result AFTER the raw log below.
+        // Children compare it with their own copy-check; nothing acts on it (s4-child.mjs).
+        if (s4) { try { s4.onFills(fillsFromLog(l, isWatchedAddr)); } catch (e) { console.warn("s4 hub:", e.message); } }
         broadcast({ t: "log", log: l });
       },
       onBeat: () => broadcast({ t: "beat" }),
       log: (...a) => console.log(new Date().toISOString(), ...a),
       warn: (...a) => console.warn(new Date().toISOString(), ...a),
     });
+    s4 = startS4Hub({ api: API, secret: SECRET, broadcast, log, mode: () => s4Mode,
+      inc: (k) => { fleetMetrics[k] = (fleetMetrics[k] || 0) + 1; } });
+    log(`s4 shadow hub up · mode ${s4Mode} · boot ${s4.boot}`);
     setInterval(() => {
       const s = hub.stats();
       log(`chainhub: ${s.connected ? "connected" : "DISCONNECTED"} · ${s.wallets} wallets · ${s.delivered} logs delivered · ${kids.size} children`);

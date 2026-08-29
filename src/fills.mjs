@@ -78,3 +78,26 @@ export function qualifyingFillIds(l, isWatched) {
     return out;
   } catch { return []; }
 }
+
+
+/**
+ * STAGE 4: the fills in a log as the hub needs them - id, whale (recipient), token, shares - using
+ * the SAME index rule as qualifyingFillIds so hub and child derive identical ids.
+ */
+export function fillsFromLog(l, isWatched) {
+  try {
+    const to = addrFromTopic(l?.topics?.[3]);
+    if (!isWatched(to)) return [];
+    const from = addrFromTopic(l?.topics?.[2]);
+    if (isWatched(from)) return [];
+    const tx = String(l?.transactionHash ?? ""), li = String(l?.logIndex ?? "");
+    if (!tx || li === "") return [];
+    const block = Number(l?.blockNumber);
+    const entries = tokensFromLog(l), out = [];
+    for (let i = 0; i < entries.length; i++) {
+      if (!(entries[i].shares > 0)) continue;
+      out.push({ fillId: `${tx}#${li}#${i}`, wallet: to, tokenId: entries[i].tokenId, shares: entries[i].shares, block: Number.isFinite(block) ? block : null });
+    }
+    return out;
+  } catch { return []; }
+}

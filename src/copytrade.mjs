@@ -1170,6 +1170,7 @@ export function startCopyTrade(deps) {
         cosmos,
         isArmed: () => alive && state.copytrade !== false,
         onSignal: (sig) => fastOpen(sig),
+        s4Ctx: () => ({ hosted: HOSTED, v2: V2() }),   // stage 4 shadow: this child's own variant, compare only
       }))
       .catch((e) => warn("chainwatch failed to start:", e?.message));
   }

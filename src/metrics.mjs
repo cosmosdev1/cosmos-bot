@@ -25,6 +25,17 @@ export const KEYS = Object.freeze([
   "fill",      // fills observed
   "deny",      // order attempts refused by the platform gate
   "reap",      // orphan processes reaped (runner only)
+  // STAGE 4 SHADOW (2026-08-29) - fixed cardinality like everything above. Hub side:
+  "s4EvalAttempt", // /fill-eval HTTP attempts, retries included
+  "s4EvalOk",      // successful responses
+  "s4EvalFull",    // responses where the server computed fresh (existed=false) - the <=1.05x counter
+  "s4EvalDup",     // responses where the server already had it (existed=true)
+  "s4EvalFail",    // attempts exhausted
+  "s4Overflow",    // fills the shadow queue refused (full / too old) - would be raw-log fallback live
+  "s4Sent",        // neutral results broadcast (per child delivery = s4Sent x children)
+  // child side:
+  "s4Recv", "s4Gap", "s4Replay", "s4Late",
+  "s4Match", "s4Expected", "s4OldBug", "s4NewBug", "s4TimingSame", "s4TimingFlip", "s4OldMissing", "s4NewMissing", "s4Unknown",
 ]);
 
 // signal -> order latency, milliseconds. Upper bound of each bucket.
