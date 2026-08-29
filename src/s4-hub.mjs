@@ -46,7 +46,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
   }
 
   async function evalOne(f) {
-    if (Date.now() < breakerUntil) { inc("s4EvalFail"); return; }
+    if (Date.now() < breakerUntil) { inc("s4Overflow"); return; }   // skipped by the breaker: not an eval failure
     const mySeq = ++seq;
     let res = null;
     for (let a = 0; a < 2; a++) {

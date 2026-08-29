@@ -59,7 +59,7 @@ if (!SECRET) { console.error("[runner] RUNNER_SECRET is required"); process.exit
 // STAGE 1 FLEET METRICS. One in-memory aggregate for the whole box, flushed as ONE row per minute.
 // Never per event: that is what made scan_runs a 3.5M-row problem.
 let fleetMetrics = mEmpty();
-let s4Mode = process.env.COSMOS_S4_MODE || "shadow";      // off | shadow | canary | on (only shadow exists in code)
+let s4Mode = process.env.COSMOS_S4_MODE || "off";         // off until the roster says otherwise (fail closed for a shadow)
 let s4 = null;                                              // stage 4 shadow hub, started with the chainhub below
 // Distinct qualifying fill identities seen this interval. Bounded by fills/minute (tens), cleared on
 // every flush - it is a COUNT that leaves, never a growing label set.
@@ -76,6 +76,8 @@ const isWatchedAddr = (a) => watchedAddrs.has(String(a || "").toLowerCase());
 let watchedAddrs = new Set();
 const METRICS_MS = Number(process.env.COSMOS_METRICS_MS) || 60_000;
 
+let lastFlushWarn = 0;
+function warnFlush(msg) { if (Date.now() - lastFlushWarn < 600_000) return; lastFlushWarn = Date.now(); console.warn(new Date().toISOString(), "[runner] metrics:", msg); }
 async function flushMetrics() {
   const m = fleetMetrics;
   fleetMetrics = mEmpty();                       // swap first: a slow POST must not lose the next interval
@@ -90,14 +92,19 @@ async function flushMetrics() {
   if (!m.ev && !m.cc && !m.reap && !m.fills && !m.s4Sent && !m.s4Recv) return;   // nothing happened - do not write a row saying so
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 15_000);
+  // Build the body first, and never let a bad sample take the counters down with it: the samples
+  // are forensics, the counters are the instrument. A failure here is LOGGED (rate-limited) - the
+  // 2026-08-29 shadow deploy went dark for 40 minutes behind a silent catch.
+  let body;
   try {
-    await fetch(`${API}/api/cloud/runner/metrics`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-runner-secret": SECRET },
-      body: JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: s4 ? s4.drainSamples(20) : [] }),
-      signal: ctl.signal,
-    });
-  } catch { /* observability must never disturb the fleet; this interval is simply lost */ }
+    let samples = [];
+    try { samples = s4 ? s4.drainSamples(20) : []; JSON.stringify(samples); } catch (e) { samples = []; warnFlush(`samples dropped: ${e.message}`); }
+    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples });
+  } catch (e) { warnFlush(`body build failed: ${e.message}`); clearTimeout(t); return; }
+  try {
+    const r = await fetch(`${API}/api/cloud/runner/metrics`, { method: "POST", headers: { "content-type": "application/json", "x-runner-secret": SECRET }, body, signal: ctl.signal });
+    if (!r.ok) warnFlush(`metrics POST ${r.status}`);
+  } catch (e) { warnFlush(`metrics POST failed: ${e.message}`); }   // observability must never disturb the fleet; the interval is lost, but not silently
   finally { clearTimeout(t); }
 }
 if (METRICS_MS > 0) setInterval(() => { flushMetrics().catch(() => {}); }, METRICS_MS).unref?.();
@@ -159,7 +166,7 @@ async function roster() {
     netOk();   // ANY http answer proves our sockets work - the wedge watchdog only fires on silence
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
-    if (typeof j?.s4_mode === "string") s4Mode = j.s4_mode;   // stage 4 mode, server-served, no restart
+    if (typeof j?.s4_mode === "string" && j.s4_mode !== s4Mode) { log(`s4 mode ${s4Mode} -> ${j.s4_mode} (roster)`); s4Mode = j.s4_mode; }
     return Array.isArray(j?.accounts) ? j.accounts : null;
   } catch (e) {
     log("roster fetch failed:", e?.message ?? e);
@@ -458,6 +465,7 @@ if (HUB_ENABLED) {
     setInterval(() => {
       const s = hub.stats();
       log(`chainhub: ${s.connected ? "connected" : "DISCONNECTED"} · ${s.wallets} wallets · ${s.delivered} logs delivered · ${kids.size} children`);
+      if (s4) { const x = s4.stats(); log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · ring ${x.ring}${x.breaker ? " · BREAKER" : ""}`); }
     }, 10 * 60_000).unref?.();
   } catch (e) {
     // Never let a hub failure stop the fleet: with no hub the children hear no heartbeat and each
