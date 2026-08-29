@@ -62,7 +62,15 @@ export const OLD_BUG_ALLOW = Object.freeze({
     // Evidence: shares equal, at the chain holding, cost differs.
     const sameSh = dSh <= 0.5, costDiff = Math.abs((Number(o.signal.his_cost_usd) || 0) - (Number(oldRow.his_cost_usd) || 0)) > 0.5;
     const atChain = chain != null ? Math.abs(childSh - chain) < 0.5 : t?.ledger?.clampedByChain === true;
-    return sameSh && costDiff && atChain;
+    if (sameSh && costDiff && atChain) return true;
+    // PEAK VARIANT (production, 2026-08-29 20:30Z+): his_peak_shares is last-writer-wins under fan-out.
+    // A follower whose accumulate was inflated by k extra adds writes peak = its inflated sum; a
+    // child reading after it sees that peak while the shared evaluation (earlier) did not. Evidence:
+    // same shares, peaks differ by an integer multiple of THIS fill's shares.
+    const dPeak = Math.abs((Number(o.signal.his_peak_shares) || 0) - (Number(oldRow.his_peak_shares) || 0));
+    const kp = dPeak / fillSh;
+    const peakMultiple = dPeak > 0.5 && Math.abs(kp - Math.round(kp)) < 0.05 && Math.round(kp) >= 1;
+    return sameSh && peakMultiple;
   },
 });
 
@@ -123,7 +131,7 @@ export function classify(old, neutral, ctx) {
     // same decision, price moved between the two book snapshots: only the price-derived fields differ
     const priceOnly = a.shares === b.shares && a.peak === b.peak && a.cents !== b.cents;
     if (priceOnly) return { cls: "TIMING_SAME", sub: "book", detail: { a, b } };
-    return { cls: "UNKNOWN", sub: "field mismatch", detail: { a, b, ledger: signalDigest(t?.ledger?.row) } };
+    return { cls: "UNKNOWN", sub: "field mismatch", detail: { a, b, ledger: signalDigest(t?.ledger?.row), fill: neutral.sharesUsed ?? null, chain: neutral.onchainShares ?? null } };
   }
   if (!old.ok && !nw.ok) {
     const r = String(old.reason || ""), s = String(nw.reason || "");
