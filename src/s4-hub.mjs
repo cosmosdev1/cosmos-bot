@@ -83,11 +83,27 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
     return out.length;
   }
 
-  /** A child forwards a bounded discrepancy sample; kept for the next metrics flush. */
-  function sample(s) { if (samples.length < 100) samples.push(s); }
-  function drainSamples(n = 20) { return samples.splice(0, n); }
+  /**
+   * A child forwards a bounded discrepancy sample; kept for the next metrics flush. PER-CLASS FAIR
+   * (2026-08-30): the first epoch reading showed 1,376 UNKNOWN with zero samples behind them - the
+   * buffer filled with OLD_PATH_BUG, the most common class, before anything rarer arrived. Each
+   * class now keeps its own bounded slot and the drain takes round-robin, so the rare classes that
+   * decide the gate are always represented.
+   */
+  const PER_CLASS = Number(process.env.COSMOS_S4_SAMPLES_PER_CLASS) || 25;
+  const byClass = new Map();
+  function sample(s) { const k = String(s?.class || "?"); const arr = byClass.get(k) || []; if (arr.length < PER_CLASS) { arr.push(s); byClass.set(k, arr); } }
+  function drainSamples(n = 20) {
+    const out = [];
+    while (out.length < n) {
+      let took = false;
+      for (const arr of byClass.values()) { if (arr.length && out.length < n) { out.push(arr.shift()); took = true; } }
+      if (!took) break;
+    }
+    return out;
+  }
 
-  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode() }; }
+  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode(), samples: [...byClass.entries()].map(([k, v]) => `${k}:${v.length}`).join(",") }; }
 
   return { onFills, replay, sample, drainSamples, stats, boot: BOOT };
 }
