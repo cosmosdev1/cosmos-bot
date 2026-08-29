@@ -36,6 +36,7 @@ export const KEYS = Object.freeze([
   // child side:
   "s4Recv", "s4Gap", "s4Replay", "s4Late",
   "s4Match", "s4Expected", "s4OldBug", "s4NewBug", "s4TimingSame", "s4TimingFlip", "s4OldMissing", "s4NewMissing", "s4Unknown",
+  "s4OldBugShare", "s4OldBugCost", "s4OldBugPeak",   // the frozen OLD_PATH_BUG taxonomy, one counter each
 ]);
 
 // signal -> order latency, milliseconds. Upper bound of each bucket.

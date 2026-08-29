@@ -24,6 +24,7 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
     const c = ctx(p.neu?.wallet ?? p.old?.wallet, p.neu ?? null);
     const r = classify(p.old ?? null, p.neu ?? null, c);
     inc(CLS[r.cls] || "s4Unknown");
+    if (r.cls === "OLD_PATH_BUG") inc(r.sub === "ACCUMULATE_SHARE_MULTIPLE" ? "s4OldBugShare" : r.sub === "ACCUMULATE_COST_RESCALE" ? "s4OldBugCost" : "s4OldBugPeak");
     if (r.cls !== "MATCH" && r.cls !== "EXPECTED") {
       const now = Date.now(); sampledAt = sampledAt.filter((t) => now - t < 60_000);
       if (sampledAt.length < SAMPLE_PER_MIN) {

@@ -40,39 +40,53 @@ export const EXPECTED_ALLOW = Object.freeze({
   "old:conflict: opposite side bigger":          (ctx, o, n, t) => t?.old?.dropped === "drivers",
 });
 
-/** OLD PATH BUGS: each entry is a recomputation that must hold for the class to be assigned. */
+/**
+ * OLD PATH BUGS - THE FROZEN TAXONOMY (owner 2026-08-30). Exactly three proven production defects,
+ * all faces of the fan-out accumulate in /v1/copy-check. Each rule is a recomputation on the
+ * sample itself; a mismatch that matches none of them is UNKNOWN, never a new bug name. Adding an
+ * entry here requires a documented production replay (docs/stage4-design-addendum.md).
+ */
 export const OLD_BUG_ALLOW = Object.freeze({
-  // The per-track accumulate re-adds this fill for every follower that reads a row an earlier
-  // follower already rewrote (docs/stage4-design-addendum.md §1). Evidence, SYMMETRIC: the two
-  // sides differ by an integer multiple of THIS fill's shares (either direction), or one side sits
-  // at the on-chain clamp while the other does not. Identity (cid/outcome/group) must already agree.
-  ACCUMULATE_DIVERGENCE: (o, n, t) => {
-    const oldRow = t?.old?.row, led = t?.ledger?.row; if (!oldRow || !led || !o?.signal) return false;
+  // 1. SHARE_MULTIPLE - follower k re-added this fill's shares k times; the two sides differ by an
+  //    integer multiple of the fill (either direction), or one side sits at the chain clamp.
+  ACCUMULATE_SHARE_MULTIPLE: (o, n, t) => {
+    const oldRow = t?.old?.row; if (!oldRow || !o?.signal) return false;
     const fillSh = Number(n?.sharesUsed) || 0; if (!(fillSh > 0)) return false;
     const childSh = Number(o.signal.his_shares) || 0, sharedSh = Number(oldRow.his_shares) || 0;
-    const dSh = Math.abs(childSh - sharedSh);
+    const dSh = Math.abs(childSh - sharedSh); if (!(dSh > 0.5)) return false;
     const k = dSh / fillSh;
-    const multiple = dSh > 0.5 && Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1;
+    const multiple = Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1;
     const chain = n?.onchainShares != null ? Number(n.onchainShares) : null;
-    const atClamp = chain != null && (Math.abs(childSh - chain) < 0.5 || Math.abs(sharedSh - chain) < 0.5) && dSh > 0.5;
-    if (multiple || atClamp || (t?.ledger?.clampedByChain === true && dSh > 0.5)) return true;
-    // COST-SCALING VARIANT (production, 2026-08-29 19:30Z+): both sides hold the SAME share count -
-    // the chain clamp - but different costs (child $109, shared $141, ledger $179 for 209.2 sh),
-    // because each follower's clamp rescaled a cost that earlier followers had already inflated.
-    // Evidence: shares equal, at the chain holding, cost differs.
-    const sameSh = dSh <= 0.5, costDiff = Math.abs((Number(o.signal.his_cost_usd) || 0) - (Number(oldRow.his_cost_usd) || 0)) > 0.5;
+    const atClamp = chain != null && (Math.abs(childSh - chain) < 0.5 || Math.abs(sharedSh - chain) < 0.5);
+    return multiple || atClamp || t?.ledger?.clampedByChain === true;
+  },
+  // 2. COST_RESCALE - same shares (both at the chain clamp) but costs rescaled from different
+  //    inflation histories.
+  ACCUMULATE_COST_RESCALE: (o, n, t) => {
+    const oldRow = t?.old?.row; if (!oldRow || !o?.signal) return false;
+    const childSh = Number(o.signal.his_shares) || 0, sharedSh = Number(oldRow.his_shares) || 0;
+    if (Math.abs(childSh - sharedSh) > 0.5) return false;
+    const costDiff = Math.abs((Number(o.signal.his_cost_usd) || 0) - (Number(oldRow.his_cost_usd) || 0)) > 0.5;
+    const chain = n?.onchainShares != null ? Number(n.onchainShares) : null;
     const atChain = chain != null ? Math.abs(childSh - chain) < 0.5 : t?.ledger?.clampedByChain === true;
-    if (sameSh && costDiff && atChain) return true;
-    // PEAK VARIANT (production, 2026-08-29 20:30Z+): his_peak_shares is last-writer-wins under fan-out.
-    // A follower whose accumulate was inflated by k extra adds writes peak = its inflated sum; a
-    // child reading after it sees that peak while the shared evaluation (earlier) did not. Evidence:
-    // same shares, peaks differ by an integer multiple of THIS fill's shares.
+    return costDiff && atChain;
+  },
+  // 3. PEAK_LASTWRITER - his_peak_shares is last-writer-wins; same shares, peaks apart by an
+  //    integer multiple of the fill.
+  ACCUMULATE_PEAK_LASTWRITER: (o, n, t) => {
+    const oldRow = t?.old?.row; if (!oldRow || !o?.signal) return false;
+    const fillSh = Number(n?.sharesUsed) || 0; if (!(fillSh > 0)) return false;
+    if (Math.abs((Number(o.signal.his_shares) || 0) - (Number(oldRow.his_shares) || 0)) > 0.5) return false;
     const dPeak = Math.abs((Number(o.signal.his_peak_shares) || 0) - (Number(oldRow.his_peak_shares) || 0));
     const kp = dPeak / fillSh;
-    const peakMultiple = dPeak > 0.5 && Math.abs(kp - Math.round(kp)) < 0.05 && Math.round(kp) >= 1;
-    return sameSh && peakMultiple;
+    return dPeak > 0.5 && Math.abs(kp - Math.round(kp)) < 0.05 && Math.round(kp) >= 1;
   },
 });
+/** The name of the matching frozen rule, or null. */
+export function oldBugRule(o, n, t) {
+  for (const name of Object.keys(OLD_BUG_ALLOW)) { if (OLD_BUG_ALLOW[name](o, n, t)) return name; }
+  return null;
+}
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
 const PRICE_GATE = /^\d+c outside \d+-\d+c$/;
@@ -127,7 +141,8 @@ export function classify(old, neutral, ctx) {
     const same = a && b && a.cid === b.cid && a.outcome === b.outcome && a.group === b.group && a.cost === b.cost && a.shares === b.shares && a.peak === b.peak && a.cents === b.cents && a.tier === b.tier;
     if (same) return { cls: "MATCH", sub: null };
     if (a.cid !== b.cid || a.outcome !== b.outcome || a.group !== b.group) return { cls: "NEW_PATH_BUG", sub: "identity", detail: { a, b } };
-    if (OLD_BUG_ALLOW.ACCUMULATE_DIVERGENCE(old, neutral, t)) return { cls: "OLD_PATH_BUG", sub: "ACCUMULATE_DIVERGENCE", detail: { a, b, ledger: signalDigest(t?.ledger?.row) } };
+    const rule = oldBugRule(old, neutral, t);
+    if (rule) return { cls: "OLD_PATH_BUG", sub: rule, detail: { a, b, ledger: signalDigest(t?.ledger?.row), fill: neutral.sharesUsed ?? null, chain: neutral.onchainShares ?? null } };
     // same decision, price moved between the two book snapshots: only the price-derived fields differ
     const priceOnly = a.shares === b.shares && a.peak === b.peak && a.cents !== b.cents;
     if (priceOnly) return { cls: "TIMING_SAME", sub: "book", detail: { a, b } };
