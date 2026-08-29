@@ -12,8 +12,18 @@
 // TIMING_SAME (different market snapshot, same decision); TIMING_FLIPPED (different snapshot,
 // different decision - investigated, never excused); OLD_MISSING / NEW_MISSING (one side never
 // arrived); UNKNOWN (everything else - must be zero to advance).
+//
+// REVISIONS FROM THE FIRST SHADOW HOUR (2026-08-29), each backed by production samples:
+//   - the old route prints "conflict: opposite side bigger" for the another-whale-drives case as
+//     well (route.ts: both paths states.delete the track and fall through to the same message), so
+//     that pair is a labelling difference, not a decision difference -> EXPECTED with evidence;
+//   - the price gate is worded "<n>c outside <a>-<b>c" and the two paths can sit on different sides
+//     of it from different book snapshots -> TIMING (SAME when both skipped, FLIPPED otherwise);
+//   - the accumulate divergence appears in BOTH directions: the child (an early follower) may read
+//     the row before others wrote it while the shared evaluation reads it already inflated and
+//     clamped to the chain. The evidence rule is therefore symmetric.
 
-/** EXPECTED discrepancies: per-user server reasons the shadow does not model, and dead rules. */
+/** EXPECTED discrepancies: per-user server reasons the shadow does not model, and old-path labels. */
 export const EXPECTED_ALLOW = Object.freeze({
   // the old route answered a per-user reason; the child's own context agrees it would not enter
   "old:copytrade is off for this account":       (ctx) => ctx.copytrade !== true,
@@ -23,26 +33,33 @@ export const EXPECTED_ALLOW = Object.freeze({
   "old:wallet not in your track":                (ctx, o, n) => Array.isArray(n?.WHALE_TRACK_MEMBERSHIPS) && !n.WHALE_TRACK_MEMBERSHIPS.includes(ctx.group),
   // the old path exhausted its retries (the measured 8.17%); the shared path answered. Counted, never folded into MATCH.
   "old:copy-check failed":                       () => true,
+  // OLD-PATH LABEL: the route says "conflict" when another whale drives the track (same states.delete
+  // path, same message). Evidence: the neutral result's track for this child is dropped for drivers.
+  "old:conflict: opposite side bigger":          (ctx, o, n, t) => t?.old?.dropped === "drivers",
 });
 
 /** OLD PATH BUGS: each entry is a recomputation that must hold for the class to be assigned. */
 export const OLD_BUG_ALLOW = Object.freeze({
   // The per-track accumulate re-adds this fill for every follower that reads a row an earlier
-  // follower already rewrote (docs/stage4-design-addendum.md §1). Evidence: the old cost/shares
-  // exceed the shared old-semantics row by a multiple of THIS fill's contribution, or sit at the
-  // on-chain clamp; and the ledger value is what the intended rule gives.
+  // follower already rewrote (docs/stage4-design-addendum.md §1). Evidence, SYMMETRIC: the two
+  // sides differ by an integer multiple of THIS fill's shares (either direction), or one side sits
+  // at the on-chain clamp while the other does not. Identity (cid/outcome/group) must already agree.
   ACCUMULATE_DIVERGENCE: (o, n, t) => {
     const oldRow = t?.old?.row, led = t?.ledger?.row; if (!oldRow || !led || !o?.signal) return false;
     const fillSh = Number(n?.sharesUsed) || 0; if (!(fillSh > 0)) return false;
-    const dSh = (Number(o.signal.his_shares) || 0) - (Number(oldRow.his_shares) || 0);
+    const childSh = Number(o.signal.his_shares) || 0, sharedSh = Number(oldRow.his_shares) || 0;
+    const dSh = Math.abs(childSh - sharedSh);
     const k = dSh / fillSh;
-    const extraAdds = dSh > 0.5 && Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1;
-    const clamped = t?.ledger?.clampedByChain === true || (n?.onchainShares != null && Math.abs((Number(o.signal.his_shares) || 0) - Number(n.onchainShares)) < 0.5);
-    return extraAdds || clamped;
+    const multiple = dSh > 0.5 && Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1;
+    const chain = n?.onchainShares != null ? Number(n.onchainShares) : null;
+    const atClamp = chain != null && (Math.abs(childSh - chain) < 0.5 || Math.abs(sharedSh - chain) < 0.5) && dSh > 0.5;
+    return multiple || atClamp || t?.ledger?.clampedByChain === true && dSh > 0.5;
   },
 });
 
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+const PRICE_GATE = /^\d+c outside \d+-\d+c$/;
+const MARKET_STATE = /no live book|no asks|market closed|market not found|runway|whale holds none/;
 
 /** Digest of the fields fastOpen consumes, so two rows compare on what matters. */
 export function signalDigest(sig) {
@@ -58,7 +75,7 @@ export function signalDigest(sig) {
 /**
  * Apply THIS child's per-user context to the neutral result: which track row would it use, and
  * would its own per-user gates (copytrade armed, follows wallet, hosted/self horizon variant,
- * v2 candle class) let it through. Returns { ok, reason, signal }.
+ * v2 candle class) let it through. Returns { ok, reason, signal, track }.
  */
 export function newPathForChild(neutral, ctx) {
   if (!neutral) return { ok: false, reason: "no neutral" };
@@ -70,9 +87,9 @@ export function newPathForChild(neutral, ctx) {
   const t = (neutral.tracks || []).find((x) => Number(x.group_id) === Number(ctx.group));
   if (!t) return { ok: false, reason: "wallet not in your track" };
   const eligible = ctx.hosted ? t.eligibleHosted : t.eligibleSelf;
-  if (!eligible) return { ok: false, reason: "resolves beyond your track's horizon" };
-  if (t.old.exited) return { ok: false, reason: "already exited: no rebuy after an exit" };
-  if (t.old.dropped) return { ok: false, reason: t.old.dropped === "drivers" ? "another whale drives this track" : "conflict: opposite side bigger" };
+  if (!eligible) return { ok: false, reason: "resolves beyond your track's horizon", track: t };
+  if (t.old.exited) return { ok: false, reason: "already exited: no rebuy after an exit", track: t };
+  if (t.old.dropped) return { ok: false, reason: t.old.dropped === "drivers" ? "another whale drives this track" : "conflict: opposite side bigger", track: t };
   return { ok: true, signal: t.old.row, track: t };
 }
 
@@ -88,34 +105,31 @@ export function classify(old, neutral, ctx) {
   if (!neutral) return { cls: "NEW_MISSING", sub: null };
   const nw = newPathForChild(neutral, ctx);
   const t = nw.track;
-  // decisions
   if (old.ok && nw.ok) {
     const a = signalDigest(old.signal), b = signalDigest(nw.signal);
     const same = a && b && a.cid === b.cid && a.outcome === b.outcome && a.group === b.group && a.cost === b.cost && a.shares === b.shares && a.peak === b.peak && a.cents === b.cents && a.tier === b.tier;
     if (same) return { cls: "MATCH", sub: null };
-    // structural mismatch (different market/outcome/track) is never timing
     if (a.cid !== b.cid || a.outcome !== b.outcome || a.group !== b.group) return { cls: "NEW_PATH_BUG", sub: "identity", detail: { a, b } };
     if (OLD_BUG_ALLOW.ACCUMULATE_DIVERGENCE(old, neutral, t)) return { cls: "OLD_PATH_BUG", sub: "ACCUMULATE_DIVERGENCE", detail: { a, b, ledger: signalDigest(t?.ledger?.row) } };
-    // same decision, price moved between the two book snapshots -> TIMING_SAME only if the ONLY
-    // differing fields are the price-derived ones (cents/maxc/cost by exactly this fill's price)
+    // same decision, price moved between the two book snapshots: only the price-derived fields differ
     const priceOnly = a.shares === b.shares && a.peak === b.peak && a.cents !== b.cents;
     if (priceOnly) return { cls: "TIMING_SAME", sub: "book", detail: { a, b } };
-    return { cls: "UNKNOWN", sub: "field mismatch", detail: { a, b } };
+    return { cls: "UNKNOWN", sub: "field mismatch", detail: { a, b, ledger: signalDigest(t?.ledger?.row) } };
   }
   if (!old.ok && !nw.ok) {
-    const r = String(old.reason || "");
+    const r = String(old.reason || ""), s = String(nw.reason || "");
     const key = "old:" + r;
-    if (EXPECTED_ALLOW[key] && EXPECTED_ALLOW[key](ctx, old, neutral)) return { cls: "EXPECTED", sub: key };
-    if (r === String(nw.reason || "")) return { cls: "MATCH", sub: "skip:" + r };
-    // both skipped for different reasons: a shared-level reason on one side and a per-user on the other
-    if (/no live book|no asks|market closed|market not found|runway|outside .* c$/.test(r) && /no live book|no asks|market closed|market not found|runway|outside/.test(String(nw.reason || ""))) return { cls: "TIMING_SAME", sub: "skip-reason", detail: { old: r, nw: nw.reason } };
-    return { cls: "UNKNOWN", sub: "skip-reason", detail: { old: r, nw: nw.reason } };
+    if (EXPECTED_ALLOW[key] && EXPECTED_ALLOW[key](ctx, old, neutral, t)) return { cls: "EXPECTED", sub: key };
+    if (r === s) return { cls: "MATCH", sub: "skip:" + r };
+    if (PRICE_GATE.test(r) && PRICE_GATE.test(s)) return { cls: "TIMING_SAME", sub: "price-gate", detail: { old: r, nw: s } };
+    if ((MARKET_STATE.test(r) || PRICE_GATE.test(r)) && (MARKET_STATE.test(s) || PRICE_GATE.test(s))) return { cls: "TIMING_SAME", sub: "skip-reason", detail: { old: r, nw: s } };
+    return { cls: "UNKNOWN", sub: "skip-reason", detail: { old: r, nw: s } };
   }
   // one entered, one did not
   const r = String((old.ok ? nw.reason : old.reason) || "");
   const key = "old:" + r;
-  if (!old.ok && EXPECTED_ALLOW[key] && EXPECTED_ALLOW[key](ctx, old, neutral)) return { cls: "EXPECTED", sub: key };
-  if (/no live book|no asks|outside \d+-\d+c|runway|market closed/.test(r)) return { cls: "TIMING_FLIPPED", sub: r, detail: { oldOk: old.ok, nwOk: nw.ok } };
+  if (!old.ok && EXPECTED_ALLOW[key] && EXPECTED_ALLOW[key](ctx, old, neutral, t)) return { cls: "EXPECTED", sub: key };
+  if (PRICE_GATE.test(r) || MARKET_STATE.test(r)) return { cls: "TIMING_FLIPPED", sub: r, detail: { oldOk: old.ok, nwOk: nw.ok } };
   return { cls: "UNKNOWN", sub: "decision flipped: " + r, detail: { oldOk: old.ok, nwOk: nw.ok } };
 }
 

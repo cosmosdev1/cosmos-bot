@@ -67,7 +67,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     ctx: (wallet, neutral) => {
       const base = typeof s4Ctx === "function" ? s4Ctx() : {};
       const mem = Array.isArray(neutral?.WHALE_TRACK_MEMBERSHIPS) ? neutral.WHALE_TRACK_MEMBERSHIPS : [];
-      return { copytrade: isArmed() === true, followsWallet: byAddr.has(String(wallet || "").toLowerCase()), diamondBlocked: false,
+      return { copytrade: base.copytrade === true, followsWallet: byAddr.has(String(wallet || "").toLowerCase()), diamondBlocked: false,
         hosted: base.hosted === true, v2: base.v2 === true, group: base.group ?? (mem.find((g) => g < 1000) ?? mem[0] ?? 1) };
     } });
   let wallets = [];          // [{wallet, username}]
