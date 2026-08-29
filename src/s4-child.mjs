@@ -15,7 +15,7 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
   const LATE_MS = Number(process.env.COSMOS_S4_LATE_MS) || 30_000;
   const SAMPLE_PER_MIN = Number(process.env.COSMOS_S4_SAMPLES_PER_MIN) || 5;
   const pairs = new Map();          // fillId -> { old, neu, t0 }
-  let lastSeq = 0, lastBoot = null, sampledAt = [], mine = new Set();
+  let lastSeq = 0, lastBoot = null, sampledAt = [], mine = new Set(), gapLoggedAt = 0;
 
   const CLS = { MATCH: "s4Match", EXPECTED: "s4Expected", OLD_PATH_BUG: "s4OldBug", NEW_PATH_BUG: "s4NewBug", TIMING_SAME: "s4TimingSame", TIMING_FLIPPED: "s4TimingFlip", OLD_MISSING: "s4OldMissing", NEW_MISSING: "s4NewMissing", UNKNOWN: "s4Unknown" };
 
@@ -51,7 +51,12 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
   }
   function accept(m, fromReplay) {
     if (lastBoot !== m.boot) { lastBoot = m.boot; lastSeq = m.seq - 1; }
-    if (!fromReplay && m.seq > lastSeq + 1) { inc("s4Gap"); send({ t: "s4gap", from: lastSeq + 1, to: m.seq - 1 }); }
+    if (!fromReplay && m.seq > lastSeq + 1) {
+      inc("s4Gap"); send({ t: "s4gap", from: lastSeq + 1, to: m.seq - 1 });
+      // DIAGNOSTIC (rate-limited): the first shadow hours counted ~11k gaps per 10 min against ~500
+      // sends, and replays returned almost nothing - the numbers do not add up. Log the raw facts.
+      if (Date.now() - gapLoggedAt > 120_000) { gapLoggedAt = Date.now(); log(`s4 gap: lastSeq ${lastSeq} got ${m.seq} boot ${m.boot} lastBoot ${lastBoot} replay=${fromReplay}`); }
+    }
     if (m.seq > lastSeq) lastSeq = m.seq;
     inc("s4Recv");
     if (Date.now() - (m.at || Date.now()) > LATE_MS) inc("s4Late");

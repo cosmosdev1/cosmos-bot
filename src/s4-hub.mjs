@@ -23,7 +23,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
   const queue = [];           // {fill, at}
   const ring = [];            // {seq, boot, neutral} newest last
   const samples = [];         // forwarded child samples, drained by flushMetrics
-  let seq = 0, inflight = 0, consecutiveFails = 0, breakerUntil = 0;
+  let seq = 0, inflight = 0, consecutiveFails = 0, breakerUntil = 0, replayLoggedAt = 0;
 
   const enabled = () => { const m = mode(); return m === "shadow" || m === "canary" || m === "on"; };
 
@@ -78,6 +78,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
   /** A child saw a gap: send it the ring entries in [from, to] (bounded, in process). */
   function replay(child, from, to) {
     const out = ring.filter((m) => m.seq >= from && m.seq <= to).slice(0, 500);
+    if (Date.now() - replayLoggedAt > 120_000) { replayLoggedAt = Date.now(); log(`s4 replay: asked ${from}..${to} · ring ${ring.length ? `${ring[0].seq}..${ring[ring.length - 1].seq}` : "empty"} · returned ${out.length} · seq now ${seq}`); }
     try { child.send({ t: "s4replay", boot: BOOT, items: out }); } catch { /* child gone */ }
     return out.length;
   }
