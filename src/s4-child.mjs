@@ -9,7 +9,9 @@
 import { classify, newPathForChild } from "./s4-compare.mjs";
 
 export function startS4Child({ inc, send, log, ctx, warn }) {
-  const PAIR_TTL_MS = Number(process.env.COSMOS_S4_PAIR_TTL_MS) || 30_000;
+  // The old path can take up to ~32 s to answer (8 s timeout x3 with 1.5 s and 6 s backoffs), so a
+  // 30 s pairing window manufactured OLD_MISSING; 60 s covers the worst case with margin.
+  const PAIR_TTL_MS = Number(process.env.COSMOS_S4_PAIR_TTL_MS) || 60_000;
   const LATE_MS = Number(process.env.COSMOS_S4_LATE_MS) || 30_000;
   const SAMPLE_PER_MIN = Number(process.env.COSMOS_S4_SAMPLES_PER_MIN) || 5;
   const pairs = new Map();          // fillId -> { old, neu, t0 }

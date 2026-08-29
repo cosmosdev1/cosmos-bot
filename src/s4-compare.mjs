@@ -33,6 +33,8 @@ export const EXPECTED_ALLOW = Object.freeze({
   "old:wallet not in your track":                (ctx, o, n) => Array.isArray(n?.WHALE_TRACK_MEMBERSHIPS) && !n.WHALE_TRACK_MEMBERSHIPS.includes(ctx.group),
   // the old path exhausted its retries (the measured 8.17%); the shared path answered. Counted, never folded into MATCH.
   "old:copy-check failed":                       () => true,
+  // the child was in its 60 s stand-down after three failures and never asked; the shared path answered
+  "old:stand-down":                              () => true,
   // OLD-PATH LABEL: the route says "conflict" when another whale drives the track (same states.delete
   // path, same message). Evidence: the neutral result's track for this child is dropped for drivers.
   "old:conflict: opposite side bigger":          (ctx, o, n, t) => t?.old?.dropped === "drivers",
@@ -53,7 +55,14 @@ export const OLD_BUG_ALLOW = Object.freeze({
     const multiple = dSh > 0.5 && Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1;
     const chain = n?.onchainShares != null ? Number(n.onchainShares) : null;
     const atClamp = chain != null && (Math.abs(childSh - chain) < 0.5 || Math.abs(sharedSh - chain) < 0.5) && dSh > 0.5;
-    return multiple || atClamp || t?.ledger?.clampedByChain === true && dSh > 0.5;
+    if (multiple || atClamp || (t?.ledger?.clampedByChain === true && dSh > 0.5)) return true;
+    // COST-SCALING VARIANT (production, 2026-08-29 19:30Z+): both sides hold the SAME share count -
+    // the chain clamp - but different costs (child $109, shared $141, ledger $179 for 209.2 sh),
+    // because each follower's clamp rescaled a cost that earlier followers had already inflated.
+    // Evidence: shares equal, at the chain holding, cost differs.
+    const sameSh = dSh <= 0.5, costDiff = Math.abs((Number(o.signal.his_cost_usd) || 0) - (Number(oldRow.his_cost_usd) || 0)) > 0.5;
+    const atChain = chain != null ? Math.abs(childSh - chain) < 0.5 : t?.ledger?.clampedByChain === true;
+    return sameSh && costDiff && atChain;
   },
 });
 

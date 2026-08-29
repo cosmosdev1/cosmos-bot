@@ -47,14 +47,16 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
 
   async function evalOne(f) {
     if (Date.now() < breakerUntil) { inc("s4Overflow"); return; }   // skipped by the breaker: not an eval failure
-    const mySeq = ++seq;
+    // The sequence is assigned at BROADCAST time, not at attempt time: a seq minted here for an
+    // evaluation that then fails would never be sent, and every child would see a phantom gap and
+    // ask for a replay the ring cannot answer (measured: 12,199 gaps in ten minutes on 432 sends).
     let res = null;
     for (let a = 0; a < 2; a++) {
       inc("s4EvalAttempt");
       try {
         const r = await fetch(`${api}/api/v1/fill-eval`, {
           method: "POST", headers: { "content-type": "application/json", "x-runner-secret": secret }, signal: AbortSignal.timeout(TIMEOUT_MS),
-          body: JSON.stringify({ fillId: f.fillId, hubSeq: mySeq, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares }),
+          body: JSON.stringify({ fillId: f.fillId, hubSeq: seq + 1, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares }),
         });
         if (r.status === 503 || r.status >= 500) throw new Error(`fill-eval ${r.status}`);
         if (!r.ok) { log(`s4: fill-eval refused ${r.status} for ${f.fillId.slice(0, 18)}`); inc("s4EvalFail"); return; }   // 4xx: not retryable
@@ -66,6 +68,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
     }
     consecutiveFails = 0;
     inc("s4EvalOk"); inc(res.existed ? "s4EvalDup" : "s4EvalFull");
+    const mySeq = ++seq;                                   // contiguous by construction: only broadcasts consume a number
     const msg = { t: "s4", seq: mySeq, boot: BOOT, at: Date.now(), evalMs: res.evalMs, neutral: res.neutral };
     ring.push(msg); if (ring.length > RING) ring.splice(0, ring.length - RING);
     inc("s4Sent");

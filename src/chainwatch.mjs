@@ -125,7 +125,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     // Stage 4 must drive toward ~1x. Counted before the standdown return so a struggling server
     // shows as ev >> cc rather than as a silent hole in both.
     inc("ev");
-    if (Date.now() < standdownUntil) return;   // server is struggling — slow path covers this fill
+    if (Date.now() < standdownUntil) { if (fillId) s4.recordOld(fillId, { ok: false, reason: "stand-down", wallet: w.wallet }); return; }   // server is struggling - slow path covers this fill; recorded so the shadow does not count it as missing
     const t0 = Date.now();
     if (myOffset) await new Promise((r) => setTimeout(r, myOffset));
     let res;
