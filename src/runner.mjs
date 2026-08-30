@@ -465,7 +465,7 @@ if (HUB_ENABLED) {
     setInterval(() => {
       const s = hub.stats();
       log(`chainhub: ${s.connected ? "connected" : "DISCONNECTED"} · ${s.wallets} wallets · ${s.delivered} logs delivered · ${kids.size} children`);
-      if (s4) { const x = s4.stats(); log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · ring ${x.ring}${x.breaker ? " · BREAKER" : ""}`); }
+      if (s4) { const x = s4.stats(); log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring}${x.breaker ? " · BREAKER" : ""}`); }
     }, 10 * 60_000).unref?.();
   } catch (e) {
     // Never let a hub failure stop the fleet: with no hub the children hear no heartbeat and each

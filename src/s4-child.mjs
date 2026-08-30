@@ -15,9 +15,9 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
   const LATE_MS = Number(process.env.COSMOS_S4_LATE_MS) || 30_000;
   const SAMPLE_PER_MIN = Number(process.env.COSMOS_S4_SAMPLES_PER_MIN) || 5;
   const pairs = new Map();          // fillId -> { old, neu, t0 }
-  let lastSeq = 0, lastBoot = null, sampledAt = [], mine = new Set(), gapLoggedAt = 0, oldBugN = 0;
+  let lastSeq = 0, lastBoot = null, sampledAt = [], mine = new Set(), gapLoggedAt = 0, oldBugN = 0, rowSameN = 0;
 
-  const CLS = { MATCH: "s4Match", EXPECTED: "s4Expected", OLD_PATH_BUG: "s4OldBug", NEW_PATH_BUG: "s4NewBug", TIMING_SAME: "s4TimingSame", TIMING_FLIPPED: "s4TimingFlip", OLD_MISSING: "s4OldMissing", NEW_MISSING: "s4NewMissing", UNKNOWN: "s4Unknown" };
+  const CLS = { MATCH: "s4Match", EXPECTED: "s4Expected", OLD_PATH_BUG: "s4OldBug", NEW_PATH_BUG: "s4NewBug", TIMING_SAME: "s4TimingSame", TIMING_FLIPPED: "s4TimingFlip", TIMING_ROWSTATE_SAME: "s4RowSame", TIMING_ROWSTATE_FLIPPED: "s4RowFlip", OLD_MISSING: "s4OldMissing", NEW_MISSING: "s4NewMissing", UNKNOWN: "s4Unknown" };
 
   function settle(fillId, p) {
     pairs.delete(fillId);
@@ -27,7 +27,8 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
     if (r.cls === "OLD_PATH_BUG") inc(r.sub === "ACCUMULATE_SHARE_MULTIPLE" ? "s4OldBugShare" : r.sub === "ACCUMULATE_COST_RESCALE" ? "s4OldBugCost" : "s4OldBugPeak");
     // OLD_PATH_BUG is proven and abundant; sample it at 1 in 10 so the rare classes get the channel
     oldBugN = r.cls === "OLD_PATH_BUG" ? oldBugN + 1 : oldBugN;
-    if (r.cls !== "MATCH" && r.cls !== "EXPECTED" && (r.cls !== "OLD_PATH_BUG" || oldBugN % 10 === 0)) {
+    rowSameN = r.cls === "TIMING_ROWSTATE_SAME" ? rowSameN + 1 : rowSameN;
+    if (r.cls !== "MATCH" && r.cls !== "EXPECTED" && (r.cls !== "OLD_PATH_BUG" || oldBugN % 10 === 0) && (r.cls !== "TIMING_ROWSTATE_SAME" || rowSameN % 10 === 0)) {
       const now = Date.now(); sampledAt = sampledAt.filter((t) => now - t < 60_000);
       if (sampledAt.length < SAMPLE_PER_MIN) {
         sampledAt.push(now);

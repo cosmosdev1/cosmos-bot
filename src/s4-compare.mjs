@@ -7,52 +7,42 @@
 //   NEW SHADOW RESULT        what the neutral result + this child's own context would have given
 //   INTENDED BUSINESS RULE   the ledger semantics (contribute once, cap once) - compared separately
 //
-// CLASSES. MATCH; EXPECTED (only from the fixed allow-list below, each with its evidence test);
-// OLD_PATH_BUG (fixed allow-list, each with a recomputation that must hold); NEW_PATH_BUG;
-// TIMING_SAME (different market snapshot, same decision); TIMING_FLIPPED (different snapshot,
-// different decision - investigated, never excused); OLD_MISSING / NEW_MISSING (one side never
-// arrived); UNKNOWN (everything else - must be zero to advance).
+// CLASSES. MATCH; EXPECTED (fixed allow-list, each with an evidence test); OLD_PATH_BUG (the FROZEN
+// three-rule taxonomy, owner 2026-08-30); NEW_PATH_BUG; TIMING_SAME / TIMING_FLIPPED (different
+// market snapshot); TIMING_ROWSTATE_SAME / TIMING_ROWSTATE_FLIPPED (owner 2026-08-30: identical
+// logic - proven 1,000/1,000 on recorded inputs - applied to different snapshots of the churning
+// production copy_signals row, differences confined to the row-derived accumulation fields; FLIPPED
+// whenever the tier or another decision changes, reported separately, never treated as harmless);
+// OLD_MISSING / NEW_MISSING; UNKNOWN (must be zero to advance).
 //
-// REVISIONS FROM THE FIRST SHADOW HOUR (2026-08-29), each backed by production samples:
-//   - the old route prints "conflict: opposite side bigger" for the another-whale-drives case as
-//     well (route.ts: both paths states.delete the track and fall through to the same message), so
-//     that pair is a labelling difference, not a decision difference -> EXPECTED with evidence;
-//   - the price gate is worded "<n>c outside <a>-<b>c" and the two paths can sit on different sides
-//     of it from different book snapshots -> TIMING (SAME when both skipped, FLIPPED otherwise);
-//   - the accumulate divergence appears in BOTH directions: the child (an early follower) may read
-//     the row before others wrote it while the shared evaluation reads it already inflated and
-//     clamped to the chain. The evidence rule is therefore symmetric.
+// PRECISION (owner 2026-08-30): no generic epsilon. Each field compares at the precision of its
+// source: share quantities are ERC-1155 amounts / 1e6 -> 6 decimals; cost is the route's integer
+// dollars; cents, tier, group, pair, end and reasons are exact. 2047.940186 == 2047.9401859999998;
+// a business delta never disappears.
 
-/** EXPECTED discrepancies: per-user server reasons the shadow does not model, and old-path labels. */
 export const EXPECTED_ALLOW = Object.freeze({
-  // the old route answered a per-user reason; the child's own context agrees it would not enter
   "old:copytrade is off for this account":       (ctx) => ctx.copytrade !== true,
   "old:wallet not in your copy list":            (ctx) => !ctx.followsWallet,
   "old:diamond access expired":                  (ctx) => ctx.diamondBlocked === true,
+  // the old route applies the per-user v2 candle-class check BEFORE its price gate; the shared path
+  // gates price first, so its SKIP carries the candle facts established before the gate (522b337)
   "old:only 15-minute and hourly candles are copied": (ctx, o, n) => n?.candle?.isCandle === true && !n?.candle?.classV2,
   "old:wallet not in your track":                (ctx, o, n) => Array.isArray(n?.WHALE_TRACK_MEMBERSHIPS) && !n.WHALE_TRACK_MEMBERSHIPS.includes(ctx.group),
-  // the old path exhausted its retries (the measured 8.17%); the shared path answered. Counted, never folded into MATCH.
   "old:copy-check failed":                       () => true,
-  // the child was in its 60 s stand-down after three failures and never asked; the shared path answered
   "old:stand-down":                              () => true,
-  // OLD-PATH LABEL: the route says "conflict" when another whale drives the track (same states.delete
-  // path, same message). Evidence: the neutral result's track for this child is dropped for drivers.
   "old:conflict: opposite side bigger":          (ctx, o, n, t) => t?.old?.dropped === "drivers",
 });
 
 /**
  * OLD PATH BUGS - THE FROZEN TAXONOMY (owner 2026-08-30). Exactly three proven production defects,
- * all faces of the fan-out accumulate in /v1/copy-check. Each rule is a recomputation on the
- * sample itself; a mismatch that matches none of them is UNKNOWN, never a new bug name. Adding an
- * entry here requires a documented production replay (docs/stage4-design-addendum.md).
+ * all faces of the fan-out accumulate in /v1/copy-check. A mismatch matching none is UNKNOWN,
+ * never a new bug name. Adding an entry requires a documented production replay first.
  */
 export const OLD_BUG_ALLOW = Object.freeze({
-  // 1. SHARE_MULTIPLE - follower k re-added this fill's shares k times; the two sides differ by an
-  //    integer multiple of the fill (either direction), or one side sits at the chain clamp.
   ACCUMULATE_SHARE_MULTIPLE: (o, n, t) => {
     const oldRow = t?.old?.row; if (!oldRow || !o?.signal) return false;
     const fillSh = Number(n?.sharesUsed) || 0; if (!(fillSh > 0)) return false;
-    const childSh = Number(o.signal.his_shares) || 0, sharedSh = Number(oldRow.his_shares) || 0;
+    const childSh = q6(o.signal.his_shares), sharedSh = q6(oldRow.his_shares);
     const dSh = Math.abs(childSh - sharedSh); if (!(dSh > 0.5)) return false;
     const k = dSh / fillSh;
     const multiple = Math.abs(k - Math.round(k)) < 0.05 && Math.round(k) >= 1;
@@ -60,54 +50,50 @@ export const OLD_BUG_ALLOW = Object.freeze({
     const atClamp = chain != null && (Math.abs(childSh - chain) < 0.5 || Math.abs(sharedSh - chain) < 0.5);
     return multiple || atClamp || t?.ledger?.clampedByChain === true;
   },
-  // 2. COST_RESCALE - same shares (both at the chain clamp) but costs rescaled from different
-  //    inflation histories.
   ACCUMULATE_COST_RESCALE: (o, n, t) => {
     const oldRow = t?.old?.row; if (!oldRow || !o?.signal) return false;
-    const childSh = Number(o.signal.his_shares) || 0, sharedSh = Number(oldRow.his_shares) || 0;
+    const childSh = q6(o.signal.his_shares), sharedSh = q6(oldRow.his_shares);
     if (Math.abs(childSh - sharedSh) > 0.5) return false;
     const costDiff = Math.abs((Number(o.signal.his_cost_usd) || 0) - (Number(oldRow.his_cost_usd) || 0)) > 0.5;
     const chain = n?.onchainShares != null ? Number(n.onchainShares) : null;
     const atChain = chain != null ? Math.abs(childSh - chain) < 0.5 : t?.ledger?.clampedByChain === true;
     return costDiff && atChain;
   },
-  // 3. PEAK_LASTWRITER - his_peak_shares is last-writer-wins; same shares, peaks apart by an
-  //    integer multiple of the fill.
   ACCUMULATE_PEAK_LASTWRITER: (o, n, t) => {
     const oldRow = t?.old?.row; if (!oldRow || !o?.signal) return false;
     const fillSh = Number(n?.sharesUsed) || 0; if (!(fillSh > 0)) return false;
-    if (Math.abs((Number(o.signal.his_shares) || 0) - (Number(oldRow.his_shares) || 0)) > 0.5) return false;
-    const dPeak = Math.abs((Number(o.signal.his_peak_shares) || 0) - (Number(oldRow.his_peak_shares) || 0));
+    if (Math.abs(q6(o.signal.his_shares) - q6(oldRow.his_shares)) > 0.5) return false;
+    const dPeak = Math.abs(q6(o.signal.his_peak_shares) - q6(oldRow.his_peak_shares));
     const kp = dPeak / fillSh;
     return dPeak > 0.5 && Math.abs(kp - Math.round(kp)) < 0.05 && Math.round(kp) >= 1;
   },
 });
-/** The name of the matching frozen rule, or null. */
 export function oldBugRule(o, n, t) {
   for (const name of Object.keys(OLD_BUG_ALLOW)) { if (OLD_BUG_ALLOW[name](o, n, t)) return name; }
   return null;
 }
 
+/** share quantities: ERC-1155 amounts / 1e6 - canonical at 6 decimals, the precision of the source */
+export const q6 = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n * 1e6) / 1e6 : null; };
+const int = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null; };
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
 const PRICE_GATE = /^\d+c outside \d+-\d+c$/;
 const MARKET_STATE = /no live book|no asks|market closed|market not found|runway|whale holds none/;
 
-/** Digest of the fields fastOpen consumes, so two rows compare on what matters. */
+/** Digest of the fields fastOpen consumes, each at its business precision. */
 export function signalDigest(sig) {
   if (!sig) return null;
   return {
-    cid: String(sig.condition_id ?? ""), outcome: String(sig.outcome ?? ""), group: num(sig.group_id),
-    cost: num(sig.his_cost_usd), shares: num(sig.his_shares), peak: num(sig.his_peak_shares),
-    cents: num(sig.entry_cents), maxc: num(sig.max_entry_cents), tier: num(sig.tier_pct_resolved),
+    cid: String(sig.condition_id ?? ""), outcome: String(sig.outcome ?? ""), group: int(sig.group_id),
+    cost: int(sig.his_cost_usd), shares: q6(sig.his_shares), peak: q6(sig.his_peak_shares),
+    cents: int(sig.entry_cents), maxc: int(sig.max_entry_cents), tier: num(sig.tier_pct_resolved),
     pair: Boolean(sig.is_pair), end: sig.end_date ?? null,
   };
 }
+const ROW_FIELDS = ["cost", "shares", "peak"];                         // derived from the copy_signals row read
+const MARKET_FIELDS = ["cents", "maxc", "pair", "end"];                  // derived from the book / market
+const DECISION_FIELDS = ["tier"];                                        // what sizing consumes
 
-/**
- * Apply THIS child's per-user context to the neutral result: which track row would it use, and
- * would its own per-user gates (copytrade armed, follows wallet, hosted/self horizon variant,
- * v2 candle class) let it through. Returns { ok, reason, signal, track }.
- */
 export function newPathForChild(neutral, ctx) {
   if (!neutral) return { ok: false, reason: "no neutral" };
   if (ctx.copytrade !== true) return { ok: false, reason: "copytrade is off for this account" };
@@ -124,11 +110,13 @@ export function newPathForChild(neutral, ctx) {
   return { ok: true, signal: t.old.row, track: t };
 }
 
+/** Which digest fields differ (after canonicalisation). */
+export function digestDiff(a, b) {
+  return [...ROW_FIELDS, ...MARKET_FIELDS, ...DECISION_FIELDS].filter((k) => a[k] !== b[k]);
+}
+
 /**
  * classify(old, neutral, ctx) -> { cls, sub, detail }
- *   old     { ok, reason?, signal? }  the child's own /v1/copy-check answer, or null if it never arrived
- *   neutral the shared result, or null if it never arrived
- *   ctx     { copytrade, followsWallet, diamondBlocked, hosted, v2, group }
  */
 export function classify(old, neutral, ctx) {
   if (!old && !neutral) return { cls: "UNKNOWN", sub: "both missing" };
@@ -138,15 +126,21 @@ export function classify(old, neutral, ctx) {
   const t = nw.track;
   if (old.ok && nw.ok) {
     const a = signalDigest(old.signal), b = signalDigest(nw.signal);
-    const same = a && b && a.cid === b.cid && a.outcome === b.outcome && a.group === b.group && a.cost === b.cost && a.shares === b.shares && a.peak === b.peak && a.cents === b.cents && a.tier === b.tier;
-    if (same) return { cls: "MATCH", sub: null };
     if (a.cid !== b.cid || a.outcome !== b.outcome || a.group !== b.group) return { cls: "NEW_PATH_BUG", sub: "identity", detail: { a, b } };
+    const diff = digestDiff(a, b);
+    if (!diff.length) return { cls: "MATCH", sub: null };
+    const detail = { a, b, diff, ledger: signalDigest(t?.ledger?.row), fill: neutral.sharesUsed ?? null, chain: neutral.onchainShares ?? null };
     const rule = oldBugRule(old, neutral, t);
-    if (rule) return { cls: "OLD_PATH_BUG", sub: rule, detail: { a, b, ledger: signalDigest(t?.ledger?.row), fill: neutral.sharesUsed ?? null, chain: neutral.onchainShares ?? null } };
-    // same decision, price moved between the two book snapshots: only the price-derived fields differ
-    const priceOnly = a.shares === b.shares && a.peak === b.peak && a.cents !== b.cents;
-    if (priceOnly) return { cls: "TIMING_SAME", sub: "book", detail: { a, b } };
-    return { cls: "UNKNOWN", sub: "field mismatch", detail: { a, b, ledger: signalDigest(t?.ledger?.row), fill: neutral.sharesUsed ?? null, chain: neutral.onchainShares ?? null } };
+    if (rule) return { cls: "OLD_PATH_BUG", sub: rule, detail };
+    const marketSame = MARKET_FIELDS.every((k) => a[k] === b[k]);
+    const onlyRow = diff.every((k) => ROW_FIELDS.includes(k) || DECISION_FIELDS.includes(k));
+    // ROW-STATE: same fill, same market facts, differences confined to the row-derived fields (and
+    // the tier they feed). Same decision -> SAME; a changed tier is a changed sizing decision -> FLIPPED.
+    if (marketSame && onlyRow) return { cls: a.tier === b.tier ? "TIMING_ROWSTATE_SAME" : "TIMING_ROWSTATE_FLIPPED", sub: diff.join("+"), detail };
+    // different book snapshot, same decision: only market-derived fields differ (the cost of THIS fill moves with the price)
+    const onlyMarket = diff.every((k) => MARKET_FIELDS.includes(k) || k === "cost");
+    if (onlyMarket && a.tier === b.tier && a.shares === b.shares && a.peak === b.peak) return { cls: "TIMING_SAME", sub: "book", detail };
+    return { cls: "UNKNOWN", sub: "field mismatch", detail };
   }
   if (!old.ok && !nw.ok) {
     const r = String(old.reason || ""), s = String(nw.reason || "");
@@ -157,7 +151,6 @@ export function classify(old, neutral, ctx) {
     if ((MARKET_STATE.test(r) || PRICE_GATE.test(r)) && (MARKET_STATE.test(s) || PRICE_GATE.test(s))) return { cls: "TIMING_SAME", sub: "skip-reason", detail: { old: r, nw: s } };
     return { cls: "UNKNOWN", sub: "skip-reason", detail: { old: r, nw: s } };
   }
-  // one entered, one did not
   const r = String((old.ok ? nw.reason : old.reason) || "");
   const key = "old:" + r;
   if (!old.ok && EXPECTED_ALLOW[key] && EXPECTED_ALLOW[key](ctx, old, neutral, t)) return { cls: "EXPECTED", sub: key };
@@ -165,7 +158,6 @@ export function classify(old, neutral, ctx) {
   return { cls: "UNKNOWN", sub: "decision flipped: " + r, detail: { oldOk: old.ok, nwOk: nw.ok } };
 }
 
-/** The ledger-vs-intended check, independent of the old path: what the shadow state says the row IS. */
 export function ledgerCheck(t, neutral) {
   if (!t?.ledger?.state || !neutral) return null;
   const c = t.ledger.contrib, s = t.ledger.state;
