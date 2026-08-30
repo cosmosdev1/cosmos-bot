@@ -66,6 +66,19 @@ export const OLD_BUG_ALLOW = Object.freeze({
     const atChain = chain != null ? Math.abs(childSh - chain) < 0.5 : t?.ledger?.clampedByChain === true;
     return costDiff && atChain;
   },
+  // RULE 4 (owner-approved 2026-08-30 after a chain reconstruction of every affected fill): the old
+  // route reads the whale's holding at `latest` on a public node; a node lagging the fill block returns
+  // the PRE-fill balance - for a whale re-entering after a full exit that is exactly 0 - and the route
+  // answers "holds none", missing the re-entry. The shadow reads at the fill's block. Predicate: the
+  // old reason is holds-none, the block-pinned post-fill holding is > 0 and that read succeeded on its
+  // first attempt (the neutral carries the method). The "no intervening exit before the old observation"
+  // clause cannot be checked at the child (children do not see the whale's outgoing transfers); it is
+  // verified offline per fill by tools/audit/_s4-reclassify.mjs against the chain.
+  BALANCE_LATEST_STALE_ZERO: (o, n) => {
+    if (String(o?.reason || "") !== "whale holds none of this token") return false;
+    const pinned = n?.onchainShares != null ? Number(n.onchainShares) : null;
+    return pinned != null && pinned > 0 && n?.balance?.method === "block" && n?.balance?.ok === true;
+  },
   ACCUMULATE_PEAK_LASTWRITER: (o, n, t) => {
     const oldRow = t?.old?.row; if (!oldRow || !o?.signal) return false;
     const fillSh = Number(n?.sharesUsed) || 0; if (!(fillSh > 0)) return false;
@@ -193,6 +206,7 @@ export function classify(old, neutral, ctx) {
     if (r === s) return { cls: "MATCH", sub: "skip:" + r };
     // the child follows the whale, the server's authoritative picks do not: stale per-user context
     if (r === NOT_IN_LIST && ctx.followsWallet) return { cls: "STALE_USER_CONTEXT", sub: "child follows, server refuses", detail: { nw: s } };
+    if (OLD_BUG_ALLOW.BALANCE_LATEST_STALE_ZERO(old, neutral)) return { cls: "OLD_PATH_BUG", sub: "BALANCE_LATEST_STALE_ZERO", detail: { old: r, nw: s, pinned: neutral.onchainShares } };
     if (PRICE_GATE.test(r) && PRICE_GATE.test(s)) return { cls: "TIMING_SAME", sub: "price-gate", detail: { old: r, nw: s } };
     if ((MARKET_STATE.test(r) || PRICE_GATE.test(r)) && (MARKET_STATE.test(s) || PRICE_GATE.test(s))) return { cls: "TIMING_SAME", sub: "skip-reason", detail: { old: r, nw: s } };
     const pair = `${gateKind(r)}->${gateKind(s)}`;
@@ -212,6 +226,7 @@ export function classify(old, neutral, ctx) {
   if (!old.ok && EXPECTED_ALLOW[key] && EXPECTED_ALLOW[key](ctx, old, neutral, t)) return { cls: "EXPECTED", sub: key };
   // stale per-user context, decision flipped: the server refused ownership the child believes it has
   if (!old.ok && r === NOT_IN_LIST && ctx.followsWallet) return { cls: "STALE_USER_CONTEXT", sub: "child follows, server refuses; new path approved", detail: { nwOk: true } };
+  if (!old.ok && OLD_BUG_ALLOW.BALANCE_LATEST_STALE_ZERO(old, neutral)) return { cls: "OLD_PATH_BUG", sub: "BALANCE_LATEST_STALE_ZERO", detail: { old: r, nwOk: true, pinned: neutral.onchainShares } };
   // DRIVER RACE: the old route hit the drivers lock (its conflict label) while the shadow, reading
   // milliseconds earlier, saw no driver for the track (or only this whale) and built a row.
   if (!old.ok && r === CONFLICT_LABEL && nw.ok && t && !t.old?.dropped && Array.isArray(t.drivers)) {

@@ -24,7 +24,7 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
     const c = ctx(p.neu?.wallet ?? p.old?.wallet, p.neu ?? null);
     const r = classify(p.old ?? null, p.neu ?? null, c);
     inc(CLS[r.cls] || "s4Unknown");
-    if (r.cls === "OLD_PATH_BUG") inc(r.sub === "ACCUMULATE_SHARE_MULTIPLE" ? "s4OldBugShare" : r.sub === "ACCUMULATE_COST_RESCALE" ? "s4OldBugCost" : "s4OldBugPeak");
+    if (r.cls === "OLD_PATH_BUG") inc(r.sub === "BALANCE_LATEST_STALE_ZERO" ? "s4OldBugBalance" : r.sub === "ACCUMULATE_SHARE_MULTIPLE" ? "s4OldBugShare" : r.sub === "ACCUMULATE_COST_RESCALE" ? "s4OldBugCost" : "s4OldBugPeak");
     // OLD_PATH_BUG is proven and abundant; sample it at 1 in 10 so the rare classes get the channel
     oldBugN = r.cls === "OLD_PATH_BUG" ? oldBugN + 1 : oldBugN;
     rowSameN = r.cls === "TIMING_ROWSTATE_SAME" ? rowSameN + 1 : rowSameN;
