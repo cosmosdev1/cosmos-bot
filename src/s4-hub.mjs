@@ -20,7 +20,9 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
   const MAX_AGE_MS = Number(process.env.COSMOS_S4_MAX_AGE_MS) || 5_000;
   const RING = Number(process.env.COSMOS_S4_RING) || 2_000;
   const TIMEOUT_MS = Number(process.env.COSMOS_S4_TIMEOUT_MS) || 6_000;
-  const queue = [];           // {fill, at}
+  const queue = [];           // {fill, at}  (arrival order; the pump skips items whose token is in flight)
+  const inflightTokens = new Set();   // PER-MARKET FIFO (owner 2026-08-30): one evaluation per token at a time, arrival order
+  let maxBlockSeen = 0;               // highest block delivered on the stream; block N < maxBlockSeen is CLOSED for the seal
   const ring = [];            // {seq, boot, neutral} newest last
   const samples = [];         // forwarded child samples, drained by flushMetrics
   let seq = 0, inflight = 0, consecutiveFails = 0, breakerUntil = 0, replayLoggedAt = 0, hung = 0;
@@ -31,6 +33,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
   function onFills(list) {
     if (!enabled() || !list?.length) return;
     for (const f of list) {
+      if (Number.isFinite(Number(f.block)) && Number(f.block) > maxBlockSeen) maxBlockSeen = Number(f.block);
       if (queue.length >= DEPTH) { inc("s4Overflow"); continue; }
       queue.push({ fill: f, at: Date.now() });
     }
@@ -38,15 +41,19 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
   }
 
   function pump() {
-    while (inflight < CONC && queue.length) {
-      const item = queue.shift();
-      if (Date.now() - item.at > MAX_AGE_MS) { inc("s4Overflow"); continue; }   // too old: live would fall back
+    // scan in arrival order; take the first item whose token is not already being evaluated
+    for (let i = 0; inflight < CONC && i < queue.length; ) {
+      const item = queue[i];
+      if (Date.now() - item.at > MAX_AGE_MS) { queue.splice(i, 1); inc("s4Overflow"); continue; }   // too old: live would fall back
+      const tok = String(item.fill.tokenId || "");
+      if (inflightTokens.has(tok)) { i++; continue; }                                                // FIFO per token: wait for the earlier fill
+      queue.splice(i, 1); inflightTokens.add(tok);
       inflight++;
       // WEDGE GUARD (2026-08-30): the slot is released by a hard deadline, never only by the promise.
       // Measured: all 8 slots hung at 00:14Z and every fill for six hours was counted as overflow
       // with zero attempts. The hung-await rule: no await without a deadline that frees the resource.
       let released = false;
-      const release = () => { if (released) return; released = true; inflight--; pump(); };
+      const release = () => { if (released) return; released = true; inflight--; inflightTokens.delete(tok); pump(); };
       const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms - slot released`); release(); } }, HARD_MS);
       evalOne(item.fill, Date.now() - item.at, item.at).catch((e) => log(`s4: evalOne threw ${e?.message || e}`)).finally(() => { clearTimeout(timer); release(); });
     }
@@ -63,7 +70,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
       try {
         const r = await fetch(`${api}/api/v1/fill-eval`, {
           method: "POST", headers: { "content-type": "application/json", "x-runner-secret": secret }, signal: AbortSignal.timeout(TIMEOUT_MS),
-          body: JSON.stringify({ fillId: f.fillId, hubSeq: seq + 1, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares, queuedMs, seenAt }),
+          body: JSON.stringify({ fillId: f.fillId, hubSeq: seq + 1, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares, queuedMs, seenAt, closedBlock: maxBlockSeen > 0 ? maxBlockSeen - 1 : null }),
         });
         if (r.status === 503 || r.status >= 500) throw new Error(`fill-eval ${r.status}`);
         if (!r.ok) { log(`s4: fill-eval refused ${r.status} for ${f.fillId.slice(0, 18)}`); inc("s4EvalFail"); return; }   // 4xx: not retryable
@@ -110,7 +117,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
     return out;
   }
 
-  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, hung, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode(), samples: [...byClass.entries()].map(([k, v]) => `${k}:${v.length}`).join(",") }; }
+  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, inflightTokens: inflightTokens.size, maxBlockSeen, hung, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode(), samples: [...byClass.entries()].map(([k, v]) => `${k}:${v.length}`).join(",") }; }
 
   return { onFills, replay, sample, drainSamples, stats, boot: BOOT };
 }
