@@ -15,7 +15,7 @@ import * as store from "./store.mjs";
 import { log, warn, err } from "./log.mjs";
 import { startQTable } from "./qtable.mjs";
 import { startFleetStateWatch, fleetHalted, fleetReason } from "./fleetstate.mjs";
-import { drawdownCheck } from "./drawdown.mjs";
+import { drawdownCheck, drawdownState } from "./drawdown.mjs";
 
 // Config comes from config.json (local install via `npm run setup`) OR env vars (cloud/24-7
 // deploy — Render/Railway/Docker, where there's no interactive terminal). Env vars win so a
@@ -1026,6 +1026,9 @@ async function cycle(cosmos, pm) {
   // real recovery. This is the individual case of the fleet rule and needs no server.
   const dd = drawdownCheck(portfolioValue);
   qtState.ddHalt = dd.halt;
+  // DRAWDOWN TELEMETRY (2026-08-30 correctness fix): the latch, its basis and the migration decision,
+  // reported to the runner every cycle so the rollout is audited server-side (bot_health has no column).
+  try { if (typeof process.send === "function") process.send({ t: "dd", halt: dd.halt, reason: dd.reason || null, portfolio: Number(portfolioValue) || 0, high: dd.high, ...drawdownState() }); } catch { /* parent gone */ }
   if (dd.halt) warn(`DRAWDOWN BREAKER: portfolio $${portfolioValue.toFixed(0)} is ${(dd.dd * 100).toFixed(0)}% below the 12h high $${dd.high.toFixed(0)} — entries halted until recovery`);
   // HOSTED IS COPY-ONLY, so this feed is pure waste for it (scale QA 2026-08-20). /v1/signals serves
   // ai/sport/quant/weather/top5 and NEVER a copytrade row, and the loop below discards every row whose
