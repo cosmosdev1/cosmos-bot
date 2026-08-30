@@ -291,6 +291,10 @@ export function classify(old, neutral, ctx) {
     // with no row on either side (owner 2026-08-30: reason-label differences already proven
     // execution-equivalent are not worth a ruling; the taxonomy stays frozen for real business-decision
     // mismatches). Every one requires its own predicate to be independently true on the captured inputs.
+    // the mirror pair, measured 2026-08-30T18:37Z: the old path refused on the absolute 5-minute candle
+    // ban while the shared evaluation could not resolve the market (fail-closed). Both SKIP; the ban is
+    // absolute, so the outcome is identical whatever the market lookup returned.
+    if (/^5-minute candles are not copied/.test(r) && /^market not found/.test(s)) return { cls: "EXPECTED_GATE_ORDER", sub: "candle5m->market-not-found", detail: { old: r, nw: s } };
     if (BOOK_GATE.test(r)) {
       // the 5-minute candle ban is absolute in the spec, so the new path's own reason IS the predicate
       if (/^5-minute candles are not copied/.test(s)) return { cls: "EXPECTED_GATE_ORDER", sub: "book->candle5m", detail: { old: r, nw: s } };
