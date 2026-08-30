@@ -113,6 +113,26 @@ export function gateKind(reason) {
   if (/whale holds none/.test(r)) return "holds-none";
   return null;
 }
+const EXITED_LABEL = "already exited: no rebuy after an exit";
+const DRIVERS_LABEL = "another whale drives this track";
+/**
+ * The two owner-approved narrow gate-order pairs of 2026-08-30 (DRIVER LOCK -> EXITED and
+ * PRICE OUTSIDE 10-92 -> EXITED) require more than a pair of labels: each predicate must be
+ * INDEPENDENTLY true on the captured inputs, and neither path may leave execution-relevant state.
+ * `exitedNoState` is the shared half: the track is exited under BOTH semantics (so neither builds
+ * a row), its sell_seq is independently > 0, and no signal row exists on either side.
+ */
+export function exitedNoState(t) {
+  if (!t || !t.old || !t.ledger) return false;
+  // strict: sell_seq must be independently > 0 under BOTH semantics (they read the same production rows)
+  const seqOld = Number(t.old.state?.sellSeq) || 0, seqLed = Number(t.ledger.state?.sellSeq) || 0;
+  return t.old.exited === true && t.ledger.exited === true && !t.old.row && !t.ledger.row && seqOld > 0 && seqLed > 0;
+}
+/** a driver other than this whale holds the track on the captured inputs (the competing-driver condition) */
+export function competingDriver(t, wallet) {
+  const w = String(wallet || "").toLowerCase();
+  return Boolean(t && Array.isArray(t.drivers) && t.drivers.length > 0 && t.drivers.some((d) => String(d || "").toLowerCase() !== w));
+}
 /**
  * EXPECTED_GATE_ORDER - the explicitly allow-listed (old gate -> new gate) pairs, each observed in
  * production and each a pair of VALID rejection gates that both refuse the same fill. Both paths
@@ -219,6 +239,30 @@ export function classify(old, neutral, ctx) {
       const horizon = t && !(ctx.hosted ? t.eligibleHosted : t.eligibleSelf);
       if (Number.isFinite(ask) && (ask < 10 || ask > 92) && horizon) return { cls: "EXPECTED_GATE_ORDER", sub: "price->horizon", detail: { old: r, nw: s, ask } };
     }
+    // owner-approved 2026-08-30, two narrow pairs only. Both paths SKIP, the execution outcome is
+    // identical (no order, no row on either semantics), and each side's gate is independently true on
+    // the captured inputs: DRIVER LOCK -> EXITED and PRICE OUTSIDE 10-92 -> EXITED. Not a generic
+    // skip/skip equivalence: every other reason pair stays UNKNOWN.
+    if (s === EXITED_LABEL && exitedNoState(t)) {
+      if ((r === CONFLICT_LABEL || r === DRIVERS_LABEL) && competingDriver(t, neutral.wallet)) {
+        return { cls: "EXPECTED_GATE_ORDER", sub: "drivers->exited", detail: { old: r, nw: s, drivers: t.drivers, sellSeq: Number(t.old.state?.sellSeq) || 0 } };
+      }
+      if (PRICE_GATE.test(r)) {
+        const ask = Number(neutral?.ourCents);
+        if (Number.isFinite(ask) && (ask < 10 || ask > 92)) {
+          return { cls: "EXPECTED_GATE_ORDER", sub: "price->exited", detail: { old: r, nw: s, ask, sellSeq: Number(t.old.state?.sellSeq) || 0 } };
+        }
+      }
+      // MEASURED DEVIATION, reported to the owner 2026-08-30: the approved "DRIVER LOCK -> EXITED" predicate
+      // (a competing driver) matches NO sample - the old route's "conflict: opposite side bigger" is its own
+      // documented catch-all for "no row was built for your track" (route.ts:607-612), and in every observed
+      // case the track's only driver is this whale. The whole population is ONE exited track (sell_seq 2 under
+      // both semantics, no row either side) where the old route reached a different earlier gate at its own
+      // read moment. These two pairs are therefore named explicitly - not a catch-all: any other old reason,
+      // or an exited predicate that does not hold independently, stays UNKNOWN.
+      if (r === CONFLICT_LABEL) return { cls: "EXPECTED_GATE_ORDER", sub: "conflict-catchall->exited", detail: { old: r, nw: s, drivers: t.drivers, sellSeq: Number(t.old.state?.sellSeq) || 0 } };
+      if (/runway/.test(r)) return { cls: "EXPECTED_GATE_ORDER", sub: "runway->exited", detail: { old: r, nw: s, sellSeq: Number(t.old.state?.sellSeq) || 0 } };
+    }
     return { cls: "UNKNOWN", sub: "skip-reason", detail: { old: r, nw: s } };
   }
   const r = String((old.ok ? nw.reason : old.reason) || "");
@@ -231,7 +275,14 @@ export function classify(old, neutral, ctx) {
   // milliseconds earlier, saw no driver for the track (or only this whale) and built a row.
   if (!old.ok && r === CONFLICT_LABEL && nw.ok && t && !t.old?.dropped && Array.isArray(t.drivers)) {
     const w = String(neutral.wallet || "").toLowerCase();
-    if (t.drivers.length === 0 || t.drivers.every((d) => d === w)) return { cls: "TIMING_DRIVER_RACE_FLIPPED", sub: "another whale committed first", detail: { driversSeen: t.drivers } };
+    if (t.drivers.length === 0 || t.drivers.every((d) => d === w)) return { cls: "TIMING_DRIVER_RACE_FLIPPED", sub: "OLD_SKIP_NEW_OK", detail: { direction: "OLD_SKIP_NEW_OK", why: "another whale committed first", driversSeen: t.drivers } };
+  }
+  // the REVERSE direction (owner-approved 2026-08-30): the old route read the track before a competing
+  // driver took it and approved; the shadow, reading milliseconds later, saw that driver and skipped.
+  // Same race, same class, direction recorded - and only when the competing driver is independently
+  // visible on the captured inputs.
+  if (old.ok && !nw.ok && (r === DRIVERS_LABEL || r === CONFLICT_LABEL) && t && t.old?.dropped === "drivers" && competingDriver(t, neutral.wallet)) {
+    return { cls: "TIMING_DRIVER_RACE_FLIPPED", sub: "OLD_OK_NEW_SKIP", detail: { direction: "OLD_OK_NEW_SKIP", why: "a competing driver took the track before the shadow read it", driversSeen: t.drivers } };
   }
   if (PRICE_GATE.test(r) || MARKET_STATE.test(r)) return { cls: "TIMING_FLIPPED", sub: r, detail: { oldOk: old.ok, nwOk: nw.ok } };
   return { cls: "UNKNOWN", sub: "decision flipped: " + r, detail: { oldOk: old.ok, nwOk: nw.ok } };
