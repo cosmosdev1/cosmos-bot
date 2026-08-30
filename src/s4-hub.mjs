@@ -60,12 +60,15 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
       if (Date.now() - item.at > MAX_AGE_MS) { inc("s4Overflow"); inc("s4OverflowCc", followers(item.fill.wallet)); settle(item.fill.fillId, false); continue; }   // too old: live would fall back; the legacy copy-checks that fallback would cost
       inflight++;
       // WEDGE GUARD (2026-08-30): the slot is released by a hard deadline, never only by the promise.
+      // AND THE WAITER IS SETTLED WITH IT (2026-08-30, second incident): freeing the slot without
+      // settling left `evaluateNow` waiting for ever, which wedged the SEAL WORKER's tick - one hung
+      // evaluation stopped reconciliation and sealing for 28 minutes with no error anywhere.
       // Measured: all 8 slots hung at 00:14Z and every fill for six hours was counted as overflow
       // with zero attempts. The hung-await rule: no await without a deadline that frees the resource.
       let released = false;
       const stage = { at: "queued" };
       const release = () => { if (released) return; released = true; inflight--; pump(); };
-      const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); inc(stage.at === "fetch" ? "s4HungFetch" : stage.at === "json" ? "s4HungJson" : "s4HungBcast"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms at stage ${stage.at} - slot released`); settle(item.fill.fillId, false); release(); } }, HARD_MS);
+      const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); inc(stage.at === "fetch" ? "s4HungFetch" : stage.at === "json" ? "s4HungJson" : "s4HungBcast"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms at stage ${stage.at} - slot released`); settle(item.fill.fillId, false); settle(item.fill.fillId, false); release(); } }, HARD_MS);
       evalOne(item.fill, Date.now() - item.at, item.at, stage).then((ok) => settle(item.fill.fillId, ok !== false)).catch((e) => { log(`s4: evalOne threw ${e?.message || e}`); settle(item.fill.fillId, false); }).finally(() => { clearTimeout(timer); release(); });
     }
   }

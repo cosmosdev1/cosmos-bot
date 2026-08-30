@@ -24,6 +24,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   let lastSealed = 0, pendingBlock = null, attempts = 0, running = false, stopped = false, started = false, throughCount = 0;
   const RPC_TIMEOUT = Number(process.env.COSMOS_S4_RECON_TIMEOUT_MS) || 8_000;
   const MAX_BEHIND = Number(process.env.COSMOS_S4_RECON_MAX_BEHIND) || 50;   // on boot, never try to reconcile more than this many blocks back
+  const EVAL_DEADLINE_MS = Number(process.env.COSMOS_S4_RECON_EVAL_MS) || 20_000;   // a recovered fill that never settles must not stop the worker
   const STUCK_INFLIGHT_MS = Number(process.env.COSMOS_S4_RECON_STUCK_MS) || 30_000;   // a backfill still running this long is treated as stuck
   const STUCK_IDLE_MS = 5_000;                                                        // a head gap the stream may still close by itself
   const backoff = () => Math.min(30_000, 1_000 * 2 ** Math.min(attempts, 5));
@@ -78,7 +79,13 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
     if (missing.length) {
       inc("s4ReconMissing", missing.length);
       log(`s4 seal: block ${N} - ${missing.length} fill(s) the stream never delivered: ${missing.map((f) => f.fillId.slice(0, 18)).join(" ")} - evaluating before the seal`);
-      const results = await s4.evaluateNow(missing, { origin: "reconcile" });
+      // NO AWAIT WITHOUT A DEADLINE (the owner's standing rule): even with the hub settling its hung
+      // waiters, this await must never be able to stop reconciliation for the whole fleet.
+      const results = await Promise.race([
+        s4.evaluateNow(missing, { origin: "reconcile" }),
+        new Promise((res) => setTimeout(() => res(null), EVAL_DEADLINE_MS)),
+      ]);
+      if (!results) return { ok: false, stats: { ...stats, status: "missing-eval-timeout", rpc_ms: rpcMs, logs: logs.length, fills: fills.length, missing: missing.length, duplicates: dup, error: `recovered fills did not settle in ${EVAL_DEADLINE_MS}ms` } };
       if (results.some((r) => !r.ok)) return { ok: false, stats: { ...stats, status: "missing-eval-failed", rpc_ms: rpcMs, logs: logs.length, fills: fills.length, missing: missing.length, duplicates: dup, error: "a recovered fill failed to evaluate" } };
     }
     if (dup) inc("s4ReconDup", dup);
