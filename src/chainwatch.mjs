@@ -186,10 +186,19 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
       // which would otherwise reach the same buy off the row the old /copy-check just wrote, defers.
       // Marked for BOTH outcomes: "no buy" is a decision, and it is the case where the old row would
       // have made the polled tick buy something Stage 4 refused.
-      { const sg = res?.signal || null;
-        const cid = sg?.condition_id ?? null, outcome = sg?.outcome ?? null;
-        if (cid && outcome) authority.markDecided(cid, outcome, w.wallet);
-        else { const n = s4.lastNeutral?.(fillId); if (n?.conditionId && n?.outcome) authority.markDecided(n.conditionId, n.outcome, w.wallet); } }
+      // The marker carries the STATE the production row will show after this decision, so it protects
+      // THIS business event and nothing else: a later fill grows the row past it and the polled sweep
+      // is free again (that is how a fill this path misses is still recovered).
+      { const n = s4.lastNeutral?.(fillId);
+        const track = (n?.tracks || []).find((t) => t?.ledger?.row || t?.old?.row);
+        const cid = res?.signal?.condition_id ?? n?.conditionId ?? null;
+        const outcome = res?.signal?.outcome ?? n?.outcome ?? null;
+        if (cid && outcome) {
+          authority.markDecided(cid, outcome, w.wallet, authority.stateOf(res?.signal) || authority.stateOf(track?.ledger?.row) || authority.stateOf(track?.old?.row) || {});
+          // the OLD path's own answer is what the polled tick will actually see in the row; when it
+          // lands (it may be seconds later, or never) the marker ratchets up to it
+          old.then((o) => { if (o?.ok && o.signal) authority.markDecided(cid, outcome, w.wallet, authority.stateOf(o.signal)); }).catch(() => {});
+        } }
     } else {
       res = await runOldCheck();
     }
