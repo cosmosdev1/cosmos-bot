@@ -98,6 +98,7 @@ export const q6 = (v) => { const n = Number(v); return Number.isFinite(n) ? Math
 const int = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n) : null; };
 const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
 const PRICE_GATE = /^\d+c outside \d+-\d+c$/;
+const BOOK_GATE = /^(no asks|no live book|market closed|market not found)/;
 const MARKET_STATE = /no live book|no asks|market closed|market not found|runway|whale holds none/;
 const CONFLICT_LABEL = "conflict: opposite side bigger";      // the old route's label for the drivers lock
 const NOT_IN_LIST = "wallet not in your copy list";
@@ -285,6 +286,20 @@ export function classify(old, neutral, ctx) {
       // or an exited predicate that does not hold independently, stays UNKNOWN.
       if (r === CONFLICT_LABEL) return { cls: "EXPECTED_GATE_ORDER", sub: "conflict-catchall->exited", detail: { old: r, nw: s, drivers: t.drivers, sellSeq: Number(t.old.state?.sellSeq) || 0 } };
       if (/runway/.test(r)) return { cls: "EXPECTED_GATE_ORDER", sub: "runway->exited", detail: { old: r, nw: s, sellSeq: Number(t.old.state?.sellSeq) || 0 } };
+    }
+    // Three further NAMED pairs, each measured in the 17:02-18:03Z window and each verified both-SKIP
+    // with no row on either side (owner 2026-08-30: reason-label differences already proven
+    // execution-equivalent are not worth a ruling; the taxonomy stays frozen for real business-decision
+    // mismatches). Every one requires its own predicate to be independently true on the captured inputs.
+    if (BOOK_GATE.test(r)) {
+      // the 5-minute candle ban is absolute in the spec, so the new path's own reason IS the predicate
+      if (/^5-minute candles are not copied/.test(s)) return { cls: "EXPECTED_GATE_ORDER", sub: "book->candle5m", detail: { old: r, nw: s } };
+      // another whale holds this child's track on the captured inputs
+      if (s === DRIVERS_LABEL && t?.old?.dropped === "drivers" && competingDriver(t, neutral.wallet)) return { cls: "EXPECTED_GATE_ORDER", sub: "book->drivers", detail: { old: r, nw: s, drivers: t.drivers } };
+    }
+    // the old route's catch-all vs the shared evaluation's OWN block-pinned holdings read
+    if (r === CONFLICT_LABEL && /^whale holds none/.test(s) && neutral?.balance?.method === "block") {
+      return { cls: "EXPECTED_GATE_ORDER", sub: "conflict-catchall->holds-none", detail: { old: r, nw: s, onchain: neutral?.onchainShares ?? null } };
     }
     return { cls: "UNKNOWN", sub: "skip-reason", detail: { old: r, nw: s } };
   }
