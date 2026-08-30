@@ -509,7 +509,7 @@ if (HUB_ENABLED) {
     setInterval(() => {
       const s = hub.stats();
       log(`chainhub: ${s.connected ? "connected" : "DISCONNECTED"} · ${s.wallets} wallets · ${s.delivered} logs delivered · ${kids.size} children`);
-      if (s4) { const x = s4.stats(); const w = sealWorker ? sealWorker.stats() : null; log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring} · sealable ${x.sealable}${w ? ` · sealed through ${w.lastSealed} (behind ${w.behind}${w.pendingBlock ? `, pending ${w.pendingBlock} x${w.attempts}` : ""})` : ""}${x.breaker ? " · BREAKER" : ""}`); if (w && w.behind > 0) fleetMetrics.s4ReconPending = w.behind; }
+      if (s4) { const x = s4.stats(); const w = sealWorker ? sealWorker.stats() : null; log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring} · sealable ${x.sealable}${w ? ` · sealed through ${w.lastSealed} (behind ${w.behind}${w.pendingBlock ? `, pending ${w.pendingBlock} x${w.attempts}` : ""})` : ""}${x.breaker ? " · BREAKER" : ""}`); if (w && w.lastSealed > 0 && w.behind > 0) fleetMetrics.s4ReconPending = w.behind; }
     }, 10 * 60_000).unref?.();
   } catch (e) {
     // Never let a hub failure stop the fleet: with no hub the children hear no heartbeat and each

@@ -37,8 +37,17 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
 
   /** resume point: the persisted DB cursor, but never further back than MAX_BEHIND blocks from what is sealable now */
   async function boot() {
-    try { const r = await post("/api/v1/fill-reconcile", null, "GET"); const cur = Number(r?.j?.cursor) || 0; const sealable = hub.sealable(); lastSealed = cur > 0 ? cur : 0; if (sealable > 0 && sealable - lastSealed > MAX_BEHIND) { log(`s4 seal: DB cursor ${lastSealed} is ${sealable - lastSealed} blocks behind - resuming at ${sealable - MAX_BEHIND} (the gap is recorded, not sealed)`); lastSealed = sealable - MAX_BEHIND; } log(`s4 seal: worker up · resume after block ${lastSealed}`); }
-    catch (e) { log(`s4 seal: boot read failed (${e?.message || e}) - resuming from the live cursor`); const s = hub.sealable(); lastSealed = s > MAX_BEHIND ? s - MAX_BEHIND : 0; }
+    // BOOT BUG (2026-08-30 13:xxZ, first deployment): the cursor was not yet anchored when boot ran,
+    // sealable() was 0, the MAX_BEHIND clamp never applied and the worker reconciled from block 1 -
+    // 4,232 ancient blocks in 53 minutes, sealing nothing current. Boot now WAITS for a live cursor,
+    // and every tick re-clamps: the worker never works more than MAX_BEHIND blocks behind sealable().
+    const sealable = hub.sealable();
+    if (!(sealable > 0)) return;                                   // not anchored yet: try again next tick
+    let cur = 0;
+    try { const r = await post("/api/v1/fill-reconcile", null, "GET"); cur = Number(r?.j?.cursor) || 0; } catch (e) { log(`s4 seal: boot read failed (${e?.message || e}) - resuming from the live cursor`); }
+    lastSealed = cur > 0 ? cur : 0;
+    if (sealable - lastSealed > MAX_BEHIND) { log(`s4 seal: DB cursor ${lastSealed} is ${sealable - lastSealed} blocks behind - resuming at ${sealable - MAX_BEHIND} (the gap is recorded, not sealed)`); lastSealed = sealable - MAX_BEHIND; }
+    log(`s4 seal: worker up · resume after block ${lastSealed} (sealable ${sealable})`);
     started = true;
   }
 
@@ -77,9 +86,12 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   async function tick() {
     if (running || stopped) return; running = true;
     try {
-      if (!started) await boot();
+      if (!started) { await boot(); if (!started) return; }
       const sealable = hub.sealable();
       if (!(sealable > lastSealed)) return;
+      // never fall further behind than MAX_BEHIND (a long stall, a stuck block after many retries): the
+      // skipped range is a KNOWN unreconciled gap, logged and counted, never silently sealed
+      if (sealable - lastSealed > MAX_BEHIND && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; attempts = 0; }
       const N = pendingBlock ?? lastSealed + 1;
       if (N > sealable) return;
       const r = await reconcile(N);
