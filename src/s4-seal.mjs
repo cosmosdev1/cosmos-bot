@@ -21,9 +21,11 @@
 import { fillsFromLog } from "./fills.mjs";
 
 export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, poll = 500 }) {
-  let lastSealed = 0, pendingBlock = null, attempts = 0, running = false, stopped = false, started = false;
+  let lastSealed = 0, pendingBlock = null, attempts = 0, running = false, stopped = false, started = false, throughCount = 0;
   const RPC_TIMEOUT = Number(process.env.COSMOS_S4_RECON_TIMEOUT_MS) || 8_000;
   const MAX_BEHIND = Number(process.env.COSMOS_S4_RECON_MAX_BEHIND) || 50;   // on boot, never try to reconcile more than this many blocks back
+  const STUCK_INFLIGHT_MS = Number(process.env.COSMOS_S4_RECON_STUCK_MS) || 30_000;   // a backfill still running this long is treated as stuck
+  const STUCK_IDLE_MS = 5_000;                                                        // a head gap the stream may still close by itself
   const backoff = () => Math.min(30_000, 1_000 * 2 ** Math.min(attempts, 5));
 
   async function post(path, body, method = "POST") {
@@ -88,20 +90,35 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
     try {
       if (!started) { await boot(); if (!started) return; }
       const sealable = hub.sealable();
-      if (!(sealable > lastSealed)) return;
+      // LIVENESS (owner 2026-08-30): a pending range nothing else can close - a refused backfill chunk, the part of
+      // a gap beyond COPY_BACKFILL_BLOCKS, a hung backfill - froze sealable() for good at 15:03Z: no code path
+      // resolved it. The worker's pinned per-block eth_getLogs IS a complete recovery of a block, so it reconciles
+      // THROUGH such a range block by block and resolves each one in the cursor; a backfill still running is left
+      // to finish first, and a fresh head gap gets a few seconds for the stream to close it.
+      let through = false;
+      if (!(sealable > lastSealed) || (pendingBlock ?? lastSealed + 1) > sealable) {
+        const N0 = pendingBlock ?? lastSealed + 1;
+        // the block that holds the cursor is the range start; N0 itself may sit just below it, held only by the
+        // head lag - it is reconciled on the way (node height >= N0 + 1 proves the chain moved past it)
+        let p = null; for (let k = N0; k <= N0 + 2 && !p; k++) p = hub.pendingAt?.(k);
+        if (!p) return;                                                                         // nothing pending near N0: simply not sealable yet (head lag)
+        if (Date.now() - (Number(p.at) || 0) < (p.inFlight ? STUCK_INFLIGHT_MS : STUCK_IDLE_MS)) return;
+        through = true;
+      }
       // never fall further behind than MAX_BEHIND (a long stall, a stuck block after many retries): the
       // skipped range is a KNOWN unreconciled gap, logged and counted, never silently sealed
-      if (sealable - lastSealed > MAX_BEHIND && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; attempts = 0; }
+      if (!through && sealable - lastSealed > MAX_BEHIND && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; attempts = 0; }
       const N = pendingBlock ?? lastSealed + 1;
-      if (N > sealable) return;
+      if (!through && N > sealable) return;
       const r = await reconcile(N);
       if (!r.ok) { attempts++; pendingBlock = N; inc("s4ReconErr"); if (attempts === 1 || attempts % 10 === 0) log(`s4 seal: block ${N} not reconciled (${r.stats.status}${r.stats.error ? ": " + r.stats.error : ""}) - attempt ${attempts}, retry in ${backoff()} ms`); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: r.stats }).catch(() => {}); await new Promise((res) => setTimeout(res, backoff())); return; }
       const p = await post("/api/v1/fill-reconcile", { block: N, hash: r.pin, stats: r.stats });
       if (!p.ok) { attempts++; pendingBlock = N; inc("s4SealErr"); log(`s4 seal: block ${N} reconciled but the seal call failed (${p.status}) - retry`); await new Promise((res) => setTimeout(res, backoff())); return; }
       inc("s4ReconOk"); inc("s4SealOk"); attempts = 0; pendingBlock = null; lastSealed = N;
+      if (through) { hub.resolveBlock?.(N); throughCount++; if (throughCount === 1 || throughCount % 25 === 0) log(`s4 seal: block ${N} reconciled THROUGH a pending range the stream could not close (${throughCount} so far) - resolved in the cursor`); }
     } catch (e) { attempts++; inc("s4ReconErr"); log(`s4 seal: tick error ${e?.message || e}`); await new Promise((res) => setTimeout(res, backoff())); }
     finally { running = false; }
   }
   const timer = setInterval(() => { tick(); }, poll); timer.unref?.();
-  return { stop: () => { stopped = true; clearInterval(timer); }, stats: () => ({ lastSealed, pendingBlock, attempts, behind: Math.max(0, hub.sealable() - lastSealed) }) };
+  return { stop: () => { stopped = true; clearInterval(timer); }, stats: () => ({ lastSealed, pendingBlock, attempts, through: throughCount, behind: Math.max(0, hub.sealable() - lastSealed) }) };
 }

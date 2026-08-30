@@ -32,7 +32,7 @@ export function createChainCursor({ headLag = 1 } = {}) {
   /** a block header arrived on the live stream */
   function onHead(n) {
     n = Number(n); if (!Number.isFinite(n) || n <= 0) return;
-    if (lastHead > 0 && n > lastHead + 1) pending.push({ from: lastHead + 1, to: n - 1, why: "head gap", inFlight: false });   // headers we never saw
+    if (lastHead > 0 && n > lastHead + 1) pending.push({ from: lastHead + 1, to: n - 1, why: "head gap", inFlight: false, at: Date.now() });   // headers we never saw
     seenHeads.add(n); if (seenHeads.size > 4096) { for (const k of seenHeads) { if (k < n - 3000) seenHeads.delete(k); } }
     if (n > lastHead) lastHead = n;
     resolveHeadRanges();
@@ -41,24 +41,43 @@ export function createChainCursor({ headLag = 1 } = {}) {
   /** a log for `block` was delivered live: a block number ahead of the heads reveals headers we missed */
   function onLog(block) {
     block = Number(block); if (!Number.isFinite(block) || block <= 0) return;
-    if (lastHead > 0 && block > lastHead + 1) pending.push({ from: lastHead + 1, to: block - 1, why: "log ahead of heads", inFlight: false });
+    if (lastHead > 0 && block > lastHead + 1) pending.push({ from: lastHead + 1, to: block - 1, why: "log ahead of heads", inFlight: false, at: Date.now() });
     if (block > lastHead) lastHead = block;
     norm();
   }
   function onDisconnect() { connected = false; }
-  /** reconnected: everything after the last head is unproven until a backfill through the new head completes */
-  function onReconnect() { connected = true; if (lastHead > 0 && !pending.some((r) => r.why === "reconnect")) pending.push({ from: lastHead + 1, to: Number.MAX_SAFE_INTEGER, why: "reconnect", inFlight: true }); norm(); }
+  /** reconnected: everything after the last head is unproven until a backfill through the new head completes.
+   *  `inclusiveFrom` (owner 2026-08-30): the hub passes the LAST BLOCK IT OBSERVED A LOG FROM when that block is
+   *  not proven closed - a socket that died after the first of several logs of block N leaves N partially
+   *  delivered, and "lastHead + 1" would silently treat it as complete (measured: block 92929478, 14:14Z). */
+  function onReconnect(inclusiveFrom) {
+    connected = true;
+    const from = Number.isFinite(Number(inclusiveFrom)) && Number(inclusiveFrom) > 0 ? Math.min(Number(inclusiveFrom), lastHead + 1) : lastHead + 1;
+    if (lastHead > 0 && !pending.some((r) => r.why === "reconnect")) pending.push({ from, to: Number.MAX_SAFE_INTEGER, why: "reconnect", inFlight: true, at: Date.now() });
+    norm();
+  }
   /** a backfill chunk [from, to] is starting (it replaces the open-ended reconnect range) */
-  function onBackfillStart(from, to) { pending = pending.filter((r) => r.why !== "reconnect"); pending.push({ from, to, why: "backfill", inFlight: true }); norm(); }
+  function onBackfillStart(from, to) { pending = pending.filter((r) => r.why !== "reconnect"); pending.push({ from, to, why: "backfill", inFlight: true, at: Date.now() }); norm(); }
   /** a backfill chunk finished: ok proves its range (and any head gap inside it); a refusal leaves it pending for retry */
   function onBackfillDone(from, to, ok) {
     pending = pending.filter((r) => !(r.why === "backfill" && r.from === from && r.to === to));
-    if (!ok) pending.push({ from, to, why: "backfill refused", inFlight: false });
+    if (!ok) pending.push({ from, to, why: "backfill refused", inFlight: false, at: Date.now() });
     else { pending = pending.filter((r) => !(r.from >= from && r.to <= to)); if (to > lastHead) lastHead = to; for (let k = from; k <= to && k - from < 5000; k++) seenHeads.add(k); }
     norm();
   }
-  /** a range a later reconciliation proved processed */
-  function resolve(from, to) { pending = pending.filter((r) => !(r.from >= from && r.to <= to)); norm(); }
+  /** a range a later reconciliation proved processed: ranges inside it disappear, ranges overlapping it are TRIMMED or
+   *  SPLIT (owner 2026-08-30: the seal worker resolves one block at a time through a range nothing else can close) */
+  function resolve(from, to) {
+    const next = [];
+    for (const r of pending) {
+      if (r.to < from || r.from > to) { next.push(r); continue; }
+      if (r.from < from) next.push({ ...r, to: from - 1 });
+      if (r.to > to) next.push({ ...r, from: to + 1 });
+    }
+    pending = next; norm();
+  }
+  /** the pending range containing block n, or null */
+  function pendingAt(n) { n = Number(n); for (const r of pending) if (r.from <= n && n <= r.to) return { ...r }; return null; }
 
   /** highest block that may be sealed now, or 0 */
   function sealable() {
@@ -69,5 +88,5 @@ export function createChainCursor({ headLag = 1 } = {}) {
     return n > 0 ? n : 0;
   }
   function state() { return { connected, lastHead, sealable: sealable(), gapOpen: pending.length > 0, gapSince: gapSince || null, pending: pending.map((r) => ({ ...r, to: r.to === Number.MAX_SAFE_INTEGER ? "head" : r.to })) }; }
-  return { onHead, onLog, onDisconnect, onReconnect, onBackfillStart, onBackfillDone, resolve, sealable, state };
+  return { onHead, onLog, onDisconnect, onReconnect, onBackfillStart, onBackfillDone, resolve, pendingAt, sealable, state };
 }

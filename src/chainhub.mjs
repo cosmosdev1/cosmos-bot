@@ -79,6 +79,10 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
   }
   let wallets = [];               // the union, lowercased
   let ws = null, sub = null, urlIx = 0, alive = false, lastBlock = 0, resubTimer = null;
+  // `lastBlock` is the highest block from which ANY streamed log was observed - it says nothing about whether
+  // that block was delivered completely. `closedThrough` is the highest block PROVEN complete: only a completed
+  // eth_getLogs backfill through it proves that; a live subscription never does. (owner 2026-08-30)
+  let closedThrough = 0;
   let connected = false, delivered = 0;
 
   function currentTopics() {
@@ -107,15 +111,21 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
     if (!wallets.length) return;
     const head = parseInt(await rpc("eth_blockNumber", []) ?? "0x0", 16);
     if (!Number.isFinite(head) || head <= 0) return;
-    if (!lastBlock) { lastBlock = head; return; }
-    let from = lastBlock + 1;
+    // INCLUSIVE RESUME (owner 2026-08-30): the socket can die - or be closed by a wallet-union resubscribe - after
+    // the first of several logs of block N. A backfill from lastBlock + 1 then leaves the remainder of N outside
+    // every recovery range (measured: block 92929478 at 14:14Z, and 91 fills across six blocks in the one-hour
+    // window; reconciliation found them). So the replay starts AT the last observed block unless that block is
+    // proven closed. Re-delivery is idempotent end to end (hub receipt dedupe -> route prior read -> ledger PK).
+    // On the first connect the head block may already be partly emitted before the subscription existed: same rule.
+    if (!lastBlock) lastBlock = head;
+    let from = lastBlock > closedThrough ? lastBlock : lastBlock + 1;
     if (from > head) return;
     if (head - from > MAX_GAP) {
       warn(`[chainhub] gap of ${head - from} blocks exceeds what the RPC will serve - ${head - from - MAX_GAP} blocks NOT recovered`);
       cursor.onBackfillStart(from, head - MAX_GAP - 1); cursor.onBackfillDone(from, head - MAX_GAP - 1, false);   // known, unrecovered: stays pending
       from = head - MAX_GAP;
     }
-    let found = 0;
+    let found = 0, lastOkTo = 0;
     for (let a = from; a <= head; a += CHUNK) {
       const b = Math.min(a + CHUNK - 1, head);
       cursor.onBackfillStart(a, b);
@@ -128,10 +138,11 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
       if (!Array.isArray(logs)) { warn(`[chainhub] backfill ${a}-${b} refused - those blocks are unchecked`); cursor.onBackfillDone(a, b, false); continue; }
       found += logs.length;
       for (const l of logs) { try { deliver(l); } catch { /* keep going */ } }
-      cursor.onBackfillDone(a, b, true);
+      cursor.onBackfillDone(a, b, true); lastOkTo = b;
     }
     if (found) log(`[chainhub] backfilled ${found} log(s) across blocks ${from}-${head}`);
     lastBlock = head;
+    if (lastOkTo === head) closedThrough = head;   // the chunk containing head succeeded: head is proven complete
   }
 
   function deliver(l) {
@@ -172,7 +183,7 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
           sub = m.result; connected = true;
           if (confirm) clearTimeout(confirm);
           log(`[chainhub] LIVE - ${wallets.length} wallets on one socket via ${url.replace(/^wss:\/\//, "").split("/")[0]}`);
-          cursor.onReconnect();
+          cursor.onReconnect(lastBlock > closedThrough ? lastBlock : undefined);   // the partially delivered block stays unproven
           backfill();
         } else {
           warn("[chainhub] subscribe rejected:", JSON.stringify(m.error ?? {}).slice(0, 80));
@@ -214,6 +225,9 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
     rpcBlockHeader: async (n, ms) => rpcT("eth_getBlockByNumber", ["0x" + Number(n).toString(16), false], ms),
     // the hub's EXACT log filter, pinned to a block hash (EIP-234): a reorg cannot make the query and the header describe different blocks
     rpcLogsPinned: async (hash, ms) => rpcT("eth_getLogs", [{ blockHash: hash, address: CTF_ERC1155, topics: [[T_SINGLE, T_BATCH], null, null, wallets.map(pad32)] }], ms),
-    stats: () => ({ wallets: wallets.length, connected, delivered, cursor: cursor.state() }),
+    stats: () => ({ wallets: wallets.length, connected, delivered, lastBlock, closedThrough, cursor: cursor.state() }),
+    // LIVENESS (owner 2026-08-30): the seal worker reconciles through a pending range nothing else can close
+    pendingAt: (n) => cursor.pendingAt(n),
+    resolveBlock: (n) => cursor.resolve(Number(n), Number(n)),
   };
 }

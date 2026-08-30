@@ -29,6 +29,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
   let maxBlockSeen = 0;               // highest block delivered on the stream (diagnostic)
   const evaluated = new Map();        // fillId -> block, bounded: what the hub has committed (the reconciliation diff)
   const waiters = new Map();          // fillId -> [resolve] for evaluateNow()
+  const queued = new Set();           // fillIds queued or in flight: an inclusive backfill replay must not evaluate twice (owner 2026-08-30)
   const remember = (fillId, block) => { evaluated.set(fillId, block); if (evaluated.size > 20000) { const cut = maxBlockSeen - 400; for (const [k, b] of evaluated) if (b < cut) evaluated.delete(k); } };
   const ring = [];            // {seq, boot, neutral} newest last
   const samples = [];         // forwarded child samples, drained by flushMetrics
@@ -42,7 +43,12 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
     if (!enabled() || !list?.length) return;
     for (const f of list) {
       if (Number.isFinite(Number(f.block)) && Number(f.block) > maxBlockSeen) maxBlockSeen = Number(f.block);
+      // RECEIPT DEDUPE (owner 2026-08-30): the reconnect backfill now replays the last observed block inclusively,
+      // so a fill the hub already committed - or is evaluating right now - arrives again; it is dropped here
+      // (counted as a duplicate), never re-posted. The ledger PK stays the last line of defence.
+      if (evaluated.has(f.fillId) || queued.has(f.fillId)) { inc("s4EvalDup"); continue; }
       if (queue.length >= DEPTH) { inc("s4Overflow"); continue; }
+      queued.add(f.fillId);
       queue.push({ fill: f, at: Date.now() });
     }
     pump();
@@ -64,12 +70,14 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
     }
   }
 
-  function settle(fillId, ok) { const w = waiters.get(fillId); if (w) { waiters.delete(fillId); for (const r of w) r({ fillId, ok }); } }
+  function settle(fillId, ok) { queued.delete(fillId); const w = waiters.get(fillId); if (w) { waiters.delete(fillId); for (const r of w) r({ fillId, ok }); } }
   /** evaluate fills the stream never delivered (found by block reconciliation) through the normal path; resolves when committed */
   function evaluateNow(list, { origin = "reconcile" } = {}) {
     return Promise.all(list.map((f) => new Promise((resolve) => {
       if (evaluated.has(f.fillId)) return resolve({ fillId: f.fillId, ok: true, existed: true });
       if (!waiters.has(f.fillId)) waiters.set(f.fillId, []); waiters.get(f.fillId).push(resolve);
+      if (queued.has(f.fillId)) return;                                   // already queued / in flight: its settle answers this waiter too
+      queued.add(f.fillId);
       queue.push({ fill: { ...f, origin }, at: Date.now() }); pump();
     })));
   }
