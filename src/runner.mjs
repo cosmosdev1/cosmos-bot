@@ -212,6 +212,12 @@ async function roster() {
     // VERSIONED ROSTER (owner 2026-08-30, shadow): the fleet epoch rides on every roster poll; a change
     // triggers ONE map fetch and a push to every child. No per-fill, no per-child network reads.
     if (j && j.roster_epoch !== null && Number.isFinite(Number(j.roster_epoch))) { const e = Number(j.roster_epoch); if (e !== rosterEpoch) { rosterEpoch = e; fetchRosterMap(e).catch(() => {}); } }
+    // RE-CONFIRM THE ROSTER EVERY POLL (owner 2026-08-30, required by the canary). The versioned map is
+    // fetched only when the epoch CHANGES, so a quiet hour left every child's copy hours old - and the
+    // child refuses Stage 4 authority for a whale whose roster confirmation is stale, which would have
+    // meant the canary silently never executing. The map itself is not re-fetched: this is one IPC
+    // message per child per minute, restating what the child already holds.
+    if (rosterMap.size) for (const [userId] of kids) pushRoster(userId);
     return Array.isArray(j?.accounts) ? j.accounts : null;
   } catch (e) {
     log("roster fetch failed:", e?.message ?? e);
