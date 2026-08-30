@@ -101,8 +101,10 @@ async function flushMetrics() {
     try { samples = s4 ? s4.drainSamples(20) : []; JSON.stringify(samples); } catch (e) { samples = []; warnFlush(`samples dropped: ${e.message}`); }
     // ROSTER AUDIT (owner 2026-08-30): what each child currently watches and when it last refreshed,
     // so the server can diff it against the authoritative picks. Bounded: 250 wallets per child.
-    const rosters = [...childRoster.entries()].filter(([u]) => kids.has(u)).map(([u, r]) => ({ u, at: r.at, src: r.source, n: r.n, w: r.list }));
-    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples, rosters });
+    const rosters = [...childRoster.entries()].filter(([u]) => kids.has(u)).map(([u, r]) => { const v = rosterMap.get(u), ack = childAck.get(u); return { u, at: r.at, src: r.source, n: r.n, w: r.list, vr: v ? { version: v.v, at: v.at, n: v.w.length, w: v.w.slice(0, 250) } : null, ack: ack || null }; });
+    // a pushed roster the child never acknowledged within 60 s is an IPC delivery failure - counted
+    for (const [u, v] of rosterMap) { if (kids.has(u) && Date.now() - v.at > 60_000 && (childAck.get(u)?.version ?? 0) < v.v) mMerge(fleetMetrics, { rosterAckMiss: 1 }); }
+    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples, rosters, epoch: rosterEpoch });
   } catch (e) { warnFlush(`body build failed: ${e.message}`); clearTimeout(t); return; }
   try {
     const r = await fetch(`${API}/api/cloud/runner/metrics`, { method: "POST", headers: { "content-type": "application/json", "x-runner-secret": SECRET }, body, signal: ctl.signal });
@@ -138,6 +140,28 @@ let sigHub = null;
 const childWallets = new Map();
 /** userId -> { at, source, n, list } of the child's last SUCCESSFUL roster refresh - reported to the server every interval for the roster audit (2026-08-30) */
 const childRoster = new Map();
+/** VERSIONED ROSTER (shadow): the map pushed to children, keyed by user; and each child's ack. */
+let rosterEpoch = null, rosterMap = new Map(), rosterMapAt = 0;
+const childAck = new Map();                    // userId -> { version, at }
+async function fetchRosterMap(epoch) {
+  const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20_000);
+  try {
+    const r = await fetch(`${API}/api/cloud/runner/roster-map`, { headers: { "x-runner-secret": SECRET }, signal: ctl.signal });
+    if (!r.ok) { mMerge(fleetMetrics, { rosterMapErr: 1 }); log(`roster-map HTTP ${r.status} (epoch ${epoch}) - keeping the previous map`); return; }
+    const j = await r.json().catch(() => null);
+    if (!j?.ready || !Array.isArray(j.users)) { mMerge(fleetMetrics, { rosterMapErr: 1 }); return; }
+    rosterMap = new Map(j.users.map((u) => [u.u, { v: Number(u.v) || 1, w: Array.isArray(u.w) ? u.w : [], at: Date.now() }]));
+    rosterMapAt = Date.now(); mMerge(fleetMetrics, { rosterMapOk: 1 });
+    log(`roster-map: epoch ${j.epoch} · ${rosterMap.size} users · pushing to ${kids.size} children`);
+    for (const [userId] of kids) pushRoster(userId);
+  } catch (e) { mMerge(fleetMetrics, { rosterMapErr: 1 }); log(`roster-map fetch failed: ${e?.message ?? e}`); }
+  finally { clearTimeout(t); }
+}
+function pushRoster(userId) {
+  const k = kids.get(userId), entry = rosterMap.get(userId);
+  if (!k?.child || !entry) return;
+  try { k.child.send({ t: "roster", list: entry.w, version: entry.v, epoch: rosterEpoch, at: entry.at }); mMerge(fleetMetrics, { rosterPush: 1 }); } catch { /* child gone */ }
+}
 let hub = null;
 function syncHubWallets() {
   if (!hub) return;
@@ -172,6 +196,9 @@ async function roster() {
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
     if (typeof j?.s4_mode === "string" && j.s4_mode !== s4Mode) { log(`s4 mode ${s4Mode} -> ${j.s4_mode} (roster)`); s4Mode = j.s4_mode; }
+    // VERSIONED ROSTER (owner 2026-08-30, shadow): the fleet epoch rides on every roster poll; a change
+    // triggers ONE map fetch and a push to every child. No per-fill, no per-child network reads.
+    if (j && j.roster_epoch !== null && Number.isFinite(Number(j.roster_epoch))) { const e = Number(j.roster_epoch); if (e !== rosterEpoch) { rosterEpoch = e; fetchRosterMap(e).catch(() => {}); } }
     return Array.isArray(j?.accounts) ? j.accounts : null;
   } catch (e) {
     log("roster fetch failed:", e?.message ?? e);
@@ -240,9 +267,10 @@ function start(a) {
   child.stderr.on("data", (d) => process.stderr.write(`[${tag}] ${d}`));
   // Children report the wallets they follow; the hub subscribes to the union of all of them.
   child.on("message", (m) => {
-    if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); childRoster.set(a.user_id, { at: Number(m.at) || Date.now(), source: m.source || null, n: m.list.length, list: m.list.slice(0, 250) }); syncHubWallets(); }
+    if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); childRoster.set(a.user_id, { at: Number(m.at) || Date.now(), source: m.source || null, n: m.list.length, list: m.list.slice(0, 250) }); syncHubWallets(); if (!childAck.has(a.user_id)) pushRoster(a.user_id); }
     // a child's single counter increment (roster refresh outcomes); merge() drops unknown keys
     else if (m?.t === "metric" && typeof m.k === "string") { mMerge(fleetMetrics, { [m.k]: 1 }); }
+    else if (m?.t === "roster-ack") { childAck.set(a.user_id, { version: Number(m.version) || 0, at: Number(m.at) || Date.now() }); mMerge(fleetMetrics, { rosterAck: 1 }); }
     // STAGE 1: a child's counter DELTA for the last interval. Merged in memory; nothing is written
     // per message. merge() drops unknown keys, so one misbehaving child cannot inflate cardinality.
     else if (m?.t === "metrics" && m.m) { mMerge(fleetMetrics, m.m); reporters.add(a.user_id); }
@@ -269,7 +297,7 @@ function stop(userId, why) {
   if (!rec) return;
   kids.delete(userId);
   // Drop its wallets from the union too, or the hub keeps subscribing to whales nobody follows.
-  childRoster.delete(userId);
+  childRoster.delete(userId); childAck.delete(userId);
   if (childWallets.delete(userId)) syncHubWallets();
   if (rec.child) {
     log(`stopping bot ${userId.slice(0, 8)} - ${why}`);

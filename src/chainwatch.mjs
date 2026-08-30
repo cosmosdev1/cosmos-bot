@@ -73,6 +73,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
   let wallets = [];          // [{wallet, username}]
   let byAddr = new Map();
   let lastRosterAt = 0;                                  // the last SUCCESSFUL roster refresh (0 = never)
+  let versioned = null;                                  // { list, version, epoch, at, receivedAt } pushed by the runner (shadow)
   const rosterMetric = (k) => { try { process.send?.({ t: "metric", k }); } catch { /* parent gone */ } };
   let ws = null, sub = null, urlIx = 0, alive = false, seenCount = 0, lastBlock = 0;
   const done = new Set();    // txHash#logIndex — a reconnect can replay logs; never act twice
@@ -307,6 +308,9 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
       if (!m || typeof m !== "object") return;
       if (m.t === "beat") { lastBeat = Date.now(); return; }
       if (m.t === "s4" || m.t === "s4replay") { try { s4.onMessage(m); } catch (e) { warn("s4 child:", e.message); } return; }   // stage 4 shadow: compare only
+      // VERSIONED ROSTER (owner 2026-08-30, shadow): stored and acknowledged; NOT used for filtering
+      // until the proof passes (ROSTER_MODE=versioned). The ack is the IPC delivery proof.
+      if (m.t === "roster" && Array.isArray(m.list)) { versioned = { list: m.list.map((w) => String(w).toLowerCase()), version: Number(m.version) || 0, epoch: m.epoch ?? null, at: Number(m.at) || Date.now(), receivedAt: Date.now() }; try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now() }); } catch { /* parent gone */ } return; }
       if (m.t === "log" && m.log) { lastBeat = Date.now(); try { handle(m.log); } catch (e) { warn("chainwatch hub log:", e.message); } }
     });
     log(`chainwatch: HUB mode - ${wallets.length} wallets, socket owned by the runner`);
