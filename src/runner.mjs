@@ -101,7 +101,7 @@ async function flushMetrics() {
     try { samples = s4 ? s4.drainSamples(20) : []; JSON.stringify(samples); } catch (e) { samples = []; warnFlush(`samples dropped: ${e.message}`); }
     // ROSTER AUDIT (owner 2026-08-30): what each child currently watches and when it last refreshed,
     // so the server can diff it against the authoritative picks. Bounded: 250 wallets per child.
-    const rosters = [...childRoster.entries()].filter(([u]) => kids.has(u)).map(([u, r]) => { const v = rosterMap.get(u), ack = childAck.get(u); return { u, at: r.at, src: r.source, n: r.n, w: r.list, vr: v ? { version: v.v, at: v.at, n: v.w.length, w: v.w.slice(0, 250) } : null, ack: ack || null }; });
+    const rosters = [...childRoster.entries()].filter(([u]) => kids.has(u)).map(([u, r]) => { const v = rosterMap.get(u), ack = childAck.get(u); return { u, at: r.at, src: r.source, n: r.n, w: r.list, vr: v ? { version: v.v, at: v.at, n: v.w.length, w: v.w.slice(0, 250) } : null, ack: ack || null, dd: childDd.get(u) || null }; });
     // a pushed roster the child never acknowledged within 60 s is an IPC delivery failure - counted
     for (const [u, v] of rosterMap) { if (kids.has(u) && Date.now() - v.at > 60_000 && (childAck.get(u)?.version ?? 0) < v.v) mMerge(fleetMetrics, { rosterAckMiss: 1 }); }
     body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples, rosters, epoch: rosterEpoch });
@@ -143,6 +143,7 @@ const childRoster = new Map();
 /** VERSIONED ROSTER (shadow): the map pushed to children, keyed by user; and each child's ack. */
 let rosterEpoch = null, rosterMap = new Map(), rosterMapAt = 0;
 const childAck = new Map();                    // userId -> { version, at }
+const childDd = new Map();                     // userId -> drawdown latch state (correctness-fix rollout audit)
 async function fetchRosterMap(epoch) {
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 20_000);
   try {
@@ -271,6 +272,7 @@ function start(a) {
     // a child's single counter increment (roster refresh outcomes); merge() drops unknown keys
     else if (m?.t === "metric" && typeof m.k === "string") { mMerge(fleetMetrics, { [m.k]: 1 }); }
     else if (m?.t === "roster-ack") { childAck.set(a.user_id, { version: Number(m.version) || 0, at: Number(m.at) || Date.now() }); mMerge(fleetMetrics, { rosterAck: 1 }); }
+    else if (m?.t === "dd") { childDd.set(a.user_id, { halt: m.halt === true, reason: String(m.reason || "").slice(0, 80), portfolio: Number(m.portfolio) || 0, high: Number(m.high) || 0, trippedHigh: Number(m.trippedHigh) || 0, trippedAt: Number(m.trippedAt) || 0, migration: m.migration ? { kind: m.migration.kind, reason: String(m.migration.reason || "").slice(0, 80), at: m.migration.at } : null, at: Date.now() }); }
     // STAGE 1: a child's counter DELTA for the last interval. Merged in memory; nothing is written
     // per message. merge() drops unknown keys, so one misbehaving child cannot inflate cardinality.
     else if (m?.t === "metrics" && m.m) { mMerge(fleetMetrics, m.m); reporters.add(a.user_id); }
@@ -297,7 +299,7 @@ function stop(userId, why) {
   if (!rec) return;
   kids.delete(userId);
   // Drop its wallets from the union too, or the hub keeps subscribing to whales nobody follows.
-  childRoster.delete(userId); childAck.delete(userId);
+  childRoster.delete(userId); childAck.delete(userId); childDd.delete(userId);
   if (childWallets.delete(userId)) syncHubWallets();
   if (rec.child) {
     log(`stopping bot ${userId.slice(0, 8)} - ${why}`);
@@ -495,7 +497,7 @@ if (HUB_ENABLED) {
       log: (...a) => console.log(new Date().toISOString(), ...a),
       warn: (...a) => console.warn(new Date().toISOString(), ...a),
     });
-    s4 = startS4Hub({ api: API, secret: SECRET, broadcast, log, mode: () => s4Mode,
+    s4 = startS4Hub({ api: API, secret: SECRET, broadcast, log, mode: () => s4Mode, sealable: () => (hub ? hub.sealable() : 0), gapOpen: () => Boolean(hub && hub.cursor().gapOpen),
       inc: (k) => { fleetMetrics[k] = (fleetMetrics[k] || 0) + 1; } });
     log(`s4 shadow hub up · mode ${s4Mode} · boot ${s4.boot}`);
     setInterval(() => {

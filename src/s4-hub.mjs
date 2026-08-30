@@ -13,7 +13,7 @@
 // where the immediate raw-log fallback would go (docs/stage4-design-addendum.md §9).
 import { randomBytes } from "node:crypto";
 
-export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
+export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = () => 0, gapOpen = () => false }) {
   const BOOT = randomBytes(4).toString("hex");
   const DEPTH = Number(process.env.COSMOS_S4_QUEUE_DEPTH) || 200;
   const CONC = Number(process.env.COSMOS_S4_CONCURRENCY) || 8;
@@ -29,6 +29,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
   const HARD_MS = 2 * TIMEOUT_MS + 2_000;   // two attempts + the retry pause, then the slot is freed regardless
 
   const enabled = () => { const m = mode(); return m === "shadow" || m === "canary" || m === "on"; };
+  setInterval(() => { try { if (enabled() && gapOpen()) inc("s4GapSec10"); } catch { /* counters only */ } }, 10_000).unref?.();   // known-gap duration of the seal cursor, 10 s units
 
   function onFills(list) {
     if (!enabled() || !list?.length) return;
@@ -70,7 +71,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
       try {
         const r = await fetch(`${api}/api/v1/fill-eval`, {
           method: "POST", headers: { "content-type": "application/json", "x-runner-secret": secret }, signal: AbortSignal.timeout(TIMEOUT_MS),
-          body: JSON.stringify({ fillId: f.fillId, hubSeq: seq + 1, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares, queuedMs, seenAt, closedBlock: maxBlockSeen > 0 ? maxBlockSeen - 1 : null }),
+          body: JSON.stringify({ fillId: f.fillId, hubSeq: seq + 1, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares, queuedMs, seenAt, contiguousBlock: sealable() > 0 ? sealable() : null }),
         });
         if (r.status === 503 || r.status >= 500) throw new Error(`fill-eval ${r.status}`);
         if (!r.ok) { log(`s4: fill-eval refused ${r.status} for ${f.fillId.slice(0, 18)}`); inc("s4EvalFail"); return; }   // 4xx: not retryable
@@ -117,7 +118,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
     return out;
   }
 
-  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, inflightTokens: inflightTokens.size, maxBlockSeen, hung, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode(), samples: [...byClass.entries()].map(([k, v]) => `${k}:${v.length}`).join(",") }; }
+  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, inflightTokens: inflightTokens.size, maxBlockSeen, sealable: sealable(), hung, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode(), samples: [...byClass.entries()].map(([k, v]) => `${k}:${v.length}`).join(",") }; }
 
   return { onFills, replay, sample, drainSamples, stats, boot: BOOT };
 }

@@ -57,7 +57,12 @@ async function rpc(method, params) {
  * @param {()=>void} onBeat                 liveness tick, broadcast so children know the hub lives
  * @param {(msg:string)=>void} log
  */
+import { createChainCursor } from "./chain-cursor.mjs";
 export function startChainHub({ onLog, onBeat, log = console.log, warn = console.warn }) {
+  // CONTIGUOUS GAP-AWARE CURSOR (owner 2026-08-30): the seal source for the canonical driver. Fed by
+  // newHeads (every header), live logs, disconnects and every backfill chunk's outcome.
+  const cursor = createChainCursor({ headLag: Number(process.env.COSMOS_SEAL_HEAD_LAG) || 1 });
+  let headSub = null;
   let wallets = [];               // the union, lowercased
   let ws = null, sub = null, urlIx = 0, alive = false, lastBlock = 0, resubTimer = null;
   let connected = false, delivered = 0;
@@ -93,20 +98,23 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
     if (from > head) return;
     if (head - from > MAX_GAP) {
       warn(`[chainhub] gap of ${head - from} blocks exceeds what the RPC will serve - ${head - from - MAX_GAP} blocks NOT recovered`);
+      cursor.onBackfillStart(from, head - MAX_GAP - 1); cursor.onBackfillDone(from, head - MAX_GAP - 1, false);   // known, unrecovered: stays pending
       from = head - MAX_GAP;
     }
     let found = 0;
     for (let a = from; a <= head; a += CHUNK) {
       const b = Math.min(a + CHUNK - 1, head);
+      cursor.onBackfillStart(a, b);
       const logs = await rpc("eth_getLogs", [{
         address: CTF_ERC1155,
         fromBlock: "0x" + a.toString(16),
         toBlock: "0x" + b.toString(16),
         topics: [[T_SINGLE, T_BATCH], null, null, wallets.map(pad32)],
       }]);
-      if (!Array.isArray(logs)) { warn(`[chainhub] backfill ${a}-${b} refused - those blocks are unchecked`); continue; }
+      if (!Array.isArray(logs)) { warn(`[chainhub] backfill ${a}-${b} refused - those blocks are unchecked`); cursor.onBackfillDone(a, b, false); continue; }
       found += logs.length;
       for (const l of logs) { try { deliver(l); } catch { /* keep going */ } }
+      cursor.onBackfillDone(a, b, true);
     }
     if (found) log(`[chainhub] backfilled ${found} log(s) across blocks ${from}-${head}`);
     lastBlock = head;
@@ -115,6 +123,7 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
   function deliver(l) {
     const b = parseInt(l.blockNumber, 16);
     if (Number.isFinite(b) && b > lastBlock) lastBlock = b;
+    if (Number.isFinite(b)) cursor.onLog(b);
     delivered++;
     onLog(l);
   }
@@ -130,6 +139,7 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
     socket.onopen = () => {
       alive = true;
       socket.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: currentTopics() }));
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_subscribe", params: ["newHeads"] }));   // one header per block: the seal cursor's contiguity source
       // A CONNECTED SOCKET WITH NO SUBSCRIPTION is the worst failure mode - it looks healthy and
       // delivers nothing, forever. Public nodes do intermittently answer eth_subscribe with an
       // internal error, so an unconfirmed subscription tears the socket down and rotates.
@@ -142,11 +152,13 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
     };
     socket.onmessage = (ev) => {
       let m; try { m = JSON.parse(typeof ev.data === "string" ? ev.data : ev.data.toString()); } catch { return; }
+      if (m.id === 2) { if (m.result) headSub = m.result; else warn("[chainhub] newHeads subscribe rejected - sealing will stay at 0 until it works:", JSON.stringify(m.error ?? {}).slice(0, 80)); return; }
       if (m.id === 1) {
         if (m.result) {
           sub = m.result; connected = true;
           if (confirm) clearTimeout(confirm);
           log(`[chainhub] LIVE - ${wallets.length} wallets on one socket via ${url.replace(/^wss:\/\//, "").split("/")[0]}`);
+          cursor.onReconnect();
           backfill();
         } else {
           warn("[chainhub] subscribe rejected:", JSON.stringify(m.error ?? {}).slice(0, 80));
@@ -155,6 +167,7 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
         return;
       }
       if (m.method === "eth_subscription" && m.params?.result) {
+        if (headSub && m.params.subscription === headSub) { const hn = parseInt(m.params.result?.number, 16); if (Number.isFinite(hn)) cursor.onHead(hn); return; }
         try { deliver(m.params.result); } catch (e) { warn("[chainhub] deliver:", e.message); }
       }
     };
@@ -162,7 +175,8 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
       if (pinger) clearInterval(pinger);
       if (confirm) clearTimeout(confirm);
       if (!alive) return;
-      alive = false; sub = null; connected = false; ws = null;
+      alive = false; sub = null; headSub = null; connected = false; ws = null;
+      cursor.onDisconnect();
       warn("[chainhub] socket down - reconnecting");
       setTimeout(connect, 2000);
     };
@@ -178,6 +192,8 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
   connect();
   return {
     setWallets,
-    stats: () => ({ wallets: wallets.length, connected, delivered }),
+    cursor: () => cursor.state(),
+    sealable: () => cursor.sealable(),
+    stats: () => ({ wallets: wallets.length, connected, delivered, cursor: cursor.state() }),
   };
 }
