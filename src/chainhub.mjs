@@ -63,6 +63,20 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
   // newHeads (every header), live logs, disconnects and every backfill chunk's outcome.
   const cursor = createChainCursor({ headLag: Number(process.env.COSMOS_SEAL_HEAD_LAG) || 1 });
   let headSub = null;
+  // RECONCILIATION SUPPORT (owner 2026-08-30): the observed header identity and receipt time per block
+  // (bounded), so the seal worker can pin its eth_getLogs to the hash the stream showed us.
+  const headHashes = new Map(), headTimes = new Map();
+  const remember = (n, hash) => { headHashes.set(n, String(hash || "").toLowerCase()); headTimes.set(n, Date.now()); if (headHashes.size > 3000) { for (const k of headHashes.keys()) { if (k < n - 2500) { headHashes.delete(k); headTimes.delete(k); } } } };
+  // same endpoint rotation as rpc(), with a caller-chosen deadline; a pinned getLogs that an endpoint
+  // refuses (no blockHash support) returns an error object, which reads as undefined -> next endpoint
+  async function rpcT(method, params, ms) {
+    for (const url of HTTP) {
+      const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms || 8000);
+      try { const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 7, method, params }), signal: ctl.signal }); const j = await r.json().catch(() => null); if (j && j.result !== undefined) return j.result; }
+      catch { /* next endpoint */ } finally { clearTimeout(t); }
+    }
+    return undefined;
+  }
   let wallets = [];               // the union, lowercased
   let ws = null, sub = null, urlIx = 0, alive = false, lastBlock = 0, resubTimer = null;
   let connected = false, delivered = 0;
@@ -167,7 +181,7 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
         return;
       }
       if (m.method === "eth_subscription" && m.params?.result) {
-        if (headSub && m.params.subscription === headSub) { const hn = parseInt(m.params.result?.number, 16); if (Number.isFinite(hn)) cursor.onHead(hn); return; }
+        if (headSub && m.params.subscription === headSub) { const hn = parseInt(m.params.result?.number, 16); if (Number.isFinite(hn)) { remember(hn, m.params.result?.hash); cursor.onHead(hn); } return; }
         try { deliver(m.params.result); } catch (e) { warn("[chainhub] deliver:", e.message); }
       }
     };
@@ -194,6 +208,12 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
     setWallets,
     cursor: () => cursor.state(),
     sealable: () => cursor.sealable(),
+    headHash: (n) => headHashes.get(Number(n)) || null,
+    headSeenAt: (n) => headTimes.get(Number(n)) || null,
+    rpcBlockNumber: async (ms) => { const r = await rpcT("eth_blockNumber", [], ms); return r ? parseInt(r, 16) : NaN; },
+    rpcBlockHeader: async (n, ms) => rpcT("eth_getBlockByNumber", ["0x" + Number(n).toString(16), false], ms),
+    // the hub's EXACT log filter, pinned to a block hash (EIP-234): a reorg cannot make the query and the header describe different blocks
+    rpcLogsPinned: async (hash, ms) => rpcT("eth_getLogs", [{ blockHash: hash, address: CTF_ERC1155, topics: [[T_SINGLE, T_BATCH], null, null, wallets.map(pad32)] }], ms),
     stats: () => ({ wallets: wallets.length, connected, delivered, cursor: cursor.state() }),
   };
 }

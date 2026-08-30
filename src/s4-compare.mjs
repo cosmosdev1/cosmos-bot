@@ -197,6 +197,14 @@ export function classify(old, neutral, ctx) {
     if ((MARKET_STATE.test(r) || PRICE_GATE.test(r)) && (MARKET_STATE.test(s) || PRICE_GATE.test(s))) return { cls: "TIMING_SAME", sub: "skip-reason", detail: { old: r, nw: s } };
     const pair = `${gateKind(r)}->${gateKind(s)}`;
     if (gateKind(r) && gateKind(s) && GATE_ORDER_ALLOW.has(pair)) return { cls: "EXPECTED_GATE_ORDER", sub: pair, detail: { old: r, nw: s } };
+    // owner-approved 2026-08-30, exactly this pair and only when BOTH predicates are independently true
+    // on the captured inputs: the old route's price gate (the neutral's own ask is outside 10-92c) and
+    // the new path's horizon gate (this child's track is not horizon-eligible). Not a PRICE/HORIZON class.
+    if (gateKind(r) === "price" && /^resolves beyond/.test(s)) {
+      const ask = Number(neutral?.ourCents);
+      const horizon = t && !(ctx.hosted ? t.eligibleHosted : t.eligibleSelf);
+      if (Number.isFinite(ask) && (ask < 10 || ask > 92) && horizon) return { cls: "EXPECTED_GATE_ORDER", sub: "price->horizon", detail: { old: r, nw: s, ask } };
+    }
     return { cls: "UNKNOWN", sub: "skip-reason", detail: { old: r, nw: s } };
   }
   const r = String((old.ok ? nw.reason : old.reason) || "");

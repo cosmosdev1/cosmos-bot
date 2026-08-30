@@ -164,6 +164,7 @@ function pushRoster(userId) {
   try { k.child.send({ t: "roster", list: entry.w, version: entry.v, epoch: rosterEpoch, at: entry.at }); mMerge(fleetMetrics, { rosterPush: 1 }); } catch { /* child gone */ }
 }
 let hub = null;
+let sealWorker = null;
 function syncHubWallets() {
   if (!hub) return;
   const union = [...childWallets.values()].flat();
@@ -497,13 +498,18 @@ if (HUB_ENABLED) {
       log: (...a) => console.log(new Date().toISOString(), ...a),
       warn: (...a) => console.warn(new Date().toISOString(), ...a),
     });
-    s4 = startS4Hub({ api: API, secret: SECRET, broadcast, log, mode: () => s4Mode, sealable: () => (hub ? hub.sealable() : 0), gapOpen: () => Boolean(hub && hub.cursor().gapOpen),
-      inc: (k) => { fleetMetrics[k] = (fleetMetrics[k] || 0) + 1; } });
+    const inc = (k, n = 1) => { fleetMetrics[k] = (fleetMetrics[k] || 0) + (Number(n) || 1); };
+    // how many children follow a wallet: the legacy copy-checks a fallback of one of its fills would cost
+    const followers = (wallet) => { const w = String(wallet || "").toLowerCase(); let n = 0; for (const list of childWallets.values()) if (list.includes(w)) n++; return n; };
+    s4 = startS4Hub({ api: API, secret: SECRET, broadcast, log, mode: () => s4Mode, sealable: () => (hub ? hub.sealable() : 0), gapOpen: () => Boolean(hub && hub.cursor().gapOpen), followers, inc });
     log(`s4 shadow hub up · mode ${s4Mode} · boot ${s4.boot}`);
+    // BLOCK-RECONCILIATION SEAL (owner-approved 2026-08-30): sealing is driven by cursor advancement, never by another fill
+    const { startSealWorker } = await import("./s4-seal.mjs");
+    sealWorker = startSealWorker({ api: API, secret: SECRET, hub, s4, log, inc, isWatched: isWatchedAddr });
     setInterval(() => {
       const s = hub.stats();
       log(`chainhub: ${s.connected ? "connected" : "DISCONNECTED"} · ${s.wallets} wallets · ${s.delivered} logs delivered · ${kids.size} children`);
-      if (s4) { const x = s4.stats(); log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring}${x.breaker ? " · BREAKER" : ""}`); }
+      if (s4) { const x = s4.stats(); const w = sealWorker ? sealWorker.stats() : null; log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring} · sealable ${x.sealable}${w ? ` · sealed through ${w.lastSealed} (behind ${w.behind}${w.pendingBlock ? `, pending ${w.pendingBlock} x${w.attempts}` : ""})` : ""}${x.breaker ? " · BREAKER" : ""}`); if (w && w.behind > 0) fleetMetrics.s4ReconPending = w.behind; }
     }, 10 * 60_000).unref?.();
   } catch (e) {
     // Never let a hub failure stop the fleet: with no hub the children hear no heartbeat and each

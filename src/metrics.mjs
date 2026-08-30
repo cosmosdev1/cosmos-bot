@@ -42,6 +42,8 @@ export const KEYS = Object.freeze([
   "rosterOk", "rosterErr",                         // the child watch-list refresh: outcomes per interval
   "rosterMapOk", "rosterMapErr", "rosterPush", "rosterAck", "rosterAckMiss",   // versioned roster distribution (shadow)
   "s4GapSec10",                                    // known-gap duration of the seal cursor, 10 s units
+  "s4ReconOk", "s4ReconErr", "s4ReconMissing", "s4ReconDup", "s4ReconPending", "s4SealOk", "s4SealErr",   // block reconciliation seal
+  "s4OverflowCc", "s4HungFetch", "s4HungJson", "s4HungBcast",   // fallback amplification estimate; hang stage
 ]);
 
 // signal -> order latency, milliseconds. Upper bound of each bucket.

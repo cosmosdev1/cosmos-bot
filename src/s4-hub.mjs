@@ -13,16 +13,23 @@
 // where the immediate raw-log fallback would go (docs/stage4-design-addendum.md §9).
 import { randomBytes } from "node:crypto";
 
-export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = () => 0, gapOpen = () => false }) {
+export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = () => 0, gapOpen = () => false, followers = () => 0 }) {
   const BOOT = randomBytes(4).toString("hex");
   const DEPTH = Number(process.env.COSMOS_S4_QUEUE_DEPTH) || 200;
   const CONC = Number(process.env.COSMOS_S4_CONCURRENCY) || 8;
   const MAX_AGE_MS = Number(process.env.COSMOS_S4_MAX_AGE_MS) || 5_000;
   const RING = Number(process.env.COSMOS_S4_RING) || 2_000;
   const TIMEOUT_MS = Number(process.env.COSMOS_S4_TIMEOUT_MS) || 6_000;
-  const queue = [];           // {fill, at}  (arrival order; the pump skips items whose token is in flight)
-  const inflightTokens = new Set();   // PER-MARKET FIFO (owner 2026-08-30): one evaluation per token at a time, arrival order
-  let maxBlockSeen = 0;               // highest block delivered on the stream; block N < maxBlockSeen is CLOSED for the seal
+  const queue = [];           // {fill, at}  arrival order; evaluations of any token run concurrently
+  // SERIALIZE AUTHORITY, NOT COMPUTATION (owner 2026-08-30): the per-token FIFO is gone. The ledger
+  // state is a pure function of the contribution SET folded in chain order (0093) and the driver's
+  // final state is order-independent (confluence proven); only the SEAL is ordered, and block
+  // reconciliation owns it. Measured before: a 147-fill minute produced 50 overflows from same-token
+  // fills aging behind each other.
+  let maxBlockSeen = 0;               // highest block delivered on the stream (diagnostic)
+  const evaluated = new Map();        // fillId -> block, bounded: what the hub has committed (the reconciliation diff)
+  const waiters = new Map();          // fillId -> [resolve] for evaluateNow()
+  const remember = (fillId, block) => { evaluated.set(fillId, block); if (evaluated.size > 20000) { const cut = maxBlockSeen - 400; for (const [k, b] of evaluated) if (b < cut) evaluated.delete(k); } };
   const ring = [];            // {seq, boot, neutral} newest last
   const samples = [];         // forwarded child samples, drained by flushMetrics
   let seq = 0, inflight = 0, consecutiveFails = 0, breakerUntil = 0, replayLoggedAt = 0, hung = 0;
@@ -42,25 +49,31 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
   }
 
   function pump() {
-    // scan in arrival order; take the first item whose token is not already being evaluated
-    for (let i = 0; inflight < CONC && i < queue.length; ) {
-      const item = queue[i];
-      if (Date.now() - item.at > MAX_AGE_MS) { queue.splice(i, 1); inc("s4Overflow"); continue; }   // too old: live would fall back
-      const tok = String(item.fill.tokenId || "");
-      if (inflightTokens.has(tok)) { i++; continue; }                                                // FIFO per token: wait for the earlier fill
-      queue.splice(i, 1); inflightTokens.add(tok);
+    while (inflight < CONC && queue.length) {
+      const item = queue.shift();
+      if (Date.now() - item.at > MAX_AGE_MS) { inc("s4Overflow"); inc("s4OverflowCc", followers(item.fill.wallet)); settle(item.fill.fillId, false); continue; }   // too old: live would fall back; the legacy copy-checks that fallback would cost
       inflight++;
       // WEDGE GUARD (2026-08-30): the slot is released by a hard deadline, never only by the promise.
       // Measured: all 8 slots hung at 00:14Z and every fill for six hours was counted as overflow
       // with zero attempts. The hung-await rule: no await without a deadline that frees the resource.
       let released = false;
-      const release = () => { if (released) return; released = true; inflight--; inflightTokens.delete(tok); pump(); };
-      const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms - slot released`); release(); } }, HARD_MS);
-      evalOne(item.fill, Date.now() - item.at, item.at).catch((e) => log(`s4: evalOne threw ${e?.message || e}`)).finally(() => { clearTimeout(timer); release(); });
+      const stage = { at: "queued" };
+      const release = () => { if (released) return; released = true; inflight--; pump(); };
+      const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); inc(stage.at === "fetch" ? "s4HungFetch" : stage.at === "json" ? "s4HungJson" : "s4HungBcast"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms at stage ${stage.at} - slot released`); settle(item.fill.fillId, false); release(); } }, HARD_MS);
+      evalOne(item.fill, Date.now() - item.at, item.at, stage).then((ok) => settle(item.fill.fillId, ok !== false)).catch((e) => { log(`s4: evalOne threw ${e?.message || e}`); settle(item.fill.fillId, false); }).finally(() => { clearTimeout(timer); release(); });
     }
   }
 
-  async function evalOne(f, queuedMs = 0, seenAt = Date.now()) {
+  function settle(fillId, ok) { const w = waiters.get(fillId); if (w) { waiters.delete(fillId); for (const r of w) r({ fillId, ok }); } }
+  /** evaluate fills the stream never delivered (found by block reconciliation) through the normal path; resolves when committed */
+  function evaluateNow(list, { origin = "reconcile" } = {}) {
+    return Promise.all(list.map((f) => new Promise((resolve) => {
+      if (evaluated.has(f.fillId)) return resolve({ fillId: f.fillId, ok: true, existed: true });
+      if (!waiters.has(f.fillId)) waiters.set(f.fillId, []); waiters.get(f.fillId).push(resolve);
+      queue.push({ fill: { ...f, origin }, at: Date.now() }); pump();
+    })));
+  }
+  async function evalOne(f, queuedMs = 0, seenAt = Date.now(), stage = { at: "queued" }) {
     if (Date.now() < breakerUntil) { inc("s4Overflow"); return; }   // skipped by the breaker: not an eval failure
     // The sequence is assigned at BROADCAST time, not at attempt time: a seq minted here for an
     // evaluation that then fails would never be sent, and every child would see a phantom gap and
@@ -69,25 +82,30 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
     for (let a = 0; a < 2; a++) {
       inc("s4EvalAttempt");
       try {
+        stage.at = "fetch";
         const r = await fetch(`${api}/api/v1/fill-eval`, {
           method: "POST", headers: { "content-type": "application/json", "x-runner-secret": secret }, signal: AbortSignal.timeout(TIMEOUT_MS),
           body: JSON.stringify({ fillId: f.fillId, hubSeq: seq + 1, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares, queuedMs, seenAt, contiguousBlock: sealable() > 0 ? sealable() : null }),
         });
         if (r.status === 503 || r.status >= 500) throw new Error(`fill-eval ${r.status}`);
-        if (!r.ok) { log(`s4: fill-eval refused ${r.status} for ${f.fillId.slice(0, 18)}`); inc("s4EvalFail"); return; }   // 4xx: not retryable
+        if (!r.ok) { log(`s4: fill-eval refused ${r.status} for ${f.fillId.slice(0, 18)}`); inc("s4EvalFail"); return false; }   // 4xx: not retryable
+        stage.at = "json";
         res = await r.json(); break;
       } catch (e) {
-        if (a === 1) { inc("s4EvalFail"); if (++consecutiveFails >= 3) { breakerUntil = Date.now() + 60_000; log("s4: 3 consecutive eval failures - shadow paused 60s"); } return; }
+        if (a === 1) { inc("s4EvalFail"); if (++consecutiveFails >= 3) { breakerUntil = Date.now() + 60_000; log("s4: 3 consecutive eval failures - shadow paused 60s"); } return false; }
         await new Promise((r) => setTimeout(r, 300));
       }
     }
     consecutiveFails = 0;
     inc("s4EvalOk"); inc(res.existed ? "s4EvalDup" : "s4EvalFull");
+    remember(f.fillId, Number(f.block) || 0);
+    stage.at = "broadcast";
     const mySeq = ++seq;                                   // contiguous by construction: only broadcasts consume a number
     const msg = { t: "s4", seq: mySeq, boot: BOOT, at: Date.now(), evalMs: res.evalMs, neutral: res.neutral };
     ring.push(msg); if (ring.length > RING) ring.splice(0, ring.length - RING);
     inc("s4Sent");
     broadcast(msg);
+    return true;
   }
 
   /** A child saw a gap: send it the ring entries in [from, to] (bounded, in process). */
@@ -118,7 +136,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
     return out;
   }
 
-  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, inflightTokens: inflightTokens.size, maxBlockSeen, sealable: sealable(), hung, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode(), samples: [...byClass.entries()].map(([k, v]) => `${k}:${v.length}`).join(",") }; }
+  function stats() { return { boot: BOOT, seq, queued: queue.length, inflight, evaluated: evaluated.size, maxBlockSeen, sealable: sealable(), hung, ring: ring.length, breaker: Date.now() < breakerUntil, mode: mode(), samples: [...byClass.entries()].map(([k, v]) => `${k}:${v.length}`).join(",") }; }
 
-  return { onFills, replay, sample, drainSamples, stats, boot: BOOT };
+  return { onFills, evaluateNow, hasEvaluated: (id) => evaluated.has(id), replay, sample, drainSamples, stats, boot: BOOT };
 }
