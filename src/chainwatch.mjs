@@ -72,6 +72,8 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     } });
   let wallets = [];          // [{wallet, username}]
   let byAddr = new Map();
+  let lastRosterAt = 0;                                  // the last SUCCESSFUL roster refresh (0 = never)
+  const rosterMetric = (k) => { try { process.send?.({ t: "metric", k }); } catch { /* parent gone */ } };
   let ws = null, sub = null, urlIx = 0, alive = false, seenCount = 0, lastBlock = 0;
   const done = new Set();    // txHash#logIndex — a reconnect can replay logs; never act twice
 
@@ -85,9 +87,10 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
       // In hub mode the PARENT owns the socket, so it needs our wallet set to build the union it
       // subscribes to. Reported on every refresh; the hub debounces and only re-subscribes on a
       // real change.
-      if (HUB) { try { process.send?.({ t: "wallets", list: list.map((w) => w.wallet) }); } catch { /* parent gone; watchdog covers */ } }
+      lastRosterAt = Date.now(); rosterMetric("rosterOk");
+      if (HUB) { try { process.send?.({ t: "wallets", list: list.map((w) => w.wallet), at: lastRosterAt, source: r?.source || null }); } catch { /* parent gone; watchdog covers */ } }
       return changed;
-    } catch (e) { warn("chainwatch wallets:", e.message); return false; }
+    } catch (e) { warn("chainwatch wallets:", e.message); rosterMetric("rosterErr"); return false; }
   }
 
   // A whale's position just grew. Ask the server whether we may copy it — every rule lives there.

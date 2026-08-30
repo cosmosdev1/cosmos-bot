@@ -99,7 +99,10 @@ async function flushMetrics() {
   try {
     let samples = [];
     try { samples = s4 ? s4.drainSamples(20) : []; JSON.stringify(samples); } catch (e) { samples = []; warnFlush(`samples dropped: ${e.message}`); }
-    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples });
+    // ROSTER AUDIT (owner 2026-08-30): what each child currently watches and when it last refreshed,
+    // so the server can diff it against the authoritative picks. Bounded: 250 wallets per child.
+    const rosters = [...childRoster.entries()].filter(([u]) => kids.has(u)).map(([u, r]) => ({ u, at: r.at, src: r.source, n: r.n, w: r.list }));
+    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples, rosters });
   } catch (e) { warnFlush(`body build failed: ${e.message}`); clearTimeout(t); return; }
   try {
     const r = await fetch(`${API}/api/cloud/runner/metrics`, { method: "POST", headers: { "content-type": "application/json", "x-runner-secret": SECRET }, body, signal: ctl.signal });
@@ -133,6 +136,8 @@ let hubToken = null;
 let sigHub = null;
 /** userId -> string[] of wallets that child follows (reported over IPC) */
 const childWallets = new Map();
+/** userId -> { at, source, n, list } of the child's last SUCCESSFUL roster refresh - reported to the server every interval for the roster audit (2026-08-30) */
+const childRoster = new Map();
 let hub = null;
 function syncHubWallets() {
   if (!hub) return;
@@ -235,7 +240,9 @@ function start(a) {
   child.stderr.on("data", (d) => process.stderr.write(`[${tag}] ${d}`));
   // Children report the wallets they follow; the hub subscribes to the union of all of them.
   child.on("message", (m) => {
-    if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); syncHubWallets(); }
+    if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); childRoster.set(a.user_id, { at: Number(m.at) || Date.now(), source: m.source || null, n: m.list.length, list: m.list.slice(0, 250) }); syncHubWallets(); }
+    // a child's single counter increment (roster refresh outcomes); merge() drops unknown keys
+    else if (m?.t === "metric" && typeof m.k === "string") { mMerge(fleetMetrics, { [m.k]: 1 }); }
     // STAGE 1: a child's counter DELTA for the last interval. Merged in memory; nothing is written
     // per message. merge() drops unknown keys, so one misbehaving child cannot inflate cardinality.
     else if (m?.t === "metrics" && m.m) { mMerge(fleetMetrics, m.m); reporters.add(a.user_id); }
@@ -262,6 +269,7 @@ function stop(userId, why) {
   if (!rec) return;
   kids.delete(userId);
   // Drop its wallets from the union too, or the hub keeps subscribing to whales nobody follows.
+  childRoster.delete(userId);
   if (childWallets.delete(userId)) syncHubWallets();
   if (rec.child) {
     log(`stopping bot ${userId.slice(0, 8)} - ${why}`);

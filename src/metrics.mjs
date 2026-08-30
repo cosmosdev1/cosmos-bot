@@ -38,6 +38,8 @@ export const KEYS = Object.freeze([
   "s4Match", "s4Expected", "s4OldBug", "s4NewBug", "s4TimingSame", "s4TimingFlip", "s4OldMissing", "s4NewMissing", "s4Unknown",
   "s4OldBugShare", "s4OldBugCost", "s4OldBugPeak",   // the frozen OLD_PATH_BUG taxonomy, one counter each
   "s4RowSame", "s4RowFlip",                        // TIMING / ROW-STATE (owner 2026-08-30)
+  "s4CompSame", "s4CompFlip", "s4DriverRace", "s4GateOrder", "s4Stale", "s4Hung",   // compound / driver race / gate order / stale context / hung slots (owner 2026-08-30)
+  "rosterOk", "rosterErr",                         // the child watch-list refresh: outcomes per interval
 ]);
 
 // signal -> order latency, milliseconds. Upper bound of each bucket.

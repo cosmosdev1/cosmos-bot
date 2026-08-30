@@ -47,7 +47,7 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode }) {
       // with zero attempts. The hung-await rule: no await without a deadline that frees the resource.
       let released = false;
       const release = () => { if (released) return; released = true; inflight--; pump(); };
-      const timer = setTimeout(() => { if (!released) { hung++; inc("s4EvalFail"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms - slot released`); release(); } }, HARD_MS);
+      const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms - slot released`); release(); } }, HARD_MS);
       evalOne(item.fill, Date.now() - item.at, item.at).catch((e) => log(`s4: evalOne threw ${e?.message || e}`)).finally(() => { clearTimeout(timer); release(); });
     }
   }
