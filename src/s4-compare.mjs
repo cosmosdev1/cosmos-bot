@@ -295,6 +295,8 @@ export function classify(old, neutral, ctx) {
     // ban while the shared evaluation could not resolve the market (fail-closed). Both SKIP; the ban is
     // absolute, so the outcome is identical whatever the market lookup returned.
     if (/^5-minute candles are not copied/.test(r) && /^market not found/.test(s)) return { cls: "EXPECTED_GATE_ORDER", sub: "candle5m->market-not-found", detail: { old: r, nw: s } };
+    if (/^5-minute candles are not copied/.test(r) && BOOK_GATE.test(s)) return { cls: "EXPECTED_GATE_ORDER", sub: "candle5m->book", detail: { old: r, nw: s } };
+    if (/^market not found/.test(r) && s === EXITED_LABEL && exitedNoState(t)) return { cls: "EXPECTED_GATE_ORDER", sub: "market-not-found->exited", detail: { old: r, nw: s } };
     if (BOOK_GATE.test(r)) {
       // the 5-minute candle ban is absolute in the spec, so the new path's own reason IS the predicate
       if (/^5-minute candles are not copied/.test(s)) return { cls: "EXPECTED_GATE_ORDER", sub: "book->candle5m", detail: { old: r, nw: s } };
