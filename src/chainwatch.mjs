@@ -122,6 +122,25 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
   const STAGGER_MS = Number(process.env.COSMOS_CHECK_STAGGER_MS) || 2_500;
   const myOffset = STAGGER_MS ? h % STAGGER_MS : 0;
 
+  // CANARY EXECUTION (owner 2026-08-30). For a whale on the canary list this child ACTS on the
+  // shared Stage 4 evaluation instead of its own copy-check answer. The old path still runs - it
+  // writes the production rows the exit ladder needs and it is the comparison - but it no longer
+  // decides. Three safety properties, in order:
+  //   * the wait is BOUNDED: no answer in S4_WAIT_MS -> the old path decides, so a hub outage can
+  //     never cost a fill (counted s4CanaryFallback);
+  //   * the versioned roster must be fresh and must contain this whale, or Stage 4 authority is
+  //     refused for that fill (counted s4CanaryBlocked) - ownership is never taken on trust;
+  //   * removing the wallet from the list reverts that whale within one roster cycle, no deploy.
+  const S4_WAIT_MS = Number(process.env.COSMOS_S4_CANARY_WAIT_MS) || 4_000;
+  const ROSTER_MAX_STALE_MS = Number(process.env.COSMOS_S4_CANARY_ROSTER_STALE_MS) || 300_000;
+  function canaryAuthorized(wallet) {
+    const v = versioned;
+    if (!v || !Array.isArray(v.list)) return { ok: false, why: "no versioned roster yet" };
+    if (Date.now() - (v.receivedAt || 0) > ROSTER_MAX_STALE_MS) return { ok: false, why: `versioned roster stale ${Math.round((Date.now() - (v.receivedAt || 0)) / 1000)}s` };
+    if (!v.list.includes(String(wallet || "").toLowerCase())) return { ok: false, why: "whale not on this account's versioned roster" };
+    return { ok: true };
+  }
+
   async function onFill(w, tokenId, shares, l, fillId) {
     // STAGE 1: the two terms of the fan-out multiplier, counted at the only place both are visible.
     // "ev" is one whale fill THIS child was handed; "cc" is a copy-check actually issued for it.
@@ -132,28 +151,46 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     if (Date.now() < standdownUntil) { if (fillId) s4.recordOld(fillId, { ok: false, reason: "stand-down", wallet: w.wallet }); return; }   // server is struggling - slow path covers this fill; recorded so the shadow does not count it as missing
     const t0 = Date.now();
     if (myOffset) await new Promise((r) => setTimeout(r, myOffset));
-    let res;
-    for (let a = 0; ; a++) {
-      try { inc("cc"); res = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); checkFails = 0; observe(Date.now() - t0); break; }
-      catch (e) {
-        if (a >= 2) {
-          inc("ccFail");
-          if (fillId) s4.recordOld(fillId, { ok: false, reason: "copy-check failed", wallet: w.wallet });
-          if (++checkFails >= 3) { standdownUntil = Date.now() + 60_000; warn("chainwatch: 3 checks failed in a row - fast path stands down 60s (slow path covers)"); }
-          else warn(`chainwatch check failed ${a + 1}x (giving up; slow path covers):`, e.message);
-          return;
+    // the old path, unchanged: it answers, it records the comparison, and it writes the production rows
+    const runOldCheck = async () => {
+      for (let a = 0; ; a++) {
+        try { inc("cc"); const r = await cosmos.copyCheck({ wallet: w.wallet, token_id: tokenId, shares }); checkFails = 0; observe(Date.now() - t0);
+          if (fillId) s4.recordOld(fillId, { ok: Boolean(r?.ok), reason: r?.reason ?? null, signal: r?.ok ? r.signal : null, wallet: w.wallet });
+          return r; }
+        catch (e) {
+          if (a >= 2) {
+            inc("ccFail");
+            if (fillId) s4.recordOld(fillId, { ok: false, reason: "copy-check failed", wallet: w.wallet });
+            if (++checkFails >= 3) { standdownUntil = Date.now() + 60_000; warn("chainwatch: 3 checks failed in a row - fast path stands down 60s (slow path covers)"); }
+            else warn(`chainwatch check failed ${a + 1}x (giving up; slow path covers):`, e.message);
+            return null;
+          }
+          await new Promise((r) => setTimeout(r, 1500 * Math.pow(4, a)));
         }
-        await new Promise((r) => setTimeout(r, 1500 * Math.pow(4, a)));
       }
+    };
+    let res = null, source = "old";
+    if (fillId && s4.isCanary(w.wallet)) {
+      const auth = canaryAuthorized(w.wallet);
+      const old = runOldCheck();                                   // runs in parallel: rows + comparison
+      old.catch(() => {});
+      if (!auth.ok) { inc("s4CanaryBlocked"); warn(`chainwatch: STAGE 4 authority refused for ${w.username} (${auth.why}) - old path decides`); res = await old; }
+      else {
+        const a = await s4.awaitAnswer(fillId, w.wallet, S4_WAIT_MS);
+        if (a) { res = a; source = "s4"; inc("s4CanaryAct"); old.then((o) => { if (o) inc(Boolean(o.ok) === Boolean(a.ok) ? "s4CanaryAgree" : "s4CanaryDiffer"); }).catch(() => {}); }
+        else { inc("s4CanaryFallback"); res = await old; }
+      }
+    } else {
+      res = await runOldCheck();
     }
+    if (!res) return;                                              // the old path gave up; the slow path covers
     const ms = Date.now() - t0;
-    if (fillId) s4.recordOld(fillId, { ok: Boolean(res?.ok), reason: res?.reason ?? null, signal: res?.ok ? res.signal : null, wallet: w.wallet });
     if (!res?.ok) {
-      log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> SKIP (${res?.reason ?? "no"}) · ${ms}ms`);
+      log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> SKIP (${res?.reason ?? "no"}) · ${ms}ms${source === "s4" ? " · STAGE 4" : ""}`);
       return;
     }
     const s = res.signal;
-    log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> ${s.outcome} @${s.entry_cents}c${s.is_pair ? " [PAIR]" : ""} · vetted in ${ms}ms · ${String(s.market_question).slice(0, 40)}`);
+    log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> ${s.outcome} @${s.entry_cents}c${s.is_pair ? " [PAIR]" : ""} · vetted in ${ms}ms${source === "s4" ? " · STAGE 4 AUTHORITY" : ""} · ${String(s.market_question).slice(0, 40)}`);
     try { await onSignal(s, { wallet: w, shares, block: l.blockNumber }); }
     catch (e) { warn("chainwatch buy:", e.message); }
   }
@@ -307,7 +344,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     process.on("message", (m) => {
       if (!m || typeof m !== "object") return;
       if (m.t === "beat") { lastBeat = Date.now(); return; }
-      if (m.t === "s4" || m.t === "s4replay") { try { s4.onMessage(m); } catch (e) { warn("s4 child:", e.message); } return; }   // stage 4 shadow: compare only
+      if (m.t === "s4" || m.t === "s4replay" || m.t === "s4canary") { try { s4.onMessage(m); } catch (e) { warn("s4 child:", e.message); } return; }   // stage 4: compare, and for a canary whale execute
       // VERSIONED ROSTER (owner 2026-08-30, shadow): stored and acknowledged; NOT used for filtering
       // until the proof passes (ROSTER_MODE=versioned). The ack is the IPC delivery proof.
       if (m.t === "roster" && Array.isArray(m.list)) { versioned = { list: m.list.map((w) => String(w).toLowerCase()), version: Number(m.version) || 0, epoch: m.epoch ?? null, at: Number(m.at) || Date.now(), receivedAt: Date.now() }; try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now() }); } catch { /* parent gone */ } return; }

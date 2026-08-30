@@ -162,9 +162,11 @@ function pushRoster(userId) {
   const k = kids.get(userId), entry = rosterMap.get(userId);
   if (!k?.child || !entry) return;
   try { k.child.send({ t: "roster", list: entry.w, version: entry.v, epoch: rosterEpoch, at: entry.at }); mMerge(fleetMetrics, { rosterPush: 1 }); } catch { /* child gone */ }
+  if (s4Canary.length) { try { k.child.send({ t: "s4canary", list: s4Canary }); } catch { /* child gone */ } }   // a child that just started must know the canary list
 }
 let hub = null;
 let sealWorker = null;
+let s4Canary = [];                 // whales for which Stage 4 decides this fleet's execution (empty = pure shadow)
 function syncHubWallets() {
   if (!hub) return;
   const union = [...childWallets.values()].flat();
@@ -198,6 +200,15 @@ async function roster() {
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
     if (typeof j?.s4_mode === "string" && j.s4_mode !== s4Mode) { log(`s4 mode ${s4Mode} -> ${j.s4_mode} (roster)`); s4Mode = j.s4_mode; }
+    // CANARY LIST (owner 2026-08-30): the whales for which Stage 4 is authoritative for execution.
+    // Served by the roster every minute from fleet_control, so adding or removing a whale takes one
+    // cycle and no deploy - that is the kill switch. Pushed to every child only when it CHANGES.
+    { const next = Array.isArray(j?.s4_canary) ? j.s4_canary.map((w) => String(w).toLowerCase()).filter((w) => /^0x[a-f0-9]{40}$/.test(w)).sort() : [];
+      if (next.join(",") !== s4Canary.join(",")) {
+        s4Canary = next;
+        log(`s4 canary list: ${s4Canary.length ? s4Canary.map((w) => w.slice(0, 10)).join(" ") : "(none - pure shadow)"}`);
+        broadcast({ t: "s4canary", list: s4Canary });
+      } }
     // VERSIONED ROSTER (owner 2026-08-30, shadow): the fleet epoch rides on every roster poll; a change
     // triggers ONE map fetch and a push to every child. No per-fill, no per-child network reads.
     if (j && j.roster_epoch !== null && Number.isFinite(Number(j.roster_epoch))) { const e = Number(j.roster_epoch); if (e !== rosterEpoch) { rosterEpoch = e; fetchRosterMap(e).catch(() => {}); } }

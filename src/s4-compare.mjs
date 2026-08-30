@@ -173,6 +173,29 @@ export function newPathForChild(neutral, ctx) {
   return { ok: true, signal: t.old.row, track: t };
 }
 
+/**
+ * THE AUTHORITATIVE STAGE 4 DECISION for one child (canary, owner 2026-08-30). Same gates as
+ * newPathForChild - which exists to REPRODUCE the old route for comparison and therefore reads the
+ * old transcription - but the row comes from the LEDGER: the canonical fold over the contribution
+ * set in chain order, clamped once by the chain (0093), which is the rule Stage 4 exists to apply.
+ * Never called in shadow: only a whale on the canary list reaches this.
+ */
+export function authoritativeForChild(neutral, ctx) {
+  if (!neutral) return { ok: false, reason: "no neutral" };
+  if (ctx.copytrade !== true) return { ok: false, reason: "copytrade is off for this account" };
+  if (!ctx.followsWallet) return { ok: false, reason: NOT_IN_LIST };
+  if (ctx.diamondBlocked) return { ok: false, reason: "diamond access expired" };
+  if (neutral.verdict !== "ROWS") return { ok: false, reason: neutral.skipReason || "skip" };
+  if (ctx.v2 && neutral.candle?.isCandle && !neutral.candle?.classV2) return { ok: false, reason: "only 15-minute and hourly candles are copied" };
+  const t = (neutral.tracks || []).find((x) => Number(x.group_id) === Number(ctx.group));
+  if (!t) return { ok: false, reason: "wallet not in your track" };
+  if (!(ctx.hosted ? t.eligibleHosted : t.eligibleSelf)) return { ok: false, reason: "resolves beyond your track's horizon", track: t };
+  if (t.ledger?.exited) return { ok: false, reason: EXITED_LABEL, track: t };
+  if (t.ledger?.dropped) return { ok: false, reason: DRIVERS_LABEL, track: t };
+  if (!t.ledger?.row) return { ok: false, reason: "no ledger row", track: t };
+  return { ok: true, signal: t.ledger.row, track: t };
+}
+
 /** Which digest fields differ (after canonicalisation). */
 export function digestDiff(a, b) {
   return [...ROW_FIELDS, ...MARKET_FIELDS, ...DECISION_FIELDS].filter((k) => a[k] !== b[k]);
