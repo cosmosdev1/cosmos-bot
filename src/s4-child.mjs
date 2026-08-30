@@ -7,6 +7,7 @@
 // runner to replay it over IPC; results older than LATE_MS on arrival are counted late. That is
 // how PRIMARY-PATH DELIVERY LOSS is measured without 106 network acks per fill.
 import { classify, newPathForChild, authoritativeForChild } from "./s4-compare.mjs";
+import * as authority from "./s4-authority.mjs";
 
 export function startS4Child({ inc, send, log, ctx, warn }) {
   // The old path can take up to ~32 s to answer (8 s timeout x3 with 1.5 s and 6 s backoffs), so a
@@ -50,6 +51,7 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
     let changed = next.size !== canary.size; if (!changed) for (const w of next) if (!canary.has(w)) { changed = true; break; }
     if (!changed) return false;
     canary.clear(); for (const w of next) canary.add(w);
+    authority.setCanary([...canary]);                 // the polled tick reads the same list
     log(`s4 canary: ${canary.size ? [...canary].map((w) => w.slice(0, 10)).join(" ") : "(none - pure shadow)"}`);
     return true;
   }
@@ -129,5 +131,6 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
   // expire unpaired entries: one side never arrived
   setInterval(() => { const now = Date.now(); for (const [id, p] of pairs) if (now - p.t0 > PAIR_TTL_MS) settle(id, p); }, 5_000).unref?.();
 
-  return { recordOld, onMessage, isCanary, setCanary, awaitAnswer, stats: () => ({ pending: pairs.size, lastSeq, lastBoot, canary: canary.size }) };
+  const lastNeutral = (fillId) => answers.get(fillId) || pairs.get(fillId)?.neu || null;
+  return { recordOld, onMessage, isCanary, setCanary, awaitAnswer, lastNeutral, stats: () => ({ pending: pairs.size, lastSeq, lastBoot, canary: canary.size }) };
 }

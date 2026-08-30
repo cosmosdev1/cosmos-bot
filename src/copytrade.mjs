@@ -16,6 +16,7 @@
 // Spawned from main() ONLY when COPYTRADE_ENABLED=1 (per-deployment gate). DRY: COPYTRADE_DRY=1 logs
 // would-be fills and places nothing. Positions are tagged source:"copytrade".
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import * as s4authority from "./s4-authority.mjs";
 import { floorGuardVerdict } from "./floor-guard.mjs";
 import { targetPctForHolding } from "./candle-sizing.mjs";
 // FIX (2026-08-03, first live fleet): oneShotTarget called pctFromAutoTiers and read TIER_MAX_PCT
@@ -296,6 +297,7 @@ let hubSignals = null, hubAt = 0, hubBeatAt = 0;
 process.on("message", (m) => {
   if (!m || typeof m !== "object") return;
   if (m.t === "enterable" && Array.isArray(m.signals)) { hubSignals = m.signals; hubAt = Date.now(); hubBeatAt = hubAt; return; }
+  if (m.t === "s4canary") { s4authority.setCanary(m.list); return; }   // the polled tick needs the same list as the fast path
   if (m.t === "enterable-beat") { hubBeatAt = Date.now(); }
 });
 const hubFresh = () => hubSignals !== null && (Date.now() - hubAt) < HUB_SIGNALS_SILENCE_MS;
@@ -1076,6 +1078,14 @@ export function startCopyTrade(deps) {
 
     for (const sig of signals) {
       if (!sig.condition_id || !sig.token_id) continue;
+      // STAGE 4 CANARY (owner 2026-08-30): for a canary whale the shared evaluation is the execution
+      // authority. If the fast path already decided this market, this tick is observational for it -
+      // it must not mint the same business intent off the row the old /copy-check wrote. A market the
+      // fast path never saw is NOT suppressed: that is a missed fill and the sweep is its only
+      // recovery, so it is counted instead (s4CanaryPolled).
+      const s4Verdict = s4authority.polledVerdict(sig);
+      if (s4Verdict === "suppress" && !positions[sig.condition_id]) { stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
+      if (s4Verdict === "fallback") mInc("s4CanaryPolled");
       // HUB SHORTCUT: when the box-wide evaluation is fresh, anything it did not vouch for cannot
       // be entered by anyone, so skip the whole per-signal entry scan for it. Costs one Set lookup
       // and removes the duplicated window/tier/price arithmetic this loop used to redo per child.
@@ -1108,6 +1118,9 @@ export function startCopyTrade(deps) {
       if (mine) {
         if (ONESHOT && !V2()) continue;   // v2 tops up to the escalated tier target
         if (V2() && (Number(sig.sell_seq) || 0) > 0) continue;   // never rebuy after an exit (v2)
+        // the same authority rule applies to a TOP-UP: for a canary whale's decided market the fast
+        // path owns the size, and this tick must not add on top of it from the old row
+        if (s4Verdict === "suppress") { stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
         const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
         if (add < MIN_ADD_USD) continue;                                // at the ceiling or no transition worth an order
         if (rateLimited()) continue;

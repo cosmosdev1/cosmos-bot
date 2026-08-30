@@ -37,6 +37,7 @@ const WALLET_REFRESH_MS = 5 * 60_000;
 import { inc, observe } from "./metrics.mjs";
 import { tokensFromLog } from "./fills.mjs";
 import { startS4Child } from "./s4-child.mjs";
+import * as authority from "./s4-authority.mjs";
 const HUB = process.env.COSMOS_CHAINHUB === "1" && typeof process.send === "function";
 
 async function rpc(method, params) {
@@ -180,6 +181,15 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
         if (a) { res = a; source = "s4"; inc("s4CanaryAct"); old.then((o) => { if (o) inc(Boolean(o.ok) === Boolean(a.ok) ? "s4CanaryAgree" : "s4CanaryDiffer"); }).catch(() => {}); }
         else { inc("s4CanaryFallback"); res = await old; }
       }
+      // EXACTLY ONE EXECUTION AUTHORITY (owner 2026-08-30). This path has now decided the market for
+      // this whale - buy or no buy, Stage 4 or its bounded-wait fallback - so the polled/adopt tick,
+      // which would otherwise reach the same buy off the row the old /copy-check just wrote, defers.
+      // Marked for BOTH outcomes: "no buy" is a decision, and it is the case where the old row would
+      // have made the polled tick buy something Stage 4 refused.
+      { const sg = res?.signal || null;
+        const cid = sg?.condition_id ?? null, outcome = sg?.outcome ?? null;
+        if (cid && outcome) authority.markDecided(cid, outcome, w.wallet);
+        else { const n = s4.lastNeutral?.(fillId); if (n?.conditionId && n?.outcome) authority.markDecided(n.conditionId, n.outcome, w.wallet); } }
     } else {
       res = await runOldCheck();
     }
