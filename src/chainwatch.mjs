@@ -324,8 +324,11 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     await refreshWallets();
     if (!wallets.length) { log("chainwatch: no wallets to watch (copytrade off?)"); return; }
     if (HUB) startHubMode(); else connect();
+    // ROSTER FREEZE (2026-08-30 stage 4 audit, 24 of 114 children): this refresh used to return while
+    // the engine was disarmed (drawdown breaker, Stop, fleet halt), so a halted child kept its boot-time
+    // watch list for the whole halt - hours - while its fill path went on calling copy-check with it.
+    // Knowledge of the roster is not an entry; it refreshes regardless of the engine state.
     setInterval(async () => {
-      if (!isArmed()) return;
       const changed = await refreshWallets();
       // In hub mode the parent re-subscribes for us when the union changes; closing a socket we do
       // not own would be meaningless (and in fallback mode `ws` is ours again, so this still works).
