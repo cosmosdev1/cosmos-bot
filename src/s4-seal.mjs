@@ -43,6 +43,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   const RPC_TIMEOUT = Number(process.env.COSMOS_S4_RECON_TIMEOUT_MS) || 8_000;
   const MAX_BEHIND = Number(process.env.COSMOS_S4_RECON_MAX_BEHIND) || 50;   // on boot, never try to reconcile more than this many blocks back
   const EVAL_DEADLINE_MS = Number(process.env.COSMOS_S4_RECON_EVAL_MS) || 20_000;   // a recovered fill that never settles must not stop the worker
+  const BLOCK_ATTEMPTS = Number(process.env.COSMOS_S4_BLOCK_ATTEMPTS) || 4;   // per-block budget before it is recorded unreconciled
   const STUCK_INFLIGHT_MS = Number(process.env.COSMOS_S4_RECON_STUCK_MS) || 30_000;   // a backfill still running this long is treated as stuck
   const STUCK_IDLE_MS = 5_000;                                                        // a head gap the stream may still close by itself
   const backoff = () => Math.min(30_000, 1_000 * 2 ** Math.min(attempts, 5));
@@ -153,7 +154,20 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       const N = through ? throughBlock : (pendingBlock ?? lastSealed + 1);
       if (!through && N > sealable) return;
       const r = await reconcile(N);
-      if (!r.ok) { attempts++; pendingBlock = N; inc("s4ReconErr"); if (attempts === 1 || attempts % 10 === 0) log(`s4 seal: block ${N} not reconciled (${r.stats.status}${r.stats.error ? ": " + r.stats.error : ""}) - attempt ${attempts}, retry in ${backoff()} ms`); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: r.stats }).catch(() => {}); await new Promise((res) => setTimeout(res, backoff())); return; }
+      if (!r.ok) {
+        attempts++; pendingBlock = N; inc("s4ReconErr");
+        // ONE BAD BLOCK MUST NOT COST HUNDREDS (measured 2026-08-31 10:46Z). A block whose recovered
+        // fills cannot be evaluated used to be retried up to twenty times with backoff - ten minutes
+        // with the cursor frozen, after which the clamp abandoned FOUR HUNDRED blocks. The block itself
+        // is what is unreconcilable, so after a small budget it is recorded as unreconciled ON ITS OWN
+        // and the cursor moves past it: the invariant is untouched (no driver in it can ever be sealed,
+        // 0094 enforces that at the database) and the cost is one block instead of a whole range.
+        if (attempts >= BLOCK_ATTEMPTS && !/node-behind/.test(String(r.stats?.status || ""))) {
+          log(`s4 seal: block ${N} could not be reconciled in ${attempts} attempts (${r.stats?.status}) - recording it as unreconciled and moving on`);
+          inc("s4ReconSkipped"); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: { status: "skipped-range", from: N, to: N, error: `block ${N} unreconcilable after ${attempts} attempts: ${r.stats?.status}` } });
+          attempts = 0; pendingBlock = null; if (N > lastSealed) lastSealed = N;
+          return;
+        } if (attempts === 1 || attempts % 10 === 0) log(`s4 seal: block ${N} not reconciled (${r.stats.status}${r.stats.error ? ": " + r.stats.error : ""}) - attempt ${attempts}, retry in ${backoff()} ms`); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: r.stats }).catch(() => {}); await new Promise((res) => setTimeout(res, backoff())); return; }
       stage = "seal-post";
       const p = await post("/api/v1/fill-reconcile", { block: N, hash: r.pin, stats: r.stats });
       if (!p.ok) { attempts++; pendingBlock = N; inc("s4SealErr"); log(`s4 seal: block ${N} reconciled but the seal call failed (${p.status}) - retry`); await new Promise((res) => setTimeout(res, backoff())); return; }
