@@ -31,8 +31,19 @@ const WSS = (process.env.COSMOS_HUB_WSS || process.env.COSMOS_WSS_URLS || "wss:/
 // BACKFILL endpoints. Deliberately SEPARATE from the socket: a metered plan may cap eth_getLogs to
 // a few blocks (QuickNode's free tier: 5), while the public nodes serve ~100. rpc() falls through
 // on any error, so listing the paid node first and the public ones after gets the best of both.
-const HTTP = (process.env.COSMOS_HUB_RPC || process.env.COSMOS_RPC_URL || "https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org")
-  .split(",").map((s) => s.trim()).filter(Boolean);
+// THE PAID ENDPOINT WAS CONNECTED AND UNREAD (2026-08-31). QUICKNODE_HTTP/WSS have been deployed as
+// runner secrets all along - the runner even strips them from children so the plan serves one client -
+// but this file was refactored to read COSMOS_HUB_RPC and nothing ever set it, so the hub ran on the
+// free public nodes while a metered endpoint sat idle. Measured on the runner: eth_getLogs pinned by
+// hash, median 38 ms and no errors, against 241 ms p50 / 7.8 s p99 on the public node. That gap is the
+// whole reconciliation throughput ceiling.
+const listOf = (v) => String(v || "").split(",").map((x) => x.trim()).filter(Boolean);
+// PRIMARY is the metered endpoint. It is tried first and alone; the public nodes are an emergency
+// fallback on ERROR only, never a share of normal traffic (owner 2026-08-31: do not deliberately send
+// reconciliation through a known throttled endpoint for the sake of redundancy).
+const PRIMARY = listOf(process.env.COSMOS_HUB_RPC || process.env.QUICKNODE_HTTP);
+const FALLBACK = listOf(process.env.COSMOS_RPC_URL || "https://polygon-bor-rpc.publicnode.com,https://polygon.drpc.org");
+const HTTP = PRIMARY.length ? PRIMARY.concat(FALLBACK) : FALLBACK;
 
 const PING_MS = Number(process.env.COSMOS_HUB_PING_MS) || 240_000;   // 4 min (was 30s per child)
 const HEARTBEAT_MS = 20_000;
@@ -48,8 +59,17 @@ const pad32 = (addr) => "0x" + addr.replace(/^0x/, "").toLowerCase().padStart(64
 // spent a round-robin slot on a guaranteed failure. Widen it with COSMOS_HUB_RPC, not by guessing.
 let rpcIx = 0;
 async function rpc(method, params) {
-  const start = HTTP.length ? (rpcIx = (rpcIx + 1) % HTTP.length) : 0;
-  const ordered = HTTP.length ? HTTP.slice(start).concat(HTTP.slice(0, start)) : HTTP;
+  // Round-robin only among EQUALLY TRUSTED endpoints. With a metered primary the rotation happens
+  // inside the primary tier and the fallback tier is appended untouched, so a healthy paid endpoint
+  // takes 100 % of normal traffic and the public nodes are reached only after an error.
+  let ordered;
+  if (PRIMARY.length) {
+    const s0 = (rpcIx = (rpcIx + 1) % PRIMARY.length);
+    ordered = PRIMARY.slice(s0).concat(PRIMARY.slice(0, s0), FALLBACK);
+  } else {
+    const s0 = FALLBACK.length ? (rpcIx = (rpcIx + 1) % FALLBACK.length) : 0;
+    ordered = FALLBACK.slice(s0).concat(FALLBACK.slice(0, s0));
+  }
   for (const url of ordered) {
     try {
       const r = await fetch(url, {
