@@ -114,12 +114,18 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   async function reconcile(N) {
     const t0 = Date.now(); stage = "height"; const stats = { status: "ok", head_seen_at: hub.headSeenAt?.(N + 1) ? new Date(hub.headSeenAt(N + 1)).toISOString() : null, recon_start_at: new Date(t0).toISOString() };
     // 1. node height
-    const height = await nodeHeight(N + 1);
-    if (!Number.isFinite(height) || height < N + 1) { heightAt = 0; return { ok: false, stats: { ...stats, status: "node-behind", error: `node at ${height}` } }; }
-    // 2. identity
+    // ONE FEWER BILLED CALL PER BLOCK. Asking the node its height and then asking for the block was
+    // two questions with one answer: a header that comes back IS proof the node has the block. The
+    // height call now happens only on the failure path, to tell "node behind" (retry, no budget spent)
+    // apart from a broken response (which does count against the block's budget). At ~40 blocks/min
+    // that is a third of reconciliation's metered traffic.
     stage = "header";
     const header = await hub.rpcBlockHeader(N, RPC_TIMEOUT);
-    if (!header?.hash) return { ok: false, stats: { ...stats, status: "no-header", error: "eth_getBlockByNumber returned nothing" } };
+    if (!header?.hash) {
+      const height = await nodeHeight(N + 1);
+      if (!Number.isFinite(height) || height < N + 1) { heightAt = 0; return { ok: false, stats: { ...stats, status: "node-behind", error: `node at ${height}` } }; }
+      return { ok: false, stats: { ...stats, status: "no-header", error: "eth_getBlockByNumber returned nothing" } };
+    }
     const seenHash = hub.headHash?.(N) || null;
     if (seenHash && seenHash !== String(header.hash).toLowerCase()) return { ok: false, stats: { ...stats, status: "hash-mismatch", error: `stream ${seenHash.slice(0, 12)} vs node ${String(header.hash).slice(0, 12)}` } };
     const pin = String(header.hash).toLowerCase();
