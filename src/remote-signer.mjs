@@ -99,6 +99,11 @@ const DEFINITIVE_CODES = new Set([
   "fleet_halted",           // kill switch
   "no_account", "account_halted", "account_revoked", "account_provisioning",
   "policy_funder_drift",    // needs re-provisioning, not another attempt
+  // Stage 4 reserve-path refusals (2026-08-31). A gate refusal comes back HTTP 200 with a code, so
+  // anything not listed here is treated as retryable - and retrying these burns a fresh signature on
+  // an answer that cannot change: the account is either authorized for that whale or it is not, and
+  // the attribution was either supplied or it was not.
+  "s4_attribution_required", "s4_unknown_fill", "s4_not_authorized",
   "approver_not_configured",// deployment problem: the split is half-done
   "clobauth_cap",           // daily ClobAuth ceiling
   "bad_order", "bad_request",
