@@ -38,20 +38,23 @@ import { AsyncLocalStorage } from "node:async_hooks";
 
 const store = new AsyncLocalStorage();
 
+/** Read-only view of the bound context, for the isolation test. Never used by production paths. */
+export function _ctxForTests() { return store.getStore() || {}; }
+
 /** STAGE 4 ATTRIBUTION (owner 2026-08-31). The placement loop mints the triggerId deep inside bot.mjs
  *  and knows nothing about Stage 4, so the attribution is pinned on an OUTER context that
  *  withSignContext inherits. Set only where the Stage 4 answer decided; an old-path order must carry
  *  nothing, which is what makes "a Stage 4 order without attribution" a detectable defect. */
 export function withS4Attribution({ fillId, group } = {}, fn) {
   const outer = store.getStore() || {};
-  return store.run({ ...outer, s4FillId: fillId ?? null, s4Group: Number.isFinite(Number(group)) ? Number(group) : null }, fn);
+  return store.run({ ...outer, s4: true, s4FillId: fillId ?? null, s4Group: Number.isFinite(Number(group)) ? Number(group) : null }, fn);
 }
 
 /** Run `fn` with the sign context bound to this one decision. One decision = one triggerId. */
 export function withSignContext({ triggerId, conditionId, s4FillId, s4Group } = {}, fn) {
   const outer = store.getStore() || {};
   return store.run({ triggerId: triggerId ?? null, conditionId: conditionId ?? "", orderRowId: null,
-    s4FillId: s4FillId ?? outer.s4FillId ?? null, s4Group: s4Group ?? outer.s4Group ?? null }, fn);
+    s4: outer.s4 === true, s4FillId: s4FillId ?? outer.s4FillId ?? null, s4Group: s4Group ?? outer.s4Group ?? null }, fn);
 }
 
 /**
@@ -211,7 +214,7 @@ export function makeRemoteSigner(config) {
         // fresh paid signature. An unwired caller must break loudly, not trade unprotected.
         const ctx = store.getStore();
         if (!ctx?.triggerId) throw new Error("remote signer: no triggerId in context — wrap the placement in withSignContext() (see remote-signer.mjs header)");
-        return await postSign({ typedData: td, triggerId: ctx.triggerId, conditionId: ctx.conditionId || "", s4FillId: ctx.s4FillId || null, s4Group: ctx.s4Group ?? null });
+        return await postSign({ typedData: td, triggerId: ctx.triggerId, conditionId: ctx.conditionId || "", s4: ctx.s4 === true, s4FillId: ctx.s4FillId || null, s4Group: ctx.s4Group ?? null });
       }
       throw new Error(`remote signer: refusing to sign unrecognised typed data (primaryType ${primaryType}, domain ${domain?.name})`);
     },
