@@ -161,12 +161,13 @@ async function fetchRosterMap(epoch) {
 function pushRoster(userId) {
   const k = kids.get(userId), entry = rosterMap.get(userId);
   if (!k?.child || !entry) return;
-  try { k.child.send({ t: "roster", list: entry.w, version: entry.v, epoch: rosterEpoch, at: entry.at, hosted: entry.h === true }); mMerge(fleetMetrics, { rosterPush: 1 }); } catch { /* child gone */ }
+  try { k.child.send({ t: "roster", list: entry.w, version: entry.v, epoch: rosterEpoch, at: entry.at, hosted: hostedUsers.has(userId) || entry.h === true }); mMerge(fleetMetrics, { rosterPush: 1 }); } catch { /* child gone */ }
   if (s4Canary.length) { try { k.child.send({ t: "s4canary", list: s4Canary }); } catch { /* child gone */ } }   // a child that just started must know the canary list
 }
 let hub = null;
 let sealWorker = null;
-let s4Canary = [];                 // whales for which Stage 4 decides this fleet's execution (empty = pure shadow)
+let s4Canary = [];
+let hostedUsers = new Set();      // the authoritative active-hosted set, refreshed by every roster poll                 // whales for which Stage 4 decides this fleet's execution (empty = pure shadow)
 function syncHubWallets() {
   if (!hub) return;
   const union = [...childWallets.values()].flat();
@@ -414,6 +415,11 @@ async function reconcile() {
   }
   if (hubToken && ![...want.values()].some((a) => a.token === hubToken)) hubToken = [...want.values()][0]?.token || null;
 
+  // EXECUTION MODE FROM THE MINUTELY POLL (owner 2026-08-31). Every account this endpoint serves is an
+  // ACTIVE hosted account by construction, so `want` is the authoritative hosted set - and unlike the
+  // roster MAP it refreshes every minute instead of only when the epoch changes. Carrying it on the
+  // map made a child fall back to SELF and refuse markets the production route approves.
+  hostedUsers = new Set(want.keys());
   for (const userId of [...kids.keys()]) {
     if (!want.has(userId)) stop(userId, "no longer on the roster (halted, disabled, or wallets cleared)");
   }

@@ -145,6 +145,12 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     if (!v || !Array.isArray(v.list)) return { ok: false, why: "no versioned roster yet" };
     if (Date.now() - (v.receivedAt || 0) > ROSTER_MAX_STALE_MS) return { ok: false, why: `versioned roster stale ${Math.round((Date.now() - (v.receivedAt || 0)) / 1000)}s` };
     if (!v.list.includes(String(wallet || "").toLowerCase())) return { ok: false, why: "whale not on this account's versioned roster" };
+    // NO AUTHORITATIVE EXECUTION MODE => STAGE 4 IS UNAVAILABLE, NOT CONSERVATIVE (owner 2026-08-31).
+    // Falling back to SELF narrows the horizon, which is safe for sizing but REFUSES markets the
+    // production route approves - three of those became "missed qualifying signal" and reverted the
+    // canary at 12:24Z. An unknown mode is an availability event: the old path decides, as it does for
+    // any other fill Stage 4 cannot answer.
+    if (typeof v.hosted !== "boolean") return { ok: false, why: "no authoritative execution mode yet" };
     return { ok: true };
   }
 
@@ -378,7 +384,12 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
         // hosted 7-day horizon after the server had already downgraded the account to self.
         const incoming = Number(m.version) || 0;
         if (versioned && incoming && incoming < versioned.version) { try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now(), stale: incoming }); } catch { /* parent gone */ } return; }
-        versioned = { list: m.list.map((w) => String(w).toLowerCase()), version: Number(m.version) || 0, epoch: m.epoch ?? null, hosted: m.hosted === true, at: Number(m.at) || Date.now(), receivedAt: Date.now() }; try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now() }); } catch { /* parent gone */ } return; }
+        // ABSENT MUST STAY ABSENT: coercing a missing execution mode to false narrowed the horizon
+        // and refused markets the production route approves (the 12:24Z revert).
+        versioned = { list: m.list.map((w) => String(w).toLowerCase()), version: Number(m.version) || 0, epoch: m.epoch ?? null, hosted: typeof m.hosted === "boolean" ? m.hosted : undefined, at: Number(m.at) || Date.now(), receivedAt: Date.now() };
+        try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now() }); } catch { /* parent gone */ }
+        return;
+      }
       if (m.t === "log" && m.log) { lastBeat = Date.now(); try { handle(m.log); } catch (e) { warn("chainwatch hub log:", e.message); } }
     });
     log(`chainwatch: HUB mode - ${wallets.length} wallets, socket owned by the runner`);
