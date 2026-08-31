@@ -57,7 +57,14 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   // arrive: 2+4+8+16 s of waiting before the fifth attempt can retire it, and the lag grows the whole
   // time. Cap it at 5 s for a pending block; the long backoff is for transient node errors, not for a
   // block that is never going to reconcile.
-  const backoff = () => Math.min(pendingBlock ? 5_000 : 30_000, 1_000 * 2 ** Math.min(attempts, 5));
+  const backoff = () => {
+    const base = Math.min(pendingBlock ? 5_000 : 30_000, 1_000 * 2 ** Math.min(attempts, 5));
+    // NEVER SLEEP PAST THE CEILING. The per-block wall-clock budget only takes effect on the next
+    // attempt, so a backoff longer than the time remaining to it silently postpones the retirement it
+    // exists to force - which is how a doubling backoff turns a 20 s budget into a minute.
+    if (!pendingSince) return base;
+    return Math.min(base, Math.max(200, BLOCK_MS - (Date.now() - pendingSince)));
+  };
 
   async function post(path, body, method = "POST") {
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15_000);
@@ -85,11 +92,27 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   }
 
   /** reconcile ONE block against the node; returns { ok, stats } */
+  // THROUGHPUT IS A SAFETY PROPERTY HERE (measured 2026-08-31, canary epoch 3). The worker reconciles
+  // sequentially, so its rate is 1/latency: 40 blocks/min healthy against a chain producing ~30 is only
+  // 1.33x of headroom, and when the public RPC slowed 7x at p50 the rate fell to 16.5/min and the
+  // cursor fell behind without bound until the range guard abandoned 123 blocks. Two fixes: stop
+  // paying for the node height on every block (it is the same answer for all of them), and reconcile a
+  // small batch concurrently while still SEALING STRICTLY IN ORDER.
+  let heightVal = 0, heightAt = 0;
+  const HEIGHT_TTL_MS = Number(process.env.COSMOS_S4_HEIGHT_TTL_MS) || 1_000;
+  async function nodeHeight() {
+    if (Date.now() - heightAt < HEIGHT_TTL_MS && heightVal) return heightVal;
+    const h = await hub.rpcBlockNumber(RPC_TIMEOUT);
+    if (Number.isFinite(h)) { heightVal = h; heightAt = Date.now(); }
+    return h;
+  }
+  const BATCH = Math.max(1, Number(process.env.COSMOS_S4_RECON_BATCH) || 4);
+
   async function reconcile(N) {
     const t0 = Date.now(); stage = "height"; const stats = { status: "ok", head_seen_at: hub.headSeenAt?.(N + 1) ? new Date(hub.headSeenAt(N + 1)).toISOString() : null, recon_start_at: new Date(t0).toISOString() };
     // 1. node height
-    const height = await hub.rpcBlockNumber(RPC_TIMEOUT);
-    if (!Number.isFinite(height) || height < N + 1) return { ok: false, stats: { ...stats, status: "node-behind", error: `node at ${height}` } };
+    const height = await nodeHeight();
+    if (!Number.isFinite(height) || height < N + 1) { heightAt = 0; return { ok: false, stats: { ...stats, status: "node-behind", error: `node at ${height}` } }; }
     // 2. identity
     stage = "header";
     const header = await hub.rpcBlockHeader(N, RPC_TIMEOUT);
@@ -164,6 +187,32 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       if (!through && losingGround(sealable - lastSealed) && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; pendingSince = 0; attempts = 0; }
       const N = through ? throughBlock : (pendingBlock ?? lastSealed + 1);
       if (!through && N > sealable) return;
+      // BATCH THE ORDINARY CASE. Only the plain "walk forward from the cursor" path batches; a pending
+      // block being retried and a through-block resolving a stuck range keep the single-block path, so
+      // their existing budgets and semantics are untouched. Blocks are reconciled CONCURRENTLY but
+      // sealed STRICTLY IN ORDER, stopping at the first failure - so the invariant is unchanged: a
+      // block is only ever sealed behind its own ok reconciliation, and nothing after a failure is
+      // sealed in this pass.
+      if (!through && !pendingBlock && sealable - lastSealed >= 2 && BATCH > 1) {
+        stage = "batch";
+        const last = Math.min(sealable, lastSealed + BATCH);
+        const blocks = []; for (let b = lastSealed + 1; b <= last; b++) blocks.push(b);
+        const results = await Promise.all(blocks.map((b) => reconcile(b).then((x) => ({ b, r: x }), (e) => ({ b, r: { ok: false, stats: { status: "threw", error: String(e?.message || e) } } }))));
+        let advanced = 0;
+        for (const { b, r: rr } of results) {
+          if (!rr.ok) { pendingBlock = b; pendingSince = Date.now(); attempts = 1; inc("s4ReconErr");
+            await post("/api/v1/fill-reconcile", { block: b, hash: null, stats: rr.stats }).catch(() => {});
+            log(`s4 seal: batch stopped at block ${b} (${rr.stats?.status}) - the rest of the batch is left for the next pass`);
+            break; }
+          stage = "seal-post";
+          const pp = await post("/api/v1/fill-reconcile", { block: b, hash: rr.pin, stats: rr.stats });
+          if (!pp.ok) { pendingBlock = b; pendingSince = Date.now(); attempts = 1; inc("s4SealErr");
+            log(`s4 seal: block ${b} reconciled but the seal call failed (${pp.status}) - retry`); break; }
+          inc("s4ReconOk"); inc("s4SealOk"); if (b > lastSealed) lastSealed = b; advanced++;
+        }
+        if (advanced) { attempts = 0; if (!pendingBlock) pendingSince = 0; }
+        return;
+      }
       const r = await reconcile(N);
       if (!r.ok) {
         attempts++; if (pendingBlock !== N) { pendingBlock = N; pendingSince = Date.now(); } inc("s4ReconErr");
