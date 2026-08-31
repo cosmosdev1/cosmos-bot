@@ -21,7 +21,7 @@
 import { fillsFromLog } from "./fills.mjs";
 
 export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, poll = 500 }) {
-  let lastSealed = 0, pendingBlock = null, attempts = 0, running = false, stopped = false, started = false, throughCount = 0;
+  let lastSealed = 0, pendingBlock = null, pendingSince = 0, attempts = 0, running = false, stopped = false, started = false, throughCount = 0;
   // SELF-HEALING (third wedge, 2026-08-31): the worker stopped twice with every await individually
   // deadlined and no counter moving at all - the `running` mutex was held by something that never
   // settled. Chasing the await is the wrong shape of fix: the mutex itself now has a deadline, and the
@@ -44,9 +44,20 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   const MAX_BEHIND = Number(process.env.COSMOS_S4_RECON_MAX_BEHIND) || 50;   // on boot, never try to reconcile more than this many blocks back
   const EVAL_DEADLINE_MS = Number(process.env.COSMOS_S4_RECON_EVAL_MS) || 20_000;   // a recovered fill that never settles must not stop the worker
   const BLOCK_ATTEMPTS = Number(process.env.COSMOS_S4_BLOCK_ATTEMPTS) || 4;   // per-block budget before it is recorded unreconciled
+  // ONE BAD BLOCK MUST NOT COST A RANGE (2026-08-31, canary epoch 2). A recovered fill that could not
+  // be evaluated held the cursor on block 92984954 while the chain ran on; four attempts with
+  // exponential backoff took longer than the lag took to reach 61 blocks, so the range guard fired and
+  // abandoned FIVE blocks - and the server guard correctly reverted the canary for an abandoned range.
+  // A wall-clock ceiling bounds the damage of one unevaluable block to that block. The invariant is
+  // untouched: the block is RECORDED UNRECONCILED, never sealed.
+  const BLOCK_MS = Number(process.env.COSMOS_S4_BLOCK_MS) || 20_000;
   const STUCK_INFLIGHT_MS = Number(process.env.COSMOS_S4_RECON_STUCK_MS) || 30_000;   // a backfill still running this long is treated as stuck
   const STUCK_IDLE_MS = 5_000;                                                        // a head gap the stream may still close by itself
-  const backoff = () => Math.min(30_000, 1_000 * 2 ** Math.min(attempts, 5));
+  // While a specific block is stuck, the doubling backoff is what makes the wall-clock ceiling slow to
+  // arrive: 2+4+8+16 s of waiting before the fifth attempt can retire it, and the lag grows the whole
+  // time. Cap it at 5 s for a pending block; the long backoff is for transient node errors, not for a
+  // block that is never going to reconcile.
+  const backoff = () => Math.min(pendingBlock ? 5_000 : 30_000, 1_000 * 2 ** Math.min(attempts, 5));
 
   async function post(path, body, method = "POST") {
     const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), 15_000);
@@ -150,28 +161,29 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       }
       // never fall further behind than MAX_BEHIND (a long stall, a stuck block after many retries): the
       // skipped range is a KNOWN unreconciled gap, logged and counted, never silently sealed
-      if (!through && losingGround(sealable - lastSealed) && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; attempts = 0; }
+      if (!through && losingGround(sealable - lastSealed) && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; pendingSince = 0; attempts = 0; }
       const N = through ? throughBlock : (pendingBlock ?? lastSealed + 1);
       if (!through && N > sealable) return;
       const r = await reconcile(N);
       if (!r.ok) {
-        attempts++; pendingBlock = N; inc("s4ReconErr");
+        attempts++; if (pendingBlock !== N) { pendingBlock = N; pendingSince = Date.now(); } inc("s4ReconErr");
         // ONE BAD BLOCK MUST NOT COST HUNDREDS (measured 2026-08-31 10:46Z). A block whose recovered
         // fills cannot be evaluated used to be retried up to twenty times with backoff - ten minutes
         // with the cursor frozen, after which the clamp abandoned FOUR HUNDRED blocks. The block itself
         // is what is unreconcilable, so after a small budget it is recorded as unreconciled ON ITS OWN
         // and the cursor moves past it: the invariant is untouched (no driver in it can ever be sealed,
         // 0094 enforces that at the database) and the cost is one block instead of a whole range.
-        if (attempts >= BLOCK_ATTEMPTS && !/node-behind/.test(String(r.stats?.status || ""))) {
-          log(`s4 seal: block ${N} could not be reconciled in ${attempts} attempts (${r.stats?.status}) - recording it as unreconciled and moving on`);
-          inc("s4ReconSkipped"); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: { status: "skipped-range", from: N, to: N, error: `block ${N} unreconcilable after ${attempts} attempts: ${r.stats?.status}` } });
-          attempts = 0; pendingBlock = null; if (N > lastSealed) lastSealed = N;
+        const heldMs = pendingSince ? Date.now() - pendingSince : 0;
+        if ((attempts >= BLOCK_ATTEMPTS || heldMs >= BLOCK_MS) && !/node-behind/.test(String(r.stats?.status || ""))) {
+          log(`s4 seal: block ${N} could not be reconciled in ${attempts} attempts / ${Math.round(heldMs / 1000)}s (${r.stats?.status}) - recording it as unreconciled and moving on`);
+          inc("s4ReconSkipped"); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: { status: "skipped-range", from: N, to: N, error: `block ${N} unreconcilable after ${attempts} attempts / ${Math.round(heldMs / 1000)}s: ${r.stats?.status}` } });
+          attempts = 0; pendingBlock = null; pendingSince = 0; if (N > lastSealed) lastSealed = N;
           return;
         } if (attempts === 1 || attempts % 10 === 0) log(`s4 seal: block ${N} not reconciled (${r.stats.status}${r.stats.error ? ": " + r.stats.error : ""}) - attempt ${attempts}, retry in ${backoff()} ms`); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: r.stats }).catch(() => {}); await new Promise((res) => setTimeout(res, backoff())); return; }
       stage = "seal-post";
       const p = await post("/api/v1/fill-reconcile", { block: N, hash: r.pin, stats: r.stats });
-      if (!p.ok) { attempts++; pendingBlock = N; inc("s4SealErr"); log(`s4 seal: block ${N} reconciled but the seal call failed (${p.status}) - retry`); await new Promise((res) => setTimeout(res, backoff())); return; }
-      inc("s4ReconOk"); inc("s4SealOk"); attempts = 0; pendingBlock = null;
+      if (!p.ok) { attempts++; if (pendingBlock !== N) { pendingBlock = N; pendingSince = Date.now(); } inc("s4SealErr"); log(`s4 seal: block ${N} reconciled but the seal call failed (${p.status}) - retry`); await new Promise((res) => setTimeout(res, backoff())); return; }
+      inc("s4ReconOk"); inc("s4SealOk"); attempts = 0; pendingBlock = null; pendingSince = 0;
       if (N > lastSealed) lastSealed = N;                                   // a through-block below the cursor must never walk it backwards
       if (through) { hub.resolveBlock?.(N); throughCount++; if (throughCount === 1 || throughCount % 25 === 0) log(`s4 seal: block ${N} reconciled THROUGH a pending range the stream could not close (${throughCount} so far) - resolved in the cursor`); }
     } catch (e) { attempts++; inc("s4ReconErr"); log(`s4 seal: tick error ${e?.message || e}`); await new Promise((res) => setTimeout(res, backoff())); }
@@ -190,5 +202,5 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
     log(`s4 seal: tick held the worker for ${Math.round(held / 1000)}s at stage "${stage}" (block ${pendingBlock ?? lastSealed + 1}) - abandoning it so reconciliation continues (${stalls} so far)`);
     running = false; stage = "idle"; attempts++;
   }, 15_000); supervisor.unref?.();
-  return { stop: () => { stopped = true; clearInterval(timer); clearInterval(supervisor); }, stats: () => ({ lastSealed, pendingBlock, attempts, through: throughCount, stalls, stage, behind: Math.max(0, hub.sealable() - lastSealed) }) };
+  return { stop: () => { stopped = true; clearInterval(timer); clearInterval(supervisor); }, stats: () => ({ lastSealed, pendingBlock, pendingSince, attempts, through: throughCount, stalls, stage, behind: Math.max(0, hub.sealable() - lastSealed) }) };
 }
