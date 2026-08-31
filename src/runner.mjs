@@ -165,6 +165,7 @@ function pushRoster(userId) {
   if (s4Canary.length) { try { k.child.send({ t: "s4canary", list: s4Canary }); } catch { /* child gone */ } }   // a child that just started must know the canary list
 }
 let hub = null;
+let lastRpcCalls = 0, lastRpcFails = 0;
 let sealWorker = null;
 let s4Canary = [];
 let hostedUsers = new Set();      // the authoritative active-hosted set, refreshed by every roster poll                 // whales for which Stage 4 decides this fleet's execution (empty = pure shadow)
@@ -539,6 +540,9 @@ if (HUB_ENABLED) {
     setInterval(() => {
       const s = hub.stats();
       log(`chainhub: ${s.connected ? "connected" : "DISCONNECTED"} · ${s.wallets} wallets · ${s.delivered} logs delivered · ${kids.size} children`);
+      // billed-call delta since the last report, so daily credit consumption is measured not guessed
+      try { const rm = hub?.rpcMeter; if (rm) { const d = rm.calls - lastRpcCalls; if (d > 0) mMerge(fleetMetrics, { hubRpcCalls: d }); lastRpcCalls = rm.calls;
+        const df = rm.fails - lastRpcFails; if (df > 0) mMerge(fleetMetrics, { hubRpcFails: df }); lastRpcFails = rm.fails; } } catch { /* observability only */ }
       if (s4) { const x = s4.stats(); const w = sealWorker ? sealWorker.stats() : null; log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring} · sealable ${x.sealable}${w ? ` · sealed through ${w.lastSealed} (behind ${w.behind}${w.pendingBlock ? `, pending ${w.pendingBlock} x${w.attempts}` : ""})` : ""}${x.breaker ? " · BREAKER" : ""}`); if (w && w.lastSealed > 0 && w.behind > 0) fleetMetrics.s4ReconPending = w.behind; }
     }, 10 * 60_000).unref?.();
   } catch (e) {

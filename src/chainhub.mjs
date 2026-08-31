@@ -58,7 +58,12 @@ const pad32 = (addr) => "0x" + addr.replace(/^0x/, "").toLowerCase().padStart(64
 // llamarpc reject it outright (measured 5/5 errors in 8-68 ms), so adding them would only have
 // spent a round-robin slot on a guaranteed failure. Widen it with COSMOS_HUB_RPC, not by guessing.
 let rpcIx = 0;
+// EVERY HUB HTTP CALL IS BILLED. Reconciliation is visible in s4_recon_events_shadow, but backfill and
+// retries were not counted anywhere, so a credit projection built only from recon events understates
+// the real consumption by an unknown amount. These are cumulative; the runner reports the delta.
+export const rpcMeter = { calls: 0, fails: 0, byMethod: Object.create(null) };
 async function rpc(method, params) {
+  rpcMeter.calls++; rpcMeter.byMethod[method] = (rpcMeter.byMethod[method] || 0) + 1;
   // Round-robin only among EQUALLY TRUSTED endpoints. With a metered primary the rotation happens
   // inside the primary tier and the fallback tier is appended untouched, so a healthy paid endpoint
   // takes 100 % of normal traffic and the public nodes are reached only after an error.
@@ -80,6 +85,7 @@ async function rpc(method, params) {
       if (r?.result !== undefined) return r.result;
     } catch { /* next endpoint */ }
   }
+  rpcMeter.fails++;
   return null;
 }
 
@@ -101,11 +107,17 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
   // same endpoint rotation as rpc(), with a caller-chosen deadline; a pinned getLogs that an endpoint
   // refuses (no blockHash support) returns an error object, which reads as undefined -> next endpoint
   async function rpcT(method, params, ms) {
+    // rpcT is a SEPARATE implementation from rpc() and it is the one reconciliation uses, so it must
+    // be metered too or the credit projection counts almost nothing. It walks HTTP in order, which
+    // with PRIMARY.concat(FALLBACK) means the metered endpoint first and the public nodes only after
+    // an error - the ordering the owner asked for.
+    rpcMeter.calls++; rpcMeter.byMethod[method] = (rpcMeter.byMethod[method] || 0) + 1;
     for (const url of HTTP) {
       const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms || 8000);
       try { const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 7, method, params }), signal: ctl.signal }); const j = await r.json().catch(() => null); if (j && j.result !== undefined) return j.result; }
       catch { /* next endpoint */ } finally { clearTimeout(t); }
     }
+    rpcMeter.fails++;
     return undefined;
   }
   let wallets = [];               // the union, lowercased
@@ -247,6 +259,7 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
 
   connect();
   return {
+    rpcMeter,
     setWallets,
     cursor: () => cursor.state(),
     sealable: () => cursor.sealable(),
