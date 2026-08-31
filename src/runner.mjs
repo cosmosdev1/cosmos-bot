@@ -423,6 +423,13 @@ async function reconcile() {
   for (const userId of [...kids.keys()]) {
     if (!want.has(userId)) stop(userId, "no longer on the roster (halted, disabled, or wallets cleared)");
   }
+  // RE-PUSH THE VERSIONED ROSTER EVERY POLL (2026-08-31). It used to be pushed only when the roster
+  // EPOCH changed or a child started, while the child expires it after 5 minutes - so a few minutes
+  // after start every child was permanently "stale" and fell back to a SELF horizon, refusing markets
+  // the production route approves. Measured: 5 live hosted/horizon contradictions in a quiet window,
+  // and a canary armed then would have been refused authority fleet-wide as "roster-stale". The push
+  // is one IPC message per child per minute and it also carries any change in the hosted set.
+  for (const userId of kids.keys()) pushRoster(userId);
 
   // COUNT the starvation instead of break-ing blind (scale build Inc 0.5): every deferred account
   // is user money with no manager, and that must page, not whisper in a Fly log.

@@ -42,7 +42,7 @@ export const KEYS = Object.freeze([
   "rosterOk", "rosterErr",                         // the child watch-list refresh: outcomes per interval
   "rosterMapOk", "rosterMapErr", "rosterPush", "rosterAck", "rosterAckMiss",   // versioned roster distribution (shadow)
   "s4GapSec10",                                    // known-gap duration of the seal cursor, 10 s units
-  "s4ReconOk", "s4ReconErr", "s4ReconMissing", "s4ReconDup", "s4ReconPending", "s4SealOk", "s4SealErr", "s4ReconSkipped", "s4CanaryAct", "s4CanaryFallback", "s4CanaryBlocked", "s4CanaryAgree", "s4CanaryDiffer", "s4CanarySuppressed", "s4CanaryPolled", "s4SealStuck", "s4CanaryIntent", "s4CanaryFilled", "s4CanaryNoMode", "s4CanaryStaleRoster", "s4CanaryNotOnRoster", "s4CanaryNoRoster",   // block reconciliation seal
+  "s4ReconOk", "s4ReconErr", "s4ReconMissing", "s4ReconDup", "s4ReconPending", "s4SealOk", "s4SealErr", "s4ReconSkipped", "s4CanaryAct", "s4CanaryFallback", "s4CanaryBlocked", "s4CanaryAgree", "s4CanaryDiffer", "s4CanarySuppressed", "s4CanaryPolled", "s4SealStuck", "s4CanaryIntent", "s4CanaryFilled", "s4ModeUnknown", "s4CanaryNoMode", "s4CanaryStaleRoster", "s4CanaryNotOnRoster", "s4CanaryNoRoster",   // block reconciliation seal
   "s4OverflowCc", "s4HungFetch", "s4HungJson", "s4HungBcast",   // fallback amplification estimate; hang stage
 ]);
 

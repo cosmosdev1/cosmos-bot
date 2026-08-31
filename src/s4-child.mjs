@@ -29,6 +29,10 @@ export function startS4Child({ inc, send, log, ctx, warn }) {
   function settle(fillId, p) {
     pairs.delete(fillId);
     const c = ctx(p.neu?.wallet ?? p.old?.wallet, p.neu ?? null);
+    // A comparison needs to know which horizon applies. Without an authoritative execution mode the
+    // two paths are not answering the same question, and classifying anyway manufactures a
+    // hosted/horizon contradiction out of a rollout gap.
+    if (c.modeKnown === false) { inc("s4ModeUnknown"); return; }
     const r = classify(p.old ?? null, p.neu ?? null, c);
     inc(CLS[r.cls] || "s4Unknown");
     if (r.cls === "OLD_PATH_BUG") inc(r.sub === "BALANCE_LATEST_STALE_ZERO" ? "s4OldBugBalance" : r.sub === "ACCUMULATE_SHARE_MULTIPLE" ? "s4OldBugShare" : r.sub === "ACCUMULATE_COST_RESCALE" ? "s4OldBugCost" : "s4OldBugPeak");

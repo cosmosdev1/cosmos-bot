@@ -72,9 +72,14 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
       // process SIGNS; it does not decide business semantics like the 2-day vs 7-day horizon. The
       // authoritative answer rides on the versioned roster; while that is missing or stale the child
       // falls back to SELF, which is the conservative side - a stale child can never widen a horizon.
+      // NEVER INFER SELF FROM MISSING STATE (owner's rule, applied here too). Coercing an unknown or
+      // expired mode to `self` narrowed the horizon and produced FALSE hosted/horizon contradictions -
+      // a comparison cannot be made at all without knowing which semantics apply, so it is skipped
+      // rather than decided wrongly. The execution path is separately gated by canaryAuthorized.
       const fresh = versioned && Date.now() - (versioned.receivedAt || 0) <= ROSTER_MAX_STALE_MS;
+      const modeKnown = Boolean(fresh) && typeof versioned.hosted === "boolean";
       return { copytrade: base.copytrade === true, followsWallet: byAddr.has(String(wallet || "").toLowerCase()), diamondBlocked: false,
-        hosted: fresh ? versioned.hosted === true : false, hostedSource: fresh ? "server" : "fallback-self",
+        modeKnown, hosted: modeKnown ? versioned.hosted : null, hostedSource: modeKnown ? "server" : "unknown",
         v2: base.v2 === true, group: base.group ?? (mem.find((g) => g < 1000) ?? mem[0] ?? 1) };
     } });
   let wallets = [];          // [{wallet, username}]
