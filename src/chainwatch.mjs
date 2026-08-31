@@ -234,7 +234,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     }
     const s = res.signal;
     log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> ${s.outcome} @${s.entry_cents}c${s.is_pair ? " [PAIR]" : ""} · vetted in ${ms}ms${source === "s4" ? " · STAGE 4 AUTHORITY" : ""} · ${String(s.market_question).slice(0, 40)}`);
-    try { await onSignal(s, { wallet: w, shares, block: l.blockNumber, s4: source === "s4" }); }
+    try { await onSignal(s, { wallet: w, shares, block: l.blockNumber, s4: source === "s4", fillId }); }
     catch (e) { warn("chainwatch buy:", e.message); }
   }
 

@@ -28,6 +28,7 @@ import { log, warn } from "./log.mjs";
 const N = (k, d) => { const v = Number(process.env[k]); return Number.isFinite(v) ? v : d; };
 const DRY = process.env.COPYTRADE_DRY === "1";
 import { inc as mInc } from "./metrics.mjs";
+import { withS4Attribution } from "./remote-signer.mjs";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
 // How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
 // so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
@@ -879,7 +880,15 @@ export function startCopyTrade(deps) {
   // that: the same token is bought by the polled sweep, by non-canary children and by the old-path
   // fallback. Only this call site knows which answer decided, so it is counted here (owner 2026-08-31,
   // after a report claimed 71 intents that were all old-path orders placed while the canary was OFF).
+  // ATTRIBUTION WRAPPER (owner 2026-08-31). The placement mints its triggerId deep in bot.mjs and knows
+  // nothing about Stage 4, so the fill identity is bound on an OUTER async context that every sign
+  // request under this decision inherits. Only the Stage 4 path sets it: an old-path order carries
+  // nothing, which is exactly what makes "a Stage 4 order without attribution" detectable.
   async function fastOpen(sig, meta = {}) {
+    if (meta?.s4 && meta?.fillId) return withS4Attribution({ fillId: meta.fillId, group: sig?.group_id }, () => fastOpenInner(sig, meta));
+    return fastOpenInner(sig, meta);
+  }
+  async function fastOpenInner(sig, meta = {}) {
     if (state.copytrade === false) return;
     if (Date.now() < budgetPausedUntil) return;   // budget breaker: no entries until the window frees
     // The fast path IS the whale-fill path. A bot that only has the adopt flag must never take one.
