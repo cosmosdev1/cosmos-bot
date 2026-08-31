@@ -38,8 +38,19 @@ const PING_MS = Number(process.env.COSMOS_HUB_PING_MS) || 240_000;   // 4 min (w
 const HEARTBEAT_MS = 20_000;
 const pad32 = (addr) => "0x" + addr.replace(/^0x/, "").toLowerCase().padStart(64, "0");
 
+// ROUND-ROBIN, NOT FIRST-WINS (2026-08-31). The list was walked in order and returned on the first
+// SUCCESS, so a rate-limited endpoint that still answers - just slowly - was never fallen away from:
+// every call hit endpoint #1 and earned its throttle. Measured on the free public node, sequential
+// calls from an unrelated machine: 674 ms, then 6.7-8.6 s. Spreading calls across the endpoints
+// multiplies the effective rate limit at no cost, and a failing endpoint is still skipped.
+// The list stays at the two endpoints that actually serve eth_getLogs: polygon-rpc.com and
+// llamarpc reject it outright (measured 5/5 errors in 8-68 ms), so adding them would only have
+// spent a round-robin slot on a guaranteed failure. Widen it with COSMOS_HUB_RPC, not by guessing.
+let rpcIx = 0;
 async function rpc(method, params) {
-  for (const url of HTTP) {
+  const start = HTTP.length ? (rpcIx = (rpcIx + 1) % HTTP.length) : 0;
+  const ordered = HTTP.length ? HTTP.slice(start).concat(HTTP.slice(0, start)) : HTTP;
+  for (const url of ordered) {
     try {
       const r = await fetch(url, {
         method: "POST", headers: { "content-type": "application/json" },
