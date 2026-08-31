@@ -22,6 +22,11 @@ import { fillsFromLog } from "./fills.mjs";
 
 export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, poll = 500 }) {
   let lastSealed = 0, pendingBlock = null, attempts = 0, running = false, stopped = false, started = false, throughCount = 0;
+  // SELF-HEALING (third wedge, 2026-08-31): the worker stopped twice with every await individually
+  // deadlined and no counter moving at all - the `running` mutex was held by something that never
+  // settled. Chasing the await is the wrong shape of fix: the mutex itself now has a deadline, and the
+  // STAGE is recorded so the next stall names its own cause instead of needing an archaeology session.
+  let tickAt = 0, stage = "idle", stalls = 0;
   const RPC_TIMEOUT = Number(process.env.COSMOS_S4_RECON_TIMEOUT_MS) || 8_000;
   const MAX_BEHIND = Number(process.env.COSMOS_S4_RECON_MAX_BEHIND) || 50;   // on boot, never try to reconcile more than this many blocks back
   const EVAL_DEADLINE_MS = Number(process.env.COSMOS_S4_RECON_EVAL_MS) || 20_000;   // a recovered fill that never settles must not stop the worker
@@ -56,17 +61,19 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
 
   /** reconcile ONE block against the node; returns { ok, stats } */
   async function reconcile(N) {
-    const t0 = Date.now(); const stats = { status: "ok", head_seen_at: hub.headSeenAt?.(N + 1) ? new Date(hub.headSeenAt(N + 1)).toISOString() : null, recon_start_at: new Date(t0).toISOString() };
+    const t0 = Date.now(); stage = "height"; const stats = { status: "ok", head_seen_at: hub.headSeenAt?.(N + 1) ? new Date(hub.headSeenAt(N + 1)).toISOString() : null, recon_start_at: new Date(t0).toISOString() };
     // 1. node height
     const height = await hub.rpcBlockNumber(RPC_TIMEOUT);
     if (!Number.isFinite(height) || height < N + 1) return { ok: false, stats: { ...stats, status: "node-behind", error: `node at ${height}` } };
     // 2. identity
+    stage = "header";
     const header = await hub.rpcBlockHeader(N, RPC_TIMEOUT);
     if (!header?.hash) return { ok: false, stats: { ...stats, status: "no-header", error: "eth_getBlockByNumber returned nothing" } };
     const seenHash = hub.headHash?.(N) || null;
     if (seenHash && seenHash !== String(header.hash).toLowerCase()) return { ok: false, stats: { ...stats, status: "hash-mismatch", error: `stream ${seenHash.slice(0, 12)} vs node ${String(header.hash).slice(0, 12)}` } };
     const pin = String(header.hash).toLowerCase();
     // 3. logs pinned to the hash, the hub's exact filter
+    stage = "logs";
     const rpcStart = Date.now();
     const logs = await hub.rpcLogsPinned(pin, RPC_TIMEOUT);
     const rpcMs = Date.now() - rpcStart;
@@ -81,6 +88,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       log(`s4 seal: block ${N} - ${missing.length} fill(s) the stream never delivered: ${missing.map((f) => f.fillId.slice(0, 18)).join(" ")} - evaluating before the seal`);
       // NO AWAIT WITHOUT A DEADLINE (the owner's standing rule): even with the hub settling its hung
       // waiters, this await must never be able to stop reconciliation for the whole fleet.
+      stage = "evaluate";
       const results = await Promise.race([
         s4.evaluateNow(missing, { origin: "reconcile" }),
         new Promise((res) => setTimeout(() => res(null), EVAL_DEADLINE_MS)),
@@ -93,7 +101,8 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   }
 
   async function tick() {
-    if (running || stopped) return; running = true;
+    if (running || stopped) return;
+    running = true; tickAt = Date.now(); stage = "start";
     try {
       if (!started) { await boot(); if (!started) return; }
       const sealable = hub.sealable();
@@ -119,13 +128,26 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       if (!through && N > sealable) return;
       const r = await reconcile(N);
       if (!r.ok) { attempts++; pendingBlock = N; inc("s4ReconErr"); if (attempts === 1 || attempts % 10 === 0) log(`s4 seal: block ${N} not reconciled (${r.stats.status}${r.stats.error ? ": " + r.stats.error : ""}) - attempt ${attempts}, retry in ${backoff()} ms`); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: r.stats }).catch(() => {}); await new Promise((res) => setTimeout(res, backoff())); return; }
+      stage = "seal-post";
       const p = await post("/api/v1/fill-reconcile", { block: N, hash: r.pin, stats: r.stats });
       if (!p.ok) { attempts++; pendingBlock = N; inc("s4SealErr"); log(`s4 seal: block ${N} reconciled but the seal call failed (${p.status}) - retry`); await new Promise((res) => setTimeout(res, backoff())); return; }
       inc("s4ReconOk"); inc("s4SealOk"); attempts = 0; pendingBlock = null; lastSealed = N;
       if (through) { hub.resolveBlock?.(N); throughCount++; if (throughCount === 1 || throughCount % 25 === 0) log(`s4 seal: block ${N} reconciled THROUGH a pending range the stream could not close (${throughCount} so far) - resolved in the cursor`); }
     } catch (e) { attempts++; inc("s4ReconErr"); log(`s4 seal: tick error ${e?.message || e}`); await new Promise((res) => setTimeout(res, backoff())); }
-    finally { running = false; }
+    finally { running = false; stage = "idle"; }
   }
   const timer = setInterval(() => { tick(); }, poll); timer.unref?.();
-  return { stop: () => { stopped = true; clearInterval(timer); }, stats: () => ({ lastSealed, pendingBlock, attempts, through: throughCount, behind: Math.max(0, hub.sealable() - lastSealed) }) };
+  // THE MUTEX HAS A DEADLINE TOO. A tick that has held `running` for longer than TICK_HARD_MS is
+  // abandoned: the flag is released so the next tick proceeds, the stage it died in is logged and
+  // counted, and the block it was on is retried. Whatever hangs next, reconciliation continues.
+  const TICK_HARD_MS = Number(process.env.COSMOS_S4_SEAL_TICK_MS) || 90_000;
+  const supervisor = setInterval(() => {
+    if (!running || stopped) return;
+    const held = Date.now() - tickAt;
+    if (held < TICK_HARD_MS) return;
+    stalls++; inc("s4SealStuck");
+    log(`s4 seal: tick held the worker for ${Math.round(held / 1000)}s at stage "${stage}" (block ${pendingBlock ?? lastSealed + 1}) - abandoning it so reconciliation continues (${stalls} so far)`);
+    running = false; stage = "idle"; attempts++;
+  }, 15_000); supervisor.unref?.();
+  return { stop: () => { stopped = true; clearInterval(timer); clearInterval(supervisor); }, stats: () => ({ lastSealed, pendingBlock, attempts, through: throughCount, stalls, stage, behind: Math.max(0, hub.sealable() - lastSealed) }) };
 }
