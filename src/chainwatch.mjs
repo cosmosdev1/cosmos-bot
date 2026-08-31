@@ -142,15 +142,15 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
   const ROSTER_MAX_STALE_MS = Number(process.env.COSMOS_S4_CANARY_ROSTER_STALE_MS) || 300_000;
   function canaryAuthorized(wallet) {
     const v = versioned;
-    if (!v || !Array.isArray(v.list)) return { ok: false, why: "no versioned roster yet" };
-    if (Date.now() - (v.receivedAt || 0) > ROSTER_MAX_STALE_MS) return { ok: false, why: `versioned roster stale ${Math.round((Date.now() - (v.receivedAt || 0)) / 1000)}s` };
-    if (!v.list.includes(String(wallet || "").toLowerCase())) return { ok: false, why: "whale not on this account's versioned roster" };
+    if (!v || !Array.isArray(v.list)) return { ok: false, why: "no versioned roster yet", code: "roster-unavailable" };
+    if (Date.now() - (v.receivedAt || 0) > ROSTER_MAX_STALE_MS) return { ok: false, why: `versioned roster stale ${Math.round((Date.now() - (v.receivedAt || 0)) / 1000)}s`, code: "roster-stale" };
+    if (!v.list.includes(String(wallet || "").toLowerCase())) return { ok: false, why: "whale not on this account's versioned roster", code: "not-on-roster" };
     // NO AUTHORITATIVE EXECUTION MODE => STAGE 4 IS UNAVAILABLE, NOT CONSERVATIVE (owner 2026-08-31).
     // Falling back to SELF narrows the horizon, which is safe for sizing but REFUSES markets the
     // production route approves - three of those became "missed qualifying signal" and reverted the
     // canary at 12:24Z. An unknown mode is an availability event: the old path decides, as it does for
     // any other fill Stage 4 cannot answer.
-    if (typeof v.hosted !== "boolean") return { ok: false, why: "no authoritative execution mode yet" };
+    if (typeof v.hosted !== "boolean") return { ok: false, why: "no authoritative execution mode yet", code: "no-mode" };
     return { ok: true };
   }
 
@@ -187,7 +187,14 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
       const auth = canaryAuthorized(w.wallet);
       const old = runOldCheck();                                   // runs in parallel: rows + comparison
       old.catch(() => {});
-      if (!auth.ok) { inc("s4CanaryBlocked"); warn(`chainwatch: STAGE 4 authority refused for ${w.username} (${auth.why}) - old path decides`); res = await old; }
+      if (!auth.ok) {
+        // WHY Stage 4 was unavailable, not just that it was: the owner's gate reports degraded-mode
+        // fallbacks by cause, and an unexpectedly high rate in ONE cause is a rollout-quality signal.
+        inc("s4CanaryBlocked");
+        inc(auth.code === "no-mode" ? "s4CanaryNoMode" : auth.code === "roster-stale" ? "s4CanaryStaleRoster" : auth.code === "not-on-roster" ? "s4CanaryNotOnRoster" : "s4CanaryNoRoster");
+        warn(`chainwatch: STAGE 4 authority refused for ${w.username} (${auth.why}) - old path decides`);
+        res = await old;
+      }
       else {
         const a = await s4.awaitAnswer(fillId, w.wallet, S4_WAIT_MS);
         if (a) { res = a; source = "s4"; inc("s4CanaryAct"); old.then((o) => { if (o) inc(Boolean(o.ok) === Boolean(a.ok) ? "s4CanaryAgree" : "s4CanaryDiffer"); }).catch(() => {}); }
