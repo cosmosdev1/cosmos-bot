@@ -100,8 +100,11 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   // small batch concurrently while still SEALING STRICTLY IN ORDER.
   let heightVal = 0, heightAt = 0;
   const HEIGHT_TTL_MS = Number(process.env.COSMOS_S4_HEIGHT_TTL_MS) || 1_000;
-  async function nodeHeight() {
-    if (Date.now() - heightAt < HEIGHT_TTL_MS && heightVal) return heightVal;
+  // Only trust the cached height when it already PROVES the block exists. A cache that can be a block
+  // stale otherwise answers "node-behind" for a block the node actually has, and buys a retry cycle
+  // instead of saving one (measured: 21 needless node-behind in 8 minutes).
+  async function nodeHeight(need) {
+    if (heightVal >= need && Date.now() - heightAt < HEIGHT_TTL_MS) return heightVal;
     const h = await hub.rpcBlockNumber(RPC_TIMEOUT);
     if (Number.isFinite(h)) { heightVal = h; heightAt = Date.now(); }
     return h;
@@ -111,7 +114,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   async function reconcile(N) {
     const t0 = Date.now(); stage = "height"; const stats = { status: "ok", head_seen_at: hub.headSeenAt?.(N + 1) ? new Date(hub.headSeenAt(N + 1)).toISOString() : null, recon_start_at: new Date(t0).toISOString() };
     // 1. node height
-    const height = await nodeHeight();
+    const height = await nodeHeight(N + 1);
     if (!Number.isFinite(height) || height < N + 1) { heightAt = 0; return { ok: false, stats: { ...stats, status: "node-behind", error: `node at ${height}` } }; }
     // 2. identity
     stage = "header";
