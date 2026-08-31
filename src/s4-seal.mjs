@@ -27,6 +27,19 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   // settled. Chasing the await is the wrong shape of fix: the mutex itself now has a deadline, and the
   // STAGE is recorded so the next stall names its own cause instead of needing an archaeology session.
   let tickAt = 0, stage = "idle", stalls = 0;
+  // ABANDONING BLOCKS IS THE LAST RESORT, NOT THE FIRST (measured 2026-08-31 09:03Z). A transient
+  // slowdown let the backlog grow 18 -> 72 blocks over eighty seconds; the flat MAX_BEHIND clamp fired
+  // and permanently abandoned 24 blocks, so no driver in them can ever be sealed. The worker reconciles
+  // ~2 blocks/s against a chain that produces ~0.5/s, so it had every chance to catch up. A range is
+  // now skipped only when the worker is LOSING GROUND - the backlog has stayed above the threshold and
+  // has not improved across several consecutive ticks - which is the condition the clamp was for.
+  const behindHistory = [];
+  const losingGround = (behind) => {
+    behindHistory.push(behind); if (behindHistory.length > 12) behindHistory.shift();
+    if (behindHistory.length < 12) return false;                       // not enough evidence yet
+    const first = behindHistory[0], last = behindHistory[behindHistory.length - 1];
+    return last >= first && behindHistory.every((b) => b > MAX_BEHIND); // never dipped, never improved
+  };
   const RPC_TIMEOUT = Number(process.env.COSMOS_S4_RECON_TIMEOUT_MS) || 8_000;
   const MAX_BEHIND = Number(process.env.COSMOS_S4_RECON_MAX_BEHIND) || 50;   // on boot, never try to reconcile more than this many blocks back
   const EVAL_DEADLINE_MS = Number(process.env.COSMOS_S4_RECON_EVAL_MS) || 20_000;   // a recovered fill that never settles must not stop the worker
@@ -136,7 +149,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       }
       // never fall further behind than MAX_BEHIND (a long stall, a stuck block after many retries): the
       // skipped range is a KNOWN unreconciled gap, logged and counted, never silently sealed
-      if (!through && sealable - lastSealed > MAX_BEHIND && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; attempts = 0; }
+      if (!through && losingGround(sealable - lastSealed) && !(pendingBlock && attempts < 20)) { const from = lastSealed + 1, to = sealable - MAX_BEHIND; log(`s4 seal: ${to - from + 1} blocks (${from}-${to}) left unreconciled - too far behind; resuming at ${to + 1}`); inc("s4ReconSkipped", to - from + 1); await post("/api/v1/fill-reconcile", { block: to, hash: null, stats: { status: "skipped-range", from, to, error: `behind by ${sealable - lastSealed}` } }).catch(() => {}); lastSealed = to; pendingBlock = null; attempts = 0; }
       const N = through ? throughBlock : (pendingBlock ?? lastSealed + 1);
       if (!through && N > sealable) return;
       const r = await reconcile(N);
