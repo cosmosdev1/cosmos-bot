@@ -68,8 +68,14 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     ctx: (wallet, neutral) => {
       const base = typeof s4Ctx === "function" ? s4Ctx() : {};
       const mem = Array.isArray(neutral?.WHALE_TRACK_MEMBERSHIPS) ? neutral.WHALE_TRACK_MEMBERSHIPS : [];
+      // EXECUTION MODE COMES FROM THE SERVER (owner 2026-08-31). The local signer flag decides how this
+      // process SIGNS; it does not decide business semantics like the 2-day vs 7-day horizon. The
+      // authoritative answer rides on the versioned roster; while that is missing or stale the child
+      // falls back to SELF, which is the conservative side - a stale child can never widen a horizon.
+      const fresh = versioned && Date.now() - (versioned.receivedAt || 0) <= ROSTER_MAX_STALE_MS;
       return { copytrade: base.copytrade === true, followsWallet: byAddr.has(String(wallet || "").toLowerCase()), diamondBlocked: false,
-        hosted: base.hosted === true, v2: base.v2 === true, group: base.group ?? (mem.find((g) => g < 1000) ?? mem[0] ?? 1) };
+        hosted: fresh ? versioned.hosted === true : false, hostedSource: fresh ? "server" : "fallback-self",
+        v2: base.v2 === true, group: base.group ?? (mem.find((g) => g < 1000) ?? mem[0] ?? 1) };
     } });
   let wallets = [];          // [{wallet, username}]
   let byAddr = new Map();
@@ -210,7 +216,7 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
     }
     const s = res.signal;
     log(`chainwatch: ${w.username} +${shares.toFixed(0)} sh -> ${s.outcome} @${s.entry_cents}c${s.is_pair ? " [PAIR]" : ""} · vetted in ${ms}ms${source === "s4" ? " · STAGE 4 AUTHORITY" : ""} · ${String(s.market_question).slice(0, 40)}`);
-    try { await onSignal(s, { wallet: w, shares, block: l.blockNumber }); }
+    try { await onSignal(s, { wallet: w, shares, block: l.blockNumber, s4: source === "s4" }); }
     catch (e) { warn("chainwatch buy:", e.message); }
   }
 
@@ -366,7 +372,13 @@ export function startChainWatch({ cosmos, onSignal, isArmed, s4Ctx }) {
       if (m.t === "s4" || m.t === "s4replay" || m.t === "s4canary") { try { s4.onMessage(m); } catch (e) { warn("s4 child:", e.message); } return; }   // stage 4: compare, and for a canary whale execute
       // VERSIONED ROSTER (owner 2026-08-30, shadow): stored and acknowledged; NOT used for filtering
       // until the proof passes (ROSTER_MODE=versioned). The ack is the IPC delivery proof.
-      if (m.t === "roster" && Array.isArray(m.list)) { versioned = { list: m.list.map((w) => String(w).toLowerCase()), version: Number(m.version) || 0, epoch: m.epoch ?? null, at: Number(m.at) || Date.now(), receivedAt: Date.now() }; try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now() }); } catch { /* parent gone */ } return; }
+      if (m.t === "roster" && Array.isArray(m.list)) {
+        // MONOTONIC (owner 2026-08-31, "roster version lag"): a push that is OLDER than what we hold is
+        // dropped. Without this a late delivery could resurrect a stale execution mode - re-granting the
+        // hosted 7-day horizon after the server had already downgraded the account to self.
+        const incoming = Number(m.version) || 0;
+        if (versioned && incoming && incoming < versioned.version) { try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now(), stale: incoming }); } catch { /* parent gone */ } return; }
+        versioned = { list: m.list.map((w) => String(w).toLowerCase()), version: Number(m.version) || 0, epoch: m.epoch ?? null, hosted: m.hosted === true, at: Number(m.at) || Date.now(), receivedAt: Date.now() }; try { process.send?.({ t: "roster-ack", version: versioned.version, at: Date.now() }); } catch { /* parent gone */ } return; }
       if (m.t === "log" && m.log) { lastBeat = Date.now(); try { handle(m.log); } catch (e) { warn("chainwatch hub log:", e.message); } }
     });
     log(`chainwatch: HUB mode - ${wallets.length} wallets, socket owned by the runner`);

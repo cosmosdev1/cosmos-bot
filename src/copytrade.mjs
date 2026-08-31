@@ -875,7 +875,11 @@ export function startCopyTrade(deps) {
     return targetUsd(sig, unitBasis, portfolio);   // crypto: the beats, or the candle tiers
   }
 
-  async function fastOpen(sig) {
+  // The canary gate counts REAL STAGE 4 INTENTS. An order on a canary whale's token is not evidence of
+  // that: the same token is bought by the polled sweep, by non-canary children and by the old-path
+  // fallback. Only this call site knows which answer decided, so it is counted here (owner 2026-08-31,
+  // after a report claimed 71 intents that were all old-path orders placed while the canary was OFF).
+  async function fastOpen(sig, meta = {}) {
     if (state.copytrade === false) return;
     if (Date.now() < budgetPausedUntil) return;   // budget breaker: no entries until the window frees
     // The fast path IS the whale-fill path. A bot that only has the adopt flag must never take one.
@@ -954,6 +958,7 @@ export function startCopyTrade(deps) {
       if (px == null) return skip("add price out of band");
       { const rb = v2ReserveBlocked(sig, add); if (rb) return skip(rb); }
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine);
+      if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
       if (ok) buyTimes.push(Date.now());
       return;
     }
@@ -996,6 +1001,7 @@ export function startCopyTrade(deps) {
     if ((ONESHOT || V2()) && tooFarFromHisEntry(sig, execC, holdsPairSibling(positions, sig))) return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)");
     { const rb = v2ReserveBlocked(sig, target); if (rb) return skip(rb); }
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key);
+    if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
   }
 
@@ -1182,7 +1188,7 @@ export function startCopyTrade(deps) {
       .then(({ startChainWatch }) => startChainWatch({
         cosmos,
         isArmed: () => alive && state.copytrade !== false,
-        onSignal: (sig) => fastOpen(sig),
+        onSignal: (sig, meta) => fastOpen(sig, meta),
         s4Ctx: () => ({ hosted: HOSTED, v2: V2(), copytrade: state.copyFills === true }),   // stage 4 shadow: this child's own variant, compare only
       }))
       .catch((e) => warn("chainwatch failed to start:", e?.message));

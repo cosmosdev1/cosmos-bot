@@ -151,7 +151,7 @@ async function fetchRosterMap(epoch) {
     if (!r.ok) { mMerge(fleetMetrics, { rosterMapErr: 1 }); log(`roster-map HTTP ${r.status} (epoch ${epoch}) - keeping the previous map`); return; }
     const j = await r.json().catch(() => null);
     if (!j?.ready || !Array.isArray(j.users)) { mMerge(fleetMetrics, { rosterMapErr: 1 }); return; }
-    rosterMap = new Map(j.users.map((u) => [u.u, { v: Number(u.v) || 1, w: Array.isArray(u.w) ? u.w : [], at: Date.now() }]));
+    rosterMap = new Map(j.users.map((u) => [u.u, { v: Number(u.v) || 1, w: Array.isArray(u.w) ? u.w : [], h: u.h === true, at: Date.now() }]));
     rosterMapAt = Date.now(); mMerge(fleetMetrics, { rosterMapOk: 1 });
     log(`roster-map: epoch ${j.epoch} · ${rosterMap.size} users · pushing to ${kids.size} children`);
     for (const [userId] of kids) pushRoster(userId);
@@ -161,7 +161,7 @@ async function fetchRosterMap(epoch) {
 function pushRoster(userId) {
   const k = kids.get(userId), entry = rosterMap.get(userId);
   if (!k?.child || !entry) return;
-  try { k.child.send({ t: "roster", list: entry.w, version: entry.v, epoch: rosterEpoch, at: entry.at }); mMerge(fleetMetrics, { rosterPush: 1 }); } catch { /* child gone */ }
+  try { k.child.send({ t: "roster", list: entry.w, version: entry.v, epoch: rosterEpoch, at: entry.at, hosted: entry.h === true }); mMerge(fleetMetrics, { rosterPush: 1 }); } catch { /* child gone */ }
   if (s4Canary.length) { try { k.child.send({ t: "s4canary", list: s4Canary }); } catch { /* child gone */ } }   // a child that just started must know the canary list
 }
 let hub = null;
