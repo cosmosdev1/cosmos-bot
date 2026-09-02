@@ -26,7 +26,46 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   // deadlined and no counter moving at all - the `running` mutex was held by something that never
   // settled. Chasing the await is the wrong shape of fix: the mutex itself now has a deadline, and the
   // STAGE is recorded so the next stall names its own cause instead of needing an archaeology session.
-  let tickAt = 0, stage = "idle", stalls = 0;
+  // TICK LIVENESS STATE (owner 2026-09-02). A hung tick writes nothing, so the persisted evidence can
+  // never say WHICH await held it - that is the whole open Stage 4 blocker. This is updated
+  // SYNCHRONOUSLY immediately before each await and costs one object write: no I/O, no promise, no
+  // metrics call. Durable evidence is emitted only by the supervisor, only when the hard limit fires.
+  let tickAt = 0, stalls = 0, tickSeq = 0;
+  // PER-BLOCK, BECAUSE RECONCILES RUN CONCURRENTLY. The batch path reconciles several blocks at once,
+  // so a single shared "current stage" is last-writer-wins and hides the block that is actually stuck.
+  // Each in-flight block keeps its own entry and the snapshot reports the OLDEST one - which is, by
+  // construction, the operation holding the tick.
+  const tick_ = { tickId: 0, stage: "idle", stageAt: 0, retry: 0 };
+  const inflight = new Map();
+  const setStage = (name, extra) => {
+    const b = extra && "block" in extra ? extra.block : null;
+    tick_.stage = name; tick_.stageAt = Date.now(); if (extra) Object.assign(tick_, extra);
+    // Container stages are not awaits on a block: "start" and "batch" bracket the work, "idle" ends it.
+    // Only block-scoped operations compete to be the oldest, or the container always wins on age and
+    // hides the operation that is actually stuck.
+    if (name === "idle" || name === "start") { inflight.clear(); return; }
+    if (name === "batch") return;
+    if (b == null) return;
+    const key = b;
+    const cur = inflight.get(key) ?? { block: b ?? null, missing: 0, evalsPending: 0, fillId: null };
+    inflight.set(key, { ...cur, ...(extra || {}), stage: name, stageAt: Date.now() });
+  };
+  const oldestInflight = () => { let best = null; for (const v of inflight.values()) if (!best || v.stageAt < best.stageAt) best = v; return best; };
+  // The transport phase lives in the hub's evaluation client; sampled only when building a snapshot.
+  const snapshot = () => {
+    const tr = (typeof hub.transportState === "function" ? hub.transportState() : null) || null;
+    const phase = tr && !tr.bodyCompleteAt ? (tr.headersReceivedAt ? "body_read" : "waiting_headers") : tr ? "complete" : null;
+    const old = oldestInflight() ?? { stage: tick_.stage, stageAt: tick_.stageAt, block: tick_.block ?? null, fillId: tick_.fillId ?? null, missing: tick_.missing ?? 0, evalsPending: tick_.evalsPending ?? 0 };
+    const stage = old.stage === "evaluate" && phase
+      ? (phase === "waiting_headers" ? "evaluate_waiting_headers" : phase === "body_read" ? "evaluate_body_read" : "evaluate_result_processing")
+      : old.stage;
+    return { tickId: tick_.tickId, stage, block: old.block, fillId: old.fillId ?? tr?.fillId ?? null,
+      ageInStageMs: old.stageAt ? Date.now() - old.stageAt : null, tickAgeMs: tickAt ? Date.now() - tickAt : null,
+      missing: old.missing ?? 0, evalsPending: old.evalsPending ?? 0, retry: tick_.retry,
+      concurrentBlocks: inflight.size,
+      backlog: Math.max(0, (hub.sealable?.() ?? 0) - lastSealed), lastSealed, pendingBlock,
+      transport: tr ? { fillId: tr.fillId, requestStartedAt: tr.requestStartedAt, headersReceivedAt: tr.headersReceivedAt, bodyCompleteAt: tr.bodyCompleteAt, status: tr.status } : null };
+  };
   // ABANDONING BLOCKS IS THE LAST RESORT, NOT THE FIRST (measured 2026-08-31 09:03Z). A transient
   // slowdown let the backlog grow 18 -> 72 blocks over eighty seconds; the flat MAX_BEHIND clamp fired
   // and permanently abandoned 24 blocks, so no driver in them can ever be sealed. The worker reconciles
@@ -112,14 +151,14 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   const BATCH = Math.max(1, Number(process.env.COSMOS_S4_RECON_BATCH) || 4);
 
   async function reconcile(N) {
-    const t0 = Date.now(); stage = "height"; const stats = { status: "ok", head_seen_at: hub.headSeenAt?.(N + 1) ? new Date(hub.headSeenAt(N + 1)).toISOString() : null, recon_start_at: new Date(t0).toISOString() };
+    const t0 = Date.now(); setStage("height", { block: N, fillId: null, missing: 0, evalsPending: 0 }); const stats = { status: "ok", head_seen_at: hub.headSeenAt?.(N + 1) ? new Date(hub.headSeenAt(N + 1)).toISOString() : null, recon_start_at: new Date(t0).toISOString() };
     // 1. node height
     // ONE FEWER BILLED CALL PER BLOCK. Asking the node its height and then asking for the block was
     // two questions with one answer: a header that comes back IS proof the node has the block. The
     // height call now happens only on the failure path, to tell "node behind" (retry, no budget spent)
     // apart from a broken response (which does count against the block's budget). At ~40 blocks/min
     // that is a third of reconciliation's metered traffic.
-    stage = "header";
+    setStage("header", { block: N });
     const header = await hub.rpcBlockHeader(N, RPC_TIMEOUT);
     if (!header?.hash) {
       const height = await nodeHeight(N + 1);
@@ -130,14 +169,16 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
     if (seenHash && seenHash !== String(header.hash).toLowerCase()) return { ok: false, stats: { ...stats, status: "hash-mismatch", error: `stream ${seenHash.slice(0, 12)} vs node ${String(header.hash).slice(0, 12)}` } };
     const pin = String(header.hash).toLowerCase();
     // 3. logs pinned to the hash, the hub's exact filter
-    stage = "logs";
+    setStage("getLogs", { block: N });
     const rpcStart = Date.now();
     const logs = await hub.rpcLogsPinned(pin, RPC_TIMEOUT);
     const rpcMs = Date.now() - rpcStart;
     if (!Array.isArray(logs)) return { ok: false, stats: { ...stats, status: "logs-refused", rpc_ms: rpcMs, error: "eth_getLogs refused" } };
     if (logs.some((l) => String(l.blockHash || "").toLowerCase() !== pin)) return { ok: false, stats: { ...stats, status: "logs-hash-mismatch", rpc_ms: rpcMs, error: "a returned log carries another block hash" } };
     // 4. expand and diff against what the hub evaluated
+    setStage("parse", { block: N });
     const fills = logs.flatMap((l) => fillsFromLog(l, isWatched));
+    setStage("missing_fill_discovery", { block: N });
     const missing = fills.filter((f) => !s4.hasEvaluated(f.fillId));
     const dup = fills.length - missing.length;
     if (missing.length) {
@@ -145,11 +186,12 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       log(`s4 seal: block ${N} - ${missing.length} fill(s) the stream never delivered: ${missing.map((f) => f.fillId.slice(0, 18)).join(" ")} - evaluating before the seal`);
       // NO AWAIT WITHOUT A DEADLINE (the owner's standing rule): even with the hub settling its hung
       // waiters, this await must never be able to stop reconciliation for the whole fleet.
-      stage = "evaluate";
+      setStage("evaluate", { block: N, missing: missing.length, evalsPending: missing.length, fillId: missing[0]?.fillId ?? null });
       const results = await Promise.race([
         s4.evaluateNow(missing, { origin: "reconcile" }),
         new Promise((res) => setTimeout(() => res(null), EVAL_DEADLINE_MS)),
       ]);
+      setStage("evaluate_result_processing", { block: N });
       if (!results) return { ok: false, stats: { ...stats, status: "missing-eval-timeout", rpc_ms: rpcMs, logs: logs.length, fills: fills.length, missing: missing.length, duplicates: dup, error: `recovered fills did not settle in ${EVAL_DEADLINE_MS}ms` } };
       if (results.some((r) => !r.ok)) return { ok: false, stats: { ...stats, status: "missing-eval-failed", rpc_ms: rpcMs, logs: logs.length, fills: fills.length, missing: missing.length, duplicates: dup, error: "a recovered fill failed to evaluate" } };
     }
@@ -159,7 +201,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
 
   async function tick() {
     if (running || stopped) return;
-    running = true; tickAt = Date.now(); stage = "start";
+    running = true; tickAt = Date.now(); setStage("start", { tickId: ++tickSeq, block: null, fillId: null, missing: 0, evalsPending: 0, retry: attempts });
     try {
       if (!started) { await boot(); if (!started) return; }
       const sealable = hub.sealable();
@@ -203,7 +245,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       // block is only ever sealed behind its own ok reconciliation, and nothing after a failure is
       // sealed in this pass.
       if (!through && !pendingBlock && sealable - lastSealed >= 2 && BATCH > 1) {
-        stage = "batch";
+        setStage("batch");
         const last = Math.min(sealable, lastSealed + BATCH);
         const blocks = []; for (let b = lastSealed + 1; b <= last; b++) blocks.push(b);
         const results = await Promise.all(blocks.map((b) => reconcile(b).then((x) => ({ b, r: x }), (e) => ({ b, r: { ok: false, stats: { status: "threw", error: String(e?.message || e) } } }))));
@@ -213,7 +255,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
             await post("/api/v1/fill-reconcile", { block: b, hash: null, stats: rr.stats }).catch(() => {});
             log(`s4 seal: batch stopped at block ${b} (${rr.stats?.status}) - the rest of the batch is left for the next pass`);
             break; }
-          stage = "seal-post";
+          setStage("seal_post", { block: b });
           const pp = await post("/api/v1/fill-reconcile", { block: b, hash: rr.pin, stats: rr.stats });
           if (!pp.ok) { pendingBlock = b; pendingSince = Date.now(); attempts = 1; inc("s4SealErr");
             log(`s4 seal: block ${b} reconciled but the seal call failed (${pp.status}) - retry`); break; }
@@ -238,14 +280,15 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
           attempts = 0; pendingBlock = null; pendingSince = 0; if (N > lastSealed) lastSealed = N;
           return;
         } if (attempts === 1 || attempts % 10 === 0) log(`s4 seal: block ${N} not reconciled (${r.stats.status}${r.stats.error ? ": " + r.stats.error : ""}) - attempt ${attempts}, retry in ${backoff()} ms`); await post("/api/v1/fill-reconcile", { block: N, hash: null, stats: r.stats }).catch(() => {}); await new Promise((res) => setTimeout(res, backoff())); return; }
-      stage = "seal-post";
+      setStage("seal_post", { block: N });
       const p = await post("/api/v1/fill-reconcile", { block: N, hash: r.pin, stats: r.stats });
       if (!p.ok) { attempts++; if (pendingBlock !== N) { pendingBlock = N; pendingSince = Date.now(); } inc("s4SealErr"); log(`s4 seal: block ${N} reconciled but the seal call failed (${p.status}) - retry`); await new Promise((res) => setTimeout(res, backoff())); return; }
+      setStage("cursor_advance", { block: N });
       inc("s4ReconOk"); inc("s4SealOk"); attempts = 0; pendingBlock = null; pendingSince = 0;
       if (N > lastSealed) lastSealed = N;                                   // a through-block below the cursor must never walk it backwards
       if (through) { hub.resolveBlock?.(N); throughCount++; if (throughCount === 1 || throughCount % 25 === 0) log(`s4 seal: block ${N} reconciled THROUGH a pending range the stream could not close (${throughCount} so far) - resolved in the cursor`); }
     } catch (e) { attempts++; inc("s4ReconErr"); log(`s4 seal: tick error ${e?.message || e}`); await new Promise((res) => setTimeout(res, backoff())); }
-    finally { running = false; stage = "idle"; }
+    finally { running = false; setStage("idle"); }
   }
   const timer = setInterval(() => { tick(); }, poll); timer.unref?.();
   // THE MUTEX HAS A DEADLINE TOO. A tick that has held `running` for longer than TICK_HARD_MS is
@@ -257,8 +300,13 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
     const held = Date.now() - tickAt;
     if (held < TICK_HARD_MS) return;
     stalls++; inc("s4SealStuck");
-    log(`s4 seal: tick held the worker for ${Math.round(held / 1000)}s at stage "${stage}" (block ${pendingBlock ?? lastSealed + 1}) - abandoning it so reconciliation continues (${stalls} so far)`);
-    running = false; stage = "idle"; attempts++;
-  }, 15_000); supervisor.unref?.();
-  return { stop: () => { stopped = true; clearInterval(timer); clearInterval(supervisor); }, stats: () => ({ lastSealed, pendingBlock, pendingSince, attempts, through: throughCount, stalls, stage, behind: Math.max(0, hub.sealable() - lastSealed) }) };
+    // DURABLE EVIDENCE, EMITTED ONLY HERE. The healthy path never pays for this.
+    const snap = snapshot();
+    log(`s4 seal: STUCK TICK ${JSON.stringify(snap)}`);
+    log(`s4 seal: tick held the worker for ${Math.round(held / 1000)}s at stage "${snap.stage}" (block ${snap.block ?? pendingBlock ?? lastSealed + 1}) - abandoning it so reconciliation continues (${stalls} so far)`);
+    running = false; setStage("idle"); attempts++;
+    // The check interval must be shorter than the limit it enforces, or the limit is only ever
+    // observed at multiples of the interval. Production (90s) keeps the 15s cadence unchanged.
+  }, Math.min(15_000, Math.max(250, Math.floor(TICK_HARD_MS / 4)))); supervisor.unref?.();
+  return { stop: () => { stopped = true; clearInterval(timer); clearInterval(supervisor); }, stats: () => ({ lastSealed, pendingBlock, pendingSince, attempts, through: throughCount, stalls, stage: tick_.stage, tick: snapshot(), behind: Math.max(0, hub.sealable() - lastSealed) }) };
 }
