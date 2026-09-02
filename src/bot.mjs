@@ -827,6 +827,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   qtState.strategyV2 = settings.strategy_v2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");
   // STAGE 2G: server-controlled like every engine flag (shadow unless it says enforce), env override for a self-hosted test.
   qtState.entryFloorGuard = settings.entry_floor_guard === true || /^(1|true|yes|on)$/i.test(process.env.COPY_2G_ENFORCE || "");
+  // PHASE 3A: opportunity tracing. Server-controlled like every flag above, so it is genuinely hot -
+  // one cycle, no restart. A Fly secret would NOT be: changing one restarts the Machine.
+  qtState.copyTraceOn = settings.copy_trace === true;
   // The rolling buy-volume governors differ per strategy (v2 recycles inside a 1h-4h window), and
   // the server decides per user - so tell the risk clamp which profile this account is on, every
   // cycle. Without this the bot would self-limit at the v1 numbers no matter what the gate allows,
@@ -1096,6 +1099,13 @@ async function cycle(cosmos, pm) {
       dd_halt: qtState.ddHalt === true,
       engines_on: { qtable2: qtState.qtable2 === true, copytrade: qtState.copytrade === true, cert15: qtState.cert15 === true },
       copy_skips: copySkips,   // undefined on most cycles; JSON.stringify drops it
+      // PHASE 3A: bounded opportunity traces ride the heartbeat that already runs each cycle, so
+      // this adds NO bot->platform request and no serverless invocation. It is not free on the
+      // server side: a non-empty batch costs one poll_trace_merge() RPC. Measured at 3.1% of
+      // heartbeats, +1.5% DB calls on this route. drain() is synchronous, total and self-limiting;
+      // an EMPTY array returns undefined, JSON.stringify drops the field, and the route's
+      // `if (Array.isArray(rows) && rows.length)` then performs no database work at all.
+      copy_trace: (() => { try { const rows = qtState.copyTrace?.drain(Number(process.env.COPY_TRACE_BATCH) || 40) ?? []; return rows.length ? rows : undefined; } catch { return undefined; } })(),
     });
   }
 

@@ -735,6 +735,53 @@ export async function makePolymarket(config) {
       }
     },
 
+    // CONTEMPORANEOUS BOOK SNAPSHOT (Phase 3A). ONE getOrderBook call returning everything the
+    // order-time trace needs: best bid, best ask, the mid they imply, and how much USD rests at or
+    // below a limit. Phase 2 could not settle the stale-entry-cap hypothesis because no historical
+    // book is retained anywhere - the ask at the instant of the attempt is simply gone. This is the
+    // only way to capture it, and it has to be read AT the attempt, never reconstructed afterwards.
+    //
+    // Called ONLY when an order is about to be built for a traced opportunity (~2,800 times a day
+    // fleet-wide), so it adds no measurable load. Total by construction: every failure returns
+    // nulls, and NO CALLER MAY BRANCH ON IT - trading must behave identically whether this
+    // succeeds, fails, or is switched off.
+    async bookSnapshot(tokenId, limitCents, timeoutMs) {
+      try {
+        // OWN TRANSPORT, ON PURPOSE. client.getOrderBook() goes through the vendored clob-client,
+        // which calls axios({...}) with NO timeout option - and axios defaults to 0, meaning NEVER
+        // TIME OUT. A hung read there would hold a socket, the closure and the tracer reference for
+        // the life of the process: exactly the no-timeout-fetch class that froze the fleet for
+        // 12.5h on 07-21. /book is a public GET, so this is a plain fetch with a REAL abort, which
+        // also matches how every other request in this file is written.
+        const r = await fetch(`${CLOB_HOST}/book?token_id=${encodeURIComponent(tokenId)}`, {
+          signal: AbortSignal.timeout(Number(timeoutMs) > 0 ? Number(timeoutMs) : 2500),
+        });
+        if (!r.ok) return null;
+        const book = await r.json();
+        const asks = book?.asks || book?.sells || [];
+        const bids = book?.bids || book?.buys || [];
+        const px = (x) => Number(x?.price ?? x?.[0] ?? 0);
+        const sz = (x) => Number(x?.size ?? x?.[1] ?? 0);
+        let bestBid = 0, bestAsk = 0;
+        for (const b of bids) { const p = px(b); if (p > bestBid && sz(b) > 0) bestBid = p; }
+        for (const a of asks) { const p = px(a); if (sz(a) > 0 && (bestAsk === 0 || p < bestAsk)) bestAsk = p; }
+        const lim = Number(limitCents) > 0 ? Number(limitCents) / 100 : null;
+        let depthUsd = 0, levels = 0;
+        if (lim != null) {
+          for (const a of asks) { const p = px(a), s = sz(a); if (s > 0 && p > 0 && p <= lim) { depthUsd += p * s; levels++; } }
+        }
+        return {
+          bid: bestBid > 0 ? Math.round(bestBid * 100) : null,
+          ask: bestAsk > 0 ? Math.round(bestAsk * 100) : null,
+          mid: bestBid > 0 && bestAsk > 0 ? Math.round(((bestBid + bestAsk) / 2) * 100) : null,
+          depthUsd: lim != null ? Math.round(depthUsd * 100) / 100 : null,
+          askLevels: lim != null ? levels : null,
+        };
+      } catch {
+        return { bid: null, ask: null, mid: null, depthUsd: null, askLevels: null };
+      }
+    },
+
     // STAGE 2E LIVE TRACE - TEMPORARY AND BOUNDED. Remove once the invariant is confirmed.
     // Console only, never the database: a per-event DB write is what made scan_runs a 3.5M-row
     // problem. Hard-capped per process (default 25) so a busy bot cannot turn this into a log flood,
