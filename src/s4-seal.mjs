@@ -31,6 +31,7 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
   // SYNCHRONOUSLY immediately before each await and costs one object write: no I/O, no promise, no
   // metrics call. Durable evidence is emitted only by the supervisor, only when the hard limit fires.
   let tickAt = 0, stalls = 0, tickSeq = 0;
+  const stuckQ = [];   // bounded; drained by the runner onto the existing metrics payload
   // PER-BLOCK, BECAUSE RECONCILES RUN CONCURRENTLY. The batch path reconciles several blocks at once,
   // so a single shared "current stage" is last-writer-wins and hides the block that is actually stuck.
   // Each in-flight block keeps its own entry and the snapshot reports the OLDEST one - which is, by
@@ -301,12 +302,19 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
     if (held < TICK_HARD_MS) return;
     stalls++; inc("s4SealStuck");
     // DURABLE EVIDENCE, EMITTED ONLY HERE. The healthy path never pays for this.
-    const snap = snapshot();
+    const snap = { ...snapshot(), supervisorAt: new Date().toISOString(), heldMs: held, abortStage: "supervisor_hard_timeout" };
     log(`s4 seal: STUCK TICK ${JSON.stringify(snap)}`);
+    // DURABLE EVIDENCE RIDES THE EXISTING METRICS POST. A hung tick's stage is the whole point of this
+    // instrumentation and Fly stdout is ephemeral, so the snapshot is queued for the runner's next
+    // metrics flush - no new transport, no request from the supervisor, and nothing here can block
+    // recovery: the queue is bounded and the tick is already abandoned by this point.
+    stuckQ.push(snap); while (stuckQ.length > 20) stuckQ.shift();
     log(`s4 seal: tick held the worker for ${Math.round(held / 1000)}s at stage "${snap.stage}" (block ${snap.block ?? pendingBlock ?? lastSealed + 1}) - abandoning it so reconciliation continues (${stalls} so far)`);
     running = false; setStage("idle"); attempts++;
     // The check interval must be shorter than the limit it enforces, or the limit is only ever
     // observed at multiples of the interval. Production (90s) keeps the 15s cadence unchanged.
   }, Math.min(15_000, Math.max(250, Math.floor(TICK_HARD_MS / 4)))); supervisor.unref?.();
-  return { stop: () => { stopped = true; clearInterval(timer); clearInterval(supervisor); }, stats: () => ({ lastSealed, pendingBlock, pendingSince, attempts, through: throughCount, stalls, stage: tick_.stage, tick: snapshot(), behind: Math.max(0, hub.sealable() - lastSealed) }) };
+  return { stop: () => { stopped = true; clearInterval(timer); clearInterval(supervisor); },
+    drainStuck: () => stuckQ.splice(0, stuckQ.length),
+    returnStuck: (rows) => { for (const r of rows ?? []) stuckQ.push(r); while (stuckQ.length > 20) stuckQ.shift(); }, stats: () => ({ lastSealed, pendingBlock, pendingSince, attempts, through: throughCount, stalls, stage: tick_.stage, tick: snapshot(), behind: Math.max(0, hub.sealable() - lastSealed) }) };
 }

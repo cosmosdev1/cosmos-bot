@@ -89,7 +89,10 @@ async function flushMetrics() {
   m.complete = kids.size > 0 && reporters.size >= kids.size ? 1 : 0;
   fillIds = new Set();
   reporters = new Set();
-  if (!m.ev && !m.cc && !m.reap && !m.fills && !m.s4Sent && !m.s4Recv) return;   // nothing happened - do not write a row saying so
+  // A STUCK TICK MUST ALWAYS BE WRITTEN, even in an otherwise idle interval - it is the evidence the
+  // whole liveness instrumentation exists to capture. Drained here, off the reconciliation path.
+  const stuckTicks = (() => { try { return sealWorker?.drainStuck?.() ?? []; } catch { return []; } })();
+  if (!m.ev && !m.cc && !m.reap && !m.fills && !m.s4Sent && !m.s4Recv && !stuckTicks.length) return;   // nothing happened - do not write a row saying so
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), 15_000);
   // Build the body first, and never let a bad sample take the counters down with it: the samples
@@ -104,12 +107,17 @@ async function flushMetrics() {
     const rosters = [...childRoster.entries()].filter(([u]) => kids.has(u)).map(([u, r]) => { const v = rosterMap.get(u), ack = childAck.get(u); return { u, at: r.at, src: r.source, n: r.n, w: r.list, vr: v ? { version: v.v, at: v.at, n: v.w.length, w: v.w.slice(0, 250) } : null, ack: ack || null, dd: childDd.get(u) || null }; });
     // a pushed roster the child never acknowledged within 60 s is an IPC delivery failure - counted
     for (const [u, v] of rosterMap) { if (kids.has(u) && Date.now() - v.at > 60_000 && (childAck.get(u)?.version ?? 0) < v.v) mMerge(fleetMetrics, { rosterAckMiss: 1 }); }
-    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples, rosters, epoch: rosterEpoch });
+    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples, rosters, stuckTicks, epoch: rosterEpoch });
   } catch (e) { warnFlush(`body build failed: ${e.message}`); clearTimeout(t); return; }
   try {
     const r = await fetch(`${API}/api/cloud/runner/metrics`, { method: "POST", headers: { "content-type": "application/json", "x-runner-secret": SECRET }, body, signal: ctl.signal });
-    if (!r.ok) warnFlush(`metrics POST ${r.status}`);
-  } catch (e) { warnFlush(`metrics POST failed: ${e.message}`); }   // observability must never disturb the fleet; the interval is lost, but not silently
+    if (!r.ok) { warnFlush(`metrics POST ${r.status}`); try { sealWorker?.returnStuck?.(stuckTicks); } catch { /* bounded queue */ } }
+  } catch (e) {
+    warnFlush(`metrics POST failed: ${e.message}`);   // observability must never disturb the fleet; the interval is lost, but not silently
+    // A LOST INTERVAL OF COUNTERS IS FINE; A LOST STUCK-TICK SNAPSHOT IS NOT. It is the one piece of
+    // evidence this instrumentation exists for, so it goes back on the bounded queue for the next flush.
+    try { sealWorker?.returnStuck?.(stuckTicks); } catch { /* bounded queue */ }
+  }
   finally { clearTimeout(t); }
 }
 if (METRICS_MS > 0) setInterval(() => { flushMetrics().catch(() => {}); }, METRICS_MS).unref?.();
