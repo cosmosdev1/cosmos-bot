@@ -830,6 +830,8 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // PHASE 3A: opportunity tracing. Server-controlled like every flag above, so it is genuinely hot -
   // one cycle, no restart. A Fly secret would NOT be: changing one restarts the Machine.
   qtState.copyTraceOn = settings.copy_trace === true;
+  // SPORTS/ESPORTS CLOCK (2026-09-02): server-controlled, one cycle, no restart. Default off.
+  qtState.clockV2 = settings.clock_v2 === true;
   // The rolling buy-volume governors differ per strategy (v2 recycles inside a 1h-4h window), and
   // the server decides per user - so tell the risk clamp which profile this account is on, every
   // cycle. Without this the bot would self-limit at the v1 numbers no matter what the gate allows,

@@ -252,11 +252,33 @@ const V2_MIN_MS = (() => { const v = Number(process.env.COPY_V2_MIN_RESOLUTION_H
 // shared by dozens of matches - so a window computed from it was fiction: 288 of 310 apparent
 // pass-throughs in one 24h audit were phantom. event_at when present, end_date as the fallback;
 // missing both -> other gates decide, never guess.
+// SPORTS / ESPORTS CLOCK EXTENSION (2026-09-02). Live-flagged: the server delivers clock_v2 every
+// cycle (bot.mjs -> state.clockV2), so it switches fleet-wide within a cycle with no restart. Env is
+// the dev override. Measured before building it: 152 window_dead opportunities per healthy account-day,
+// all fresh whale fills, median 1.4-1.6h after kickoff. The extension moves only the CLOCK; every
+// other gate - the 20% price gate above all - still applies to the in-play price.
+const CLOCK_SPORTS_H = (() => { const v = Number(process.env.COPY_CLOCK_SPORTS_H); return Number.isFinite(v) && v >= 0 ? v : 2; })();
+const CLOCK_ESPORTS_H = (() => { const v = Number(process.env.COPY_CLOCK_ESPORTS_H); return Number.isFinite(v) && v >= 0 ? v : 4; })();
+const ESPORTS_RE = /counter-strike|league of legends|\bcs2\b|\bcs:?go\b|dota|valorant|esports?|\bmap \d|overwatch|rocket league|\blol\b|\bbo[35]\b/i;
+const SPORTS_RE = /\bvs\.?\b|o\/u|over\/under|spread:|moneyline|handicap|1st half|2nd half|clean sheet|exact score|to win|\bwin on \d{4}-\d{2}-\d{2}\b|\bFC\b/i;
+/** which extension applies: "esports" | "sports" | null. Feed category first, question text second. */
+const clockClass = (sig) => {
+  const q = String(sig?.market_question ?? "");
+  if (ESPORTS_RE.test(q)) return "esports";
+  if (String(sig?.category ?? "").toUpperCase() === "SPORTS" || SPORTS_RE.test(q)) return "sports";
+  return null;
+};
+let clockV2On = () => false;   // rebound by startCopyTrade to the live server flag
+const clockExtMs = (sig) => {
+  if (!clockV2On()) return 0;
+  const c = clockClass(sig);
+  return c === "esports" ? CLOCK_ESPORTS_H * 3600_000 : c === "sports" ? CLOCK_SPORTS_H * 3600_000 : 0;
+};
 const v2ClockMs = (sig) => {
   const ev = Date.parse(String(sig?.wallets?.[0]?.event_at ?? ""));
-  if (Number.isFinite(ev)) return ev;
+  if (Number.isFinite(ev)) return ev + clockExtMs(sig);
   const end = Date.parse(String(sig?.end_date ?? ""));
-  return Number.isFinite(end) ? end : NaN;
+  return Number.isFinite(end) ? end + clockExtMs(sig) : NaN;
 };
 const outsideV2Window = (sig, v2) => {
   if (!v2) return false;
@@ -830,6 +852,7 @@ export function startCopyTrade(deps) {
   // Live state, not a boot-time constant: the server delivers strategy_v2 every cycle (bot.mjs),
   // so the fleet switches without restarts. Env stays as a dev override.
   const V2 = () => state.strategyV2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");
+  clockV2On = () => state.clockV2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_CLOCK_V2 || "");
   const V2_FLOOR_USD = Number(process.env.COPY_V2_FLOOR_USD) || 2;
   // Crypto cash reserve: the LAST 10% of the portfolio is crypto-only. A NON-candle buy needs cash
   // >= 10% of portfolio before it and may not take cash under 6% after. Candles spend freely.
