@@ -155,7 +155,12 @@ function closeOutCloudOrder(r, kind) {
     orderRowId,
     filledSizeUsd,
     polymarketOrderId: r?.body?.polymarket?.orderID ?? null,
-    error: kind === "filled" ? null : (r?.cloudCode || r?.body?.polymarket?.error || r?.status || "not filled"),
+    // DELAYED VERDICT ON THE ROW (2026-09-03): the platform stores `error` as free text and derives
+    // status from filledSizeUsd alone, so a delayed outcome is annotated on both paths. Unresolved
+    // (ambiguous) verdicts never reach here on purpose: reporting 0 would release the exposure.
+    error: kind === "filled"
+      ? (m.delayed ? `delayed:${m.delayed_state || "terminal"}` : null)
+      : (m.delayed ? `delayed:${m.delayed_state || "terminal"} | ` : "") + (r?.cloudCode || r?.body?.polymarket?.error || r?.status || "not filled"),
   }).catch(() => {});
 }
 
