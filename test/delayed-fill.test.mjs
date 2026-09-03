@@ -132,7 +132,8 @@ test("case 7: repeated polling cannot double-book: one verdict, one fill object,
   const r = await settlePlacement({ resp: delayedResp(), side: "BUY", size: 10, priceCents: 80, client: v, tokenId: TOK, opts: fast(c) });
   assert.equal(r.kind, "filled");
   assert.equal(v.calls.getOrder, 1, "stops at the first terminal record");
-  assert.equal(v.calls.getTrades, 1);
+  // v3: one own-trades read per poll (empty here) + one read per associate trade id; never more.
+  assert.ok(v.calls.getTrades <= 2, `trades read at most twice (${v.calls.getTrades})`);
   assert.deepEqual(r.fill, { shares: 10, priceCents: 79 });
 });
 

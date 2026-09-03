@@ -217,6 +217,7 @@ const DELAYED_POLL_MS = Math.max(3000, Number(process.env.COPY_DELAYED_POLL_MS) 
 const DELAYED_POLL_EVERY_MS = 500;
 const DELAYED_CALL_MS = 2500;   // deadline on EACH venue read: a hung read must never hold the loop
 const DELAYED_AMBIGUOUS_HOLD_MS = Math.max(30_000, Number(process.env.COPY_DELAYED_HOLD_MS) || 300_000);
+const DELAYED_SELL_HOLD_MS = Math.max(15_000, Number(process.env.COPY_DELAYED_SELL_HOLD_MS) || 90_000);
 const delayedLocks = new Map(); // `${tokenId}|${SIDE}` -> { orderID, since, until, state }
 
 const lockKey = (tokenId, side) => `${String(tokenId)}|${String(side).toUpperCase()}`;
@@ -259,7 +260,16 @@ function raceTimeout(promise, ms, label) {
 async function readOrderRecord(client, orderID, callMs) {
   try {
     const o = await raceTimeout(Promise.resolve().then(() => client.getOrder(orderID)), callMs, "getOrder");
-    if (o && typeof o === "object") return { record: o, missing: false, error: false };
+    // The CLOB client does not throw on an HTTP error (throwOnError is off): it hands back the body
+    // as `{ error, status }`. That is never an order record. 404 = the venue has no such record
+    // (a matched or killed FAK is not an open order); anything else is a transport-class error.
+    if (o && typeof o === "object" && "error" in o && !("id" in o) && !("size_matched" in o)) {
+      const code = Number(o.status);
+      const msg = String(o.error ?? "");
+      const missing = code === 404 || /not found|no order/i.test(msg);
+      return { record: null, missing, error: !missing };
+    }
+    if (o && typeof o === "object" && ("id" in o || "size_matched" in o || "status" in o)) return { record: o, missing: false, error: false };
     return { record: null, missing: true, error: false };
   } catch (e) {
     const s = String(e?.message ?? e);
@@ -288,12 +298,42 @@ async function fillFromTrades(client, record, callMs) {
   return { shares: round2(shares), priceCents: Math.round((usd / shares) * 10000) / 100, priceSource: "trades" };
 }
 
-// Follow a delayed order to its verdict. Terminal = the record says MATCHED/CANCELED/EXPIRED/KILLED
-// or size_matched reached original_size. Returns { fill, state, waitedMs, polls }; fill is
-// { shares: 0 } for a verified kill, { shares, priceCents } for a fill, null when unresolved.
+// The account's recent trades on this token that belong to OUR order: the venue stamps the taker's
+// order id on each trade (taker_order_id) and lists maker order ids under maker_orders. Returns the
+// fill from those trades, or null when none are visible yet. Trades in a failed state are ignored.
+async function fillFromOwnTrades(client, tokenId, orderID, side, callMs) {
+  if (!tokenId || typeof client?.getTrades !== "function") return null;
+  let trades;
+  try { trades = await raceTimeout(Promise.resolve().then(() => client.getTrades({ asset_id: String(tokenId) }, true)), callMs, "getTrades"); } catch { return null; }
+  if (!Array.isArray(trades)) return null;
+  const mine = trades.filter((t) => t && (String(t.taker_order_id ?? "") === String(orderID)
+    || (Array.isArray(t.maker_orders) && t.maker_orders.some((m) => String(m?.order_id ?? "") === String(orderID))))
+    && !/FAILED|RETRYING/i.test(String(t.status ?? "")));
+  if (!mine.length) return null;
+  let shares = 0, usd = 0;
+  for (const t of mine) {
+    // A trade where we were a MAKER carries the whole taker size; take only our maker leg then.
+    let sz = num(t.size), px = num(t.price);
+    if (String(t.taker_order_id ?? "") !== String(orderID) && Array.isArray(t.maker_orders)) {
+      const leg = t.maker_orders.find((m) => String(m?.order_id ?? "") === String(orderID));
+      const legSz = num(leg?.matched_amount); const legPx = num(leg?.price);
+      if (legSz != null) sz = legSz; if (legPx != null) px = legPx;
+    }
+    if (sz == null || px == null || !(sz > 0) || !(px > 0) || px > 1) continue;
+    shares += sz; usd += sz * px;
+  }
+  if (!(shares > 0)) return null;
+  return { shares: round2(shares), priceCents: Math.round((usd / shares) * 10000) / 100, priceSource: "own_trades", trades: mine.length };
+}
+
+// Follow a delayed order to its verdict. Terminal = the venue's trades name our order (source of
+// truth for a taker fill), or the record says MATCHED/CANCELED/EXPIRED/KILLED, or size_matched
+// reached original_size. Returns { fill, state, waitedMs, polls }; fill is { shares: 0 } for a
+// verified kill, { shares, priceCents } for a fill, null when unresolved.
 export async function awaitDelayedFill(client, orderID, side, reqShares, limitCents, opts = {}) {
   const pollMs = opts.pollMs ?? DELAYED_POLL_MS, everyMs = opts.everyMs ?? DELAYED_POLL_EVERY_MS;
   const callMs = opts.callMs ?? DELAYED_CALL_MS, now = opts.now ?? Date.now, sleep = opts.sleep ?? defaultSleep;
+  const tokenId = opts.tokenId ?? null;
   const t0 = now();
   let last = null, polls = 0, missing = 0, errors = 0;
   const finalize = async (rec, matched, state) => {
@@ -307,6 +347,9 @@ export async function awaitDelayedFill(client, orderID, side, reqShares, limitCe
   };
   while (now() - t0 < pollMs) {
     await sleep(everyMs); polls++;
+    // Trades first: a matched FAK leaves no open-order record, but its trades are visible at once.
+    const own = await fillFromOwnTrades(client, tokenId, orderID, side, callMs);
+    if (own) return { fill: own, state: `terminal:trades(${own.trades})`, waitedMs: now() - t0, polls, missing, errors };
     const r = await readOrderRecord(client, orderID, callMs);
     if (r.error) { errors++; continue; }
     if (!r.record) { missing++; continue; }
@@ -342,7 +385,7 @@ export async function settlePlacement({ resp, side, size, priceCents, client, to
   delayedLocks.set(key, { orderID: resp.orderID, since: now(), until: null, state: "pending" });
   let settled;
   try {
-    settled = await awaitDelayedFill(client, resp.orderID, side, size, priceCents, opts);
+    settled = await awaitDelayedFill(client, resp.orderID, side, size, priceCents, { ...opts, tokenId });
   } catch (e) {
     settled = { fill: null, state: `settle_error:${String(e?.message ?? e).slice(0, 60)}`, waitedMs: 0, polls: 0 };
   }
@@ -355,7 +398,10 @@ export async function settlePlacement({ resp, side, size, priceCents, client, to
     const fill = settled.fill.shares > 0 ? { shares: settled.fill.shares, priceCents: settled.fill.priceCents } : { shares: 0 };
     return { kind: fill.shares > 0 ? "filled" : "killed", fill, meta };
   }
-  delayedLocks.set(key, { orderID: resp.orderID, since: now(), until: now() + holdMs, state: settled.state });
+  // BUYs hold for the full window (a whale re-trigger must not re-fire); SELLs hold briefly, so an
+  // exit that may still be settling is not re-posted on top of itself, then flow again.
+  const hold = String(side).toUpperCase() === "SELL" ? Math.min(holdMs, opts.sellHoldMs ?? DELAYED_SELL_HOLD_MS) : holdMs;
+  delayedLocks.set(key, { orderID: resp.orderID, since: now(), until: now() + hold, state: settled.state });
   return { kind: "ambiguous", fill: null, meta: { ...meta, fill_unknown: true }, error: `delayed order unresolved (${settled.state})` };
 }
 
@@ -980,7 +1026,7 @@ export async function makePolymarket(config) {
       // a SELL is refused only while its own delayed sell is still pending (exits must flow).
       {
         const dl = delayedLockFor(tokenId, side);
-        if (dl && (side === "BUY" || dl.state === "pending")) {
+        if (dl) {
           console.warn(`[polymarket] ${side} refused: delayed order ${dl.state} on this token (${String(dl.orderID).slice(0, 12)}...)`);
           return { ok: false, status: 409, cloudCode: "delayed_inflight", cloudDefinitive: true,
                    body: { polymarket: { error: `delayed order ${dl.state} on this token` } },
