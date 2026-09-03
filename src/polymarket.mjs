@@ -202,6 +202,163 @@ function invalidateBalanceCache() { balCache = { at: 0, usd: null }; }
 // cannot discriminate units on its own: div cancels out of usd/shares, so priceC is identical for
 // both readings. The magnitude cap is the ONLY unit discriminator, which is why each side needs the
 // correct one rather than a shared approximation.)
+// ---------------------------------------------------------------------------------------------
+// DELAYED PLACEMENTS (2026-09-03). Sports markets under live conditions hold every marketable
+// order in a delay window; the venue answers `status: "delayed"` with EMPTY amounts and matches
+// seconds later. Reading that first answer as "0 shares" booked nothing while the venue filled
+// everything: 328 of 336 such "kills" in 7 days were real fills ($1,907 unbooked), both sides of
+// the same match were bought blind because the gate saw no exposure, exits never managed the
+// positions, and two accounts were drained to $0 in 30 minutes. From here on a delayed placement is
+// UNRESOLVED EXECUTION STATE: follow the venue's order record to a terminal verdict and book what
+// matched (from the venue's trades, never from the request); if no verdict arrives, classify the
+// placement AMBIGUOUS (fill_unknown, exposure stays counted) and refuse a re-post on the same
+// (token, side) until the record resolves or the hold window expires.
+const DELAYED_POLL_MS = Math.max(3000, Number(process.env.COPY_DELAYED_POLL_MS) || 12_000);
+const DELAYED_POLL_EVERY_MS = 500;
+const DELAYED_CALL_MS = 2500;   // deadline on EACH venue read: a hung read must never hold the loop
+const DELAYED_AMBIGUOUS_HOLD_MS = Math.max(30_000, Number(process.env.COPY_DELAYED_HOLD_MS) || 300_000);
+const delayedLocks = new Map(); // `${tokenId}|${SIDE}` -> { orderID, since, until, state }
+
+const lockKey = (tokenId, side) => `${String(tokenId)}|${String(side).toUpperCase()}`;
+const defaultSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : null; };
+const round2 = (n) => Math.round(n * 100) / 100;
+
+// The active lock on (token, side), or null. A lock with an `until` expires by itself; a pending
+// lock (until === null) lives exactly as long as the settle loop that owns it.
+export function delayedLockFor(tokenId, side, now = Date.now()) {
+  const k = lockKey(tokenId, side);
+  const l = delayedLocks.get(k);
+  if (!l) return null;
+  if (l.until != null && now >= l.until) { delayedLocks.delete(k); return null; }
+  return l;
+}
+export function _resetDelayedLocks() { delayedLocks.clear(); }
+
+// A placement is delayed when the venue says so, or when it handed back an orderID with no
+// readable amounts at all (older responses omit `status`). An explicit matched/live/unmatched
+// status is never delayed: matched-with-zero is a genuine empty fill.
+export function isDelayedPlacement(resp, fill) {
+  if (!resp || typeof resp !== "object") return false;
+  const st = String(resp.status ?? "").toLowerCase();
+  if (st === "delayed") return true;
+  if (st === "matched" || st === "live" || st === "unmatched") return false;
+  const empty = (v) => v === undefined || v === null || v === "" || Number(v) === 0;
+  if (!resp.orderID) return false;
+  return (!fill || !(fill.shares > 0)) && empty(resp.takingAmount) && empty(resp.makingAmount);
+}
+
+function raceTimeout(promise, ms, label) {
+  let t;
+  const timer = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${label} timeout after ${ms}ms`)), ms); if (t.unref) t.unref(); });
+  return Promise.race([promise, timer]).finally(() => clearTimeout(t));
+}
+
+// One read of the venue's order record. missing = the venue says it has no such record (a FAK the
+// book killed can vanish); error = transport/timeout (says nothing about the order).
+async function readOrderRecord(client, orderID, callMs) {
+  try {
+    const o = await raceTimeout(Promise.resolve().then(() => client.getOrder(orderID)), callMs, "getOrder");
+    if (o && typeof o === "object") return { record: o, missing: false, error: false };
+    return { record: null, missing: true, error: false };
+  } catch (e) {
+    const s = String(e?.message ?? e);
+    const missing = /\b404\b|not found|no order/i.test(s);
+    return { record: null, missing, error: !missing };
+  }
+}
+
+// The venue's own trades for this order: exact shares and the real average price (a marketable
+// order fills at the book, not at our cap). Null when unavailable; the caller falls back to the
+// record's size_matched at the limit price and says so in the meta.
+async function fillFromTrades(client, record, callMs) {
+  const ids = Array.isArray(record?.associate_trades) ? record.associate_trades.filter(Boolean) : [];
+  if (!ids.length || typeof client?.getTrades !== "function") return null;
+  let shares = 0, usd = 0;
+  for (const id of ids) {
+    let trades;
+    try { trades = await raceTimeout(Promise.resolve().then(() => client.getTrades({ id }, true)), callMs, "getTrades"); } catch { return null; }
+    for (const t of Array.isArray(trades) ? trades : []) {
+      const sz = num(t?.size), px = num(t?.price);
+      if (sz == null || px == null || !(sz > 0) || !(px > 0) || px > 1) continue;
+      shares += sz; usd += sz * px;
+    }
+  }
+  if (!(shares > 0)) return null;
+  return { shares: round2(shares), priceCents: Math.round((usd / shares) * 10000) / 100, priceSource: "trades" };
+}
+
+// Follow a delayed order to its verdict. Terminal = the record says MATCHED/CANCELED/EXPIRED/KILLED
+// or size_matched reached original_size. Returns { fill, state, waitedMs, polls }; fill is
+// { shares: 0 } for a verified kill, { shares, priceCents } for a fill, null when unresolved.
+export async function awaitDelayedFill(client, orderID, side, reqShares, limitCents, opts = {}) {
+  const pollMs = opts.pollMs ?? DELAYED_POLL_MS, everyMs = opts.everyMs ?? DELAYED_POLL_EVERY_MS;
+  const callMs = opts.callMs ?? DELAYED_CALL_MS, now = opts.now ?? Date.now, sleep = opts.sleep ?? defaultSleep;
+  const t0 = now();
+  let last = null, polls = 0, missing = 0, errors = 0;
+  const finalize = async (rec, matched, state) => {
+    const sh = matched == null ? 0 : round2(matched);
+    if (!(sh > 0)) return { fill: { shares: 0 }, state, waitedMs: now() - t0, polls, missing, errors };
+    const fromTrades = await fillFromTrades(client, rec, callMs);
+    if (fromTrades && Math.abs(fromTrades.shares - sh) <= Math.max(0.01, sh * 0.02)) return { fill: fromTrades, state, waitedMs: now() - t0, polls, missing, errors };
+    const px = num(rec?.price);
+    const priceCents = px != null && px > 0 && px <= 1 ? Math.round(px * 10000) / 100 : limitCents;
+    return { fill: { shares: sh, priceCents, priceSource: "limit" }, state, waitedMs: now() - t0, polls, missing, errors };
+  };
+  while (now() - t0 < pollMs) {
+    await sleep(everyMs); polls++;
+    const r = await readOrderRecord(client, orderID, callMs);
+    if (r.error) { errors++; continue; }
+    if (!r.record) { missing++; continue; }
+    last = r.record;
+    const matched = num(last.size_matched ?? last.sizeMatched);
+    const original = num(last.original_size ?? last.originalSize) ?? reqShares;
+    const st = String(last.status ?? "").toUpperCase();
+    const terminal = st === "MATCHED" || st === "CANCELED" || st === "CANCELLED" || st === "EXPIRED" || st === "KILLED"
+      || (matched != null && original > 0 && matched >= original - 0.005);
+    if (!terminal) continue;
+    return finalize(last, matched, `terminal:${st || "full"}`);
+  }
+  // Deadline. A FAK that matched after the delay matches ONCE, so a partial we already saw is
+  // final; anything else stays unresolved (never a zero-fill).
+  const lastMatched = num(last?.size_matched ?? last?.sizeMatched);
+  if (last && lastMatched != null && lastMatched > 0) return finalize(last, lastMatched, "partial_at_deadline");
+  const state = last ? "pending_at_deadline" : (missing > 0 && errors === 0 ? "record_missing" : "unreachable");
+  return { fill: null, state, waitedMs: now() - t0, polls, missing, errors };
+}
+
+// The verdict for one placement. kind: immediate (not delayed; fill is extractFill's reading),
+// filled, killed (venue-verified empty), ambiguous (unresolved: caller must return the
+// fill_unknown class and MUST NOT re-post). Holds the (token, side) lock while pending; keeps it
+// for the hold window after an ambiguous verdict; releases it on any terminal verdict.
+export async function settlePlacement({ resp, side, size, priceCents, client, tokenId, opts = {} }) {
+  const fill0 = resp ? extractFill(resp, side, size, priceCents) : null;
+  if (!isDelayedPlacement(resp, fill0)) return { kind: "immediate", fill: fill0, meta: {} };
+  const now = opts.now ?? Date.now;
+  const holdMs = opts.holdMs ?? DELAYED_AMBIGUOUS_HOLD_MS;
+  const meta = { delayed: true };
+  if (!resp.orderID) return { kind: "ambiguous", fill: null, meta: { ...meta, fill_unknown: true, delayed_state: "no_orderid" }, error: "delayed placement without orderID" };
+  const key = lockKey(tokenId, side);
+  delayedLocks.set(key, { orderID: resp.orderID, since: now(), until: null, state: "pending" });
+  let settled;
+  try {
+    settled = await awaitDelayedFill(client, resp.orderID, side, size, priceCents, opts);
+  } catch (e) {
+    settled = { fill: null, state: `settle_error:${String(e?.message ?? e).slice(0, 60)}`, waitedMs: 0, polls: 0 };
+  }
+  meta.delayed_state = settled.state;
+  meta.delayed_wait_ms = settled.waitedMs;
+  meta.delayed_polls = settled.polls;
+  if (settled.fill) {
+    delayedLocks.delete(key);
+    if (settled.fill.priceSource) meta.delayed_price_source = settled.fill.priceSource;
+    const fill = settled.fill.shares > 0 ? { shares: settled.fill.shares, priceCents: settled.fill.priceCents } : { shares: 0 };
+    return { kind: fill.shares > 0 ? "filled" : "killed", fill, meta };
+  }
+  delayedLocks.set(key, { orderID: resp.orderID, since: now(), until: now() + holdMs, state: settled.state });
+  return { kind: "ambiguous", fill: null, meta: { ...meta, fill_unknown: true }, error: `delayed order unresolved (${settled.state})` };
+}
+
 function extractFill(resp, side, reqShares, limitCents) {
   const t = Number(resp?.takingAmount), m = Number(resp?.makingAmount);
   if (!Number.isFinite(t) || !Number.isFinite(m)) return null;
@@ -816,6 +973,20 @@ export async function makePolymarket(config) {
       // LOCAL RISK CAP — BUYS ONLY (sells must always be allowed: never trap open money). Clamps the
       // shares to the per-fill %-of-portfolio ceiling and the rolling hour/day buy-volume governors,
       // all computed from the bot's OWN portfolio, never from Cosmos. A hostile server cannot widen it.
+      // UNRESOLVED DELAYED ORDER ON THIS TOKEN (2026-09-03): a whale re-trigger inside the venue's
+      // delay window used to land a second (and third) order on the same market while the first
+      // was quietly filling. Refuse it definitively - no retry, nothing signed - until the first
+      // order's record resolves or the ambiguous hold expires. BUYs are refused for the whole hold;
+      // a SELL is refused only while its own delayed sell is still pending (exits must flow).
+      {
+        const dl = delayedLockFor(tokenId, side);
+        if (dl && (side === "BUY" || dl.state === "pending")) {
+          console.warn(`[polymarket] ${side} refused: delayed order ${dl.state} on this token (${String(dl.orderID).slice(0, 12)}...)`);
+          return { ok: false, status: 409, cloudCode: "delayed_inflight", cloudDefinitive: true,
+                   body: { polymarket: { error: `delayed order ${dl.state} on this token` } },
+                   meta: { market: tokenId, side: side.toLowerCase(), size: 0, price: priceCents, delayed_inflight: true } };
+        }
+      }
       if (side === "BUY") {
         if (fleetHalted()) {
           console.warn(`[fleetstate] BUY refused: fleet is HALTED · token ${String(tokenId).slice(0, 12)}`);
@@ -910,7 +1081,17 @@ export async function makePolymarket(config) {
           // fill, and turn a zero-fill kill into ok:false so no phantom trade is ever recorded.
           meta.req_size = size;               // shares we ASKED for
           meta.limit_price = priceCents;      // the FAK cap we signed (cents)
-          const fill = resp ? extractFill(resp, side, size, priceCents) : null;
+          // DELAYED PLACEMENT (2026-09-03): the first answer is not the verdict on a live sports
+          // market. settlePlacement follows the venue record; ambiguous = unresolved, never zero.
+          const verdict = await settlePlacement({ resp, side, size, priceCents, client: c, tokenId });
+          Object.assign(meta, verdict.meta);
+          if (verdict.kind === "ambiguous") {
+            // fill_unknown keeps the platform counting this exposure in full (fail-closed against
+            // the 7% cap); status 409 is not rejected:true, so no fallback re-post can fire; the
+            // (token, side) lock refuses the next attempt until the record resolves or the hold ends.
+            return { ok: false, status: 409, body: { polymarket: { ...resp, error: verdict.error } }, meta: { ...meta, size: 0 } };
+          }
+          const fill = verdict.fill;
           if (!fill) {
             meta.fill_unknown = true;         // response carried no readable fill info — report the request, flagged, never guessed
           } else if (!(fill.shares > 0)) {
