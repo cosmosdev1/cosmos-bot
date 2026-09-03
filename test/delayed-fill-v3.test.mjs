@@ -11,7 +11,8 @@ const delayedResp = (orderID = "0xabc") => ({ success: true, status: "delayed", 
 const TOK = "111222333";
 const fast = (c, extra = {}) => ({ now: c.now, sleep: c.sleep, pollMs: 12_000, everyMs: 500, callMs: 50, holdMs: 300_000, ...extra });
 const notFound = { error: "order not found", status: 404 };
-const trade = (o) => ({ id: "t1", taker_order_id: "0xabc", asset_id: TOK, side: "SELL", size: "4.22", price: "1.0", status: "MATCHED", maker_orders: [], ...o });
+// match_time "1002" = 2 s after the virtual placement at 1000 s (clock base 1,000,000 ms)
+const trade = (o) => ({ id: "t1", taker_order_id: "0xabc", asset_id: TOK, side: "SELL", size: "4.22", price: "1.0", status: "MATCHED", match_time: "1002", maker_orders: [], ...o });
 
 // A venue whose trades appear only after `tradesAfterPolls` reads, like a real delay window.
 function venue({ record = notFound, tradesAfterPolls = 0, trades = [] } = {}) {

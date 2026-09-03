@@ -301,29 +301,56 @@ async function fillFromTrades(client, record, callMs) {
 // The account's recent trades on this token that belong to OUR order: the venue stamps the taker's
 // order id on each trade (taker_order_id) and lists maker order ids under maker_orders. Returns the
 // fill from those trades, or null when none are visible yet. Trades in a failed state are ignored.
-async function fillFromOwnTrades(client, tokenId, orderID, side, callMs) {
-  if (!tokenId || typeof client?.getTrades !== "function") return null;
+// match_time on a venue trade: unix seconds or milliseconds as a number/string, or ISO. Null when
+// it cannot be read - and an unreadable time makes the trade NOT attributable (owner invariant).
+function tradeTimeMs(t) {
+  const raw = t?.match_time ?? t?.matchTime ?? t?.last_update ?? null;
+  if (raw == null || raw === "") return null;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return n > 1e12 ? n : n * 1000;
+  const p = Date.parse(String(raw));
+  return Number.isFinite(p) ? p : null;
+}
+
+// One read of the account's trades on this token, reduced to the legs that PROVABLY belong to our
+// order. Returns { legs: Map(tradeId -> { sz, px }), rejected: { side, asset, time, noid, failed } }.
+async function ownTradesFor(client, tokenId, orderID, side, callMs, win) {
+  const legs = new Map(), rejected = { side: 0, asset: 0, time: 0, noid: 0, failed: 0 };
+  if (!tokenId || typeof client?.getTrades !== "function") return { legs, rejected };
   let trades;
-  try { trades = await raceTimeout(Promise.resolve().then(() => client.getTrades({ asset_id: String(tokenId) }, true)), callMs, "getTrades"); } catch { return null; }
-  if (!Array.isArray(trades)) return null;
-  const mine = trades.filter((t) => t && (String(t.taker_order_id ?? "") === String(orderID)
-    || (Array.isArray(t.maker_orders) && t.maker_orders.some((m) => String(m?.order_id ?? "") === String(orderID))))
-    && !/FAILED|RETRYING/i.test(String(t.status ?? "")));
-  if (!mine.length) return null;
-  let shares = 0, usd = 0;
-  for (const t of mine) {
-    // A trade where we were a MAKER carries the whole taker size; take only our maker leg then.
+  try { trades = await raceTimeout(Promise.resolve().then(() => client.getTrades({ asset_id: String(tokenId) }, true)), callMs, "getTrades"); } catch { return { legs, rejected }; }
+  if (!Array.isArray(trades)) return { legs, rejected };
+  const ours = String(side).toUpperCase();
+  for (const t of trades) {
+    if (!t || typeof t !== "object") continue;
+    const takerLink = String(t.taker_order_id ?? "") === String(orderID);
+    const makerLeg = Array.isArray(t.maker_orders) ? t.maker_orders.find((m) => String(m?.order_id ?? "") === String(orderID)) : null;
+    if (!takerLink && !makerLeg) continue;                                   // exact id link only
+    if (/FAILED|RETRYING/i.test(String(t.status ?? ""))) { rejected.failed++; continue; }
+    const id = t.id != null && String(t.id) !== "" ? String(t.id) : null;
+    if (!id) { rejected.noid++; continue; }                                    // cannot dedupe -> not attributable
+    if (t.asset_id != null && String(t.asset_id) !== String(tokenId)) { rejected.asset++; continue; }
+    const tside = String(t.side ?? "").toUpperCase();
+    if (tside && ((takerLink && tside !== ours) || (!takerLink && tside === ours))) { rejected.side++; continue; }
+    if (!tside) { rejected.side++; continue; }                                 // side must be provable
+    const tm = tradeTimeMs(t);
+    if (tm == null || tm < win.fromMs || tm > win.toMs) { rejected.time++; continue; }
     let sz = num(t.size), px = num(t.price);
-    if (String(t.taker_order_id ?? "") !== String(orderID) && Array.isArray(t.maker_orders)) {
-      const leg = t.maker_orders.find((m) => String(m?.order_id ?? "") === String(orderID));
-      const legSz = num(leg?.matched_amount); const legPx = num(leg?.price);
+    if (!takerLink && makerLeg) {                                              // our maker leg only
+      const legSz = num(makerLeg.matched_amount); const legPx = num(makerLeg.price);
       if (legSz != null) sz = legSz; if (legPx != null) px = legPx;
     }
     if (sz == null || px == null || !(sz > 0) || !(px > 0) || px > 1) continue;
-    shares += sz; usd += sz * px;
+    legs.set(id, { sz, px });                                                  // by id: counted once
   }
+  return { legs, rejected };
+}
+
+function fillFromLegs(legs) {
+  let shares = 0, usd = 0;
+  for (const { sz, px } of legs.values()) { shares += sz; usd += sz * px; }
   if (!(shares > 0)) return null;
-  return { shares: round2(shares), priceCents: Math.round((usd / shares) * 10000) / 100, priceSource: "own_trades", trades: mine.length };
+  return { shares: round2(shares), priceCents: Math.round((usd / shares) * 10000) / 100, priceSource: "own_trades", trades: legs.size };
 }
 
 // Follow a delayed order to its verdict. Terminal = the venue's trades name our order (source of
@@ -345,11 +372,24 @@ export async function awaitDelayedFill(client, orderID, side, reqShares, limitCe
     const priceCents = px != null && px > 0 && px <= 1 ? Math.round(px * 10000) / 100 : limitCents;
     return { fill: { shares: sh, priceCents, priceSource: "limit" }, state, waitedMs: now() - t0, polls, missing, errors };
   };
+  // Reconciliation window for a trade to count: not before placement (60 s clock skew) and not
+  // after the poll window plus the same skew. A trade outside it is not ours, whatever it says.
+  const win = { fromMs: t0 - 60_000, toMs: t0 + pollMs + 60_000 };
+  let rejectedTrades = null;
   while (now() - t0 < pollMs) {
     await sleep(everyMs); polls++;
     // Trades first: a matched FAK leaves no open-order record, but its trades are visible at once.
-    const own = await fillFromOwnTrades(client, tokenId, orderID, side, callMs);
-    if (own) return { fill: own, state: `terminal:trades(${own.trades})`, waitedMs: now() - t0, polls, missing, errors };
+    const first = await ownTradesFor(client, tokenId, orderID, side, callMs, win);
+    if (first.legs.size) {
+      // Confirmation re-read, merged BY TRADE ID: a fill that matched several makers may surface
+      // its trades over two reads; the union counts each leg exactly once.
+      await sleep(everyMs); polls++;
+      const second = await ownTradesFor(client, tokenId, orderID, side, callMs, win);
+      for (const [id, leg] of second.legs) first.legs.set(id, leg);
+      const own = fillFromLegs(first.legs);
+      if (own) return { fill: own, state: `terminal:trades(${own.trades})`, waitedMs: now() - t0, polls, missing, errors };
+    }
+    if (Object.values(first.rejected).some((n) => n > 0)) rejectedTrades = first.rejected;
     const r = await readOrderRecord(client, orderID, callMs);
     if (r.error) { errors++; continue; }
     if (!r.record) { missing++; continue; }
@@ -367,7 +407,7 @@ export async function awaitDelayedFill(client, orderID, side, reqShares, limitCe
   const lastMatched = num(last?.size_matched ?? last?.sizeMatched);
   if (last && lastMatched != null && lastMatched > 0) return finalize(last, lastMatched, "partial_at_deadline");
   const state = last ? "pending_at_deadline" : (missing > 0 && errors === 0 ? "record_missing" : "unreachable");
-  return { fill: null, state, waitedMs: now() - t0, polls, missing, errors };
+  return { fill: null, state, waitedMs: now() - t0, polls, missing, errors, rejectedTrades };
 }
 
 // The verdict for one placement. kind: immediate (not delayed; fill is extractFill's reading),
@@ -392,6 +432,7 @@ export async function settlePlacement({ resp, side, size, priceCents, client, to
   meta.delayed_state = settled.state;
   meta.delayed_wait_ms = settled.waitedMs;
   meta.delayed_polls = settled.polls;
+  if (settled.rejectedTrades) meta.delayed_rejected_trades = settled.rejectedTrades;
   if (settled.fill) {
     delayedLocks.delete(key);
     if (settled.fill.priceSource) meta.delayed_price_source = settled.fill.priceSource;
