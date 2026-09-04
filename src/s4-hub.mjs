@@ -12,6 +12,7 @@
 // COUNTED (s4Overflow) - in shadow nothing is lost because the old path ran anyway; live, this is
 // where the immediate raw-log fallback would go (docs/stage4-design-addendum.md §9).
 import { randomBytes } from "node:crypto";
+import * as diag from "./rpc-diag.mjs";
 
 export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = () => 0, gapOpen = () => false, followers = () => 0 }) {
   const BOOT = randomBytes(4).toString("hex");
@@ -68,7 +69,12 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
       let released = false;
       const stage = { at: "queued" };
       const release = () => { if (released) return; released = true; inflight--; pump(); };
-      const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); inc(stage.at === "fetch" ? "s4HungFetch" : stage.at === "json" ? "s4HungJson" : "s4HungBcast"); log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms at stage ${stage.at} - slot released`); settle(item.fill.fillId, false); settle(item.fill.fillId, false); release(); } }, HARD_MS);
+      const timer = setTimeout(() => { if (!released) { hung++; inc("s4Hung"); inc("s4EvalFail"); inc(stage.at === "fetch" ? "s4HungFetch" : stage.at === "json" ? "s4HungJson" : "s4HungBcast");
+        // WHICH TRANSPORT PHASE (owner 2026-09-03). Our stage says which await we were sitting in;
+        // this says what the socket had actually completed underneath it.
+        const dr = diag.byLabel(`s4eval:${item.fill.fillId}`);
+        inc(!dr ? "s4HungPhaseUnknown" : dr.classification === "headers_arrived_body_incomplete" ? "s4HungAtBody" : dr.classification === "body_complete_parse_stalled" ? "s4HungAtParse" : dr.classification === "request_sent_no_response_headers" ? "s4HungAtSend" : "s4HungAtConnect");
+        log(`s4: evaluation of ${item.fill.fillId.slice(0, 18)} hung past ${HARD_MS} ms at stage ${stage.at} · transport ${dr ? `${dr.classification} (last ${dr.lastPhase}, age ${Math.round(dr.ageMs)}ms)` : "no record"} - slot released`); settle(item.fill.fillId, false); settle(item.fill.fillId, false); release(); } }, HARD_MS);
       evalOne(item.fill, Date.now() - item.at, item.at, stage).then((ok) => settle(item.fill.fillId, ok !== false)).catch((e) => { log(`s4: evalOne threw ${e?.message || e}`); settle(item.fill.fillId, false); }).finally(() => { clearTimeout(timer); release(); });
     }
   }
@@ -94,10 +100,12 @@ export function startS4Hub({ api, secret, broadcast, log, inc, mode, sealable = 
       inc("s4EvalAttempt");
       try {
         stage.at = "fetch";
-        const r = await fetch(`${api}/api/v1/fill-eval`, {
+        // Labelled so the watchdog above can ask the socket diagnostics WHERE this stopped. Observation
+        // only: the fetch, its timeout and its error propagation are unchanged.
+        const r = await diag.label(`s4eval:${f.fillId}`, () => fetch(`${api}/api/v1/fill-eval`, {
           method: "POST", headers: { "content-type": "application/json", "x-runner-secret": secret }, signal: AbortSignal.timeout(TIMEOUT_MS),
           body: JSON.stringify({ fillId: f.fillId, hubSeq: seq + 1, bootId: BOOT, block: f.block, wallet: f.wallet, tokenId: f.tokenId, shares: f.shares, queuedMs, seenAt, contiguousBlock: sealable() > 0 ? sealable() : null }),
-        });
+        }));
         if (r.status === 503 || r.status >= 500) throw new Error(`fill-eval ${r.status}`);
         if (!r.ok) { log(`s4: fill-eval refused ${r.status} for ${f.fillId.slice(0, 18)}`); inc("s4EvalFail"); return false; }   // 4xx: not retryable
         stage.at = "json";

@@ -30,6 +30,11 @@ import { startS4Hub } from "./s4-hub.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
+import * as rpcDiag from "./rpc-diag.mjs";
+
+// SOCKET-LEVEL DIAGNOSTICS, OBSERVATION ONLY (owner 2026-09-03). Installed before any request is
+// issued so no in-flight call is half-observed. Subscribing changes nothing about how requests run.
+rpcDiag.install();
 
 const API = (process.env.COSMOS_API || "https://try-cosmos.com").replace(/\/$/, "");
 const SECRET = process.env.RUNNER_SECRET || "";
@@ -551,7 +556,8 @@ if (HUB_ENABLED) {
       // billed-call delta since the last report, so daily credit consumption is measured not guessed
       try { const rm = hub?.rpcMeter; if (rm) { const d = rm.calls - lastRpcCalls; if (d > 0) mMerge(fleetMetrics, { hubRpcCalls: d }); lastRpcCalls = rm.calls;
         const df = rm.fails - lastRpcFails; if (df > 0) mMerge(fleetMetrics, { hubRpcFails: df }); lastRpcFails = rm.fails; } } catch { /* observability only */ }
-      if (s4) { const x = s4.stats(); const w = sealWorker ? sealWorker.stats() : null; log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring} · sealable ${x.sealable}${w ? ` · sealed through ${w.lastSealed} (behind ${w.behind}${w.pendingBlock ? `, pending ${w.pendingBlock} x${w.attempts}` : ""})` : ""}${x.breaker ? " · BREAKER" : ""}`); if (w && w.lastSealed > 0 && w.behind > 0) fleetMetrics.s4ReconPending = w.behind; }
+      if (s4) { const x = s4.stats(); const w = sealWorker ? sealWorker.stats() : null; log(`s4 hub: mode ${x.mode} · seq ${x.seq} · queued ${x.queued} · inflight ${x.inflight} · hung ${x.hung} · ring ${x.ring} · sealable ${x.sealable}${w ? ` · sealed through ${w.lastSealed} (behind ${w.behind}${w.pendingBlock ? `, pending ${w.pendingBlock} x${w.attempts}` : ""})` : ""}${x.breaker ? " · BREAKER" : ""}`); if (w && w.lastSealed > 0 && w.behind > 0) fleetMetrics.s4ReconPending = w.behind;
+      try { fleetMetrics.s4DiagChans = rpcDiag.channelMask(); } catch { /* gauge only */ } }
     }, 10 * 60_000).unref?.();
   } catch (e) {
     // Never let a hub failure stop the fleet: with no hub the children hear no heartbeat and each

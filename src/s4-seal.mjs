@@ -19,6 +19,7 @@
 // at a time, driven by cursor advancement; duplicate head notifications are harmless; on restart the
 // worker resumes from the persisted cursor (re-reconciling anything the previous process had in flight).
 import { fillsFromLog } from "./fills.mjs";
+import * as diag from "./rpc-diag.mjs";
 
 export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, poll = 500 }) {
   let lastSealed = 0, pendingBlock = null, pendingSince = 0, attempts = 0, running = false, stopped = false, started = false, throughCount = 0;
@@ -64,6 +65,11 @@ export function startSealWorker({ api, secret, hub, s4, log, inc, isWatched, pol
       ageInStageMs: old.stageAt ? Date.now() - old.stageAt : null, tickAgeMs: tickAt ? Date.now() - tickAt : null,
       missing: old.missing ?? 0, evalsPending: old.evalsPending ?? 0, retry: tick_.retry,
       concurrentBlocks: inflight.size,
+      // THE PHASE UNDERNEATH THE AWAIT (owner 2026-09-03, Diagnostic Path 1). Nine stalls named this
+      // worker's `header` stage; this names what the socket had done when it stopped. During a header
+      // stall the outstanding request IS the block-header RPC, so it is looked up by label first.
+      rpc: (() => { try { return diag.byLabel("hub:eth_getBlockByNumber") ?? diag.oldestInflight(); } catch { return null; } })(),
+      rpcInflight: (() => { try { return diag.stats().liveCount; } catch { return null; } })(),
       backlog: Math.max(0, (hub.sealable?.() ?? 0) - lastSealed), lastSealed, pendingBlock,
       transport: tr ? { fillId: tr.fillId, requestStartedAt: tr.requestStartedAt, headersReceivedAt: tr.headersReceivedAt, bodyCompleteAt: tr.bodyCompleteAt, status: tr.status } : null };
   };

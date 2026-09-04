@@ -44,6 +44,11 @@ export const KEYS = Object.freeze([
   "s4GapSec10",                                    // known-gap duration of the seal cursor, 10 s units
   "s4ReconOk", "s4ReconErr", "s4ReconMissing", "s4ReconDup", "s4ReconPending", "s4SealOk", "s4SealErr", "s4ReconSkipped", "s4CanaryAct", "s4CanaryFallback", "s4CanaryBlocked", "s4CanaryAgree", "s4CanaryDiffer", "s4CanarySuppressed", "s4CanaryPolled", "s4SealStuck", "s4CanaryIntent", "s4CanaryFilled", "s4ModeUnknown", "s4CanaryNoMode", "s4CanaryStaleRoster", "s4CanaryNotOnRoster", "s4CanaryNoRoster",   // block reconciliation seal
   "s4OverflowCc", "s4HungFetch", "s4HungJson", "s4HungBcast",   // fallback amplification estimate; hang stage
+  // WHERE a hang actually stopped, from the socket diagnostics (owner 2026-09-03, Diagnostic Path 1).
+  // s4HungFetch/s4HungJson say which of OUR awaits was outstanding; these say what the transport had
+  // and had not done underneath it, which is the difference between blaming the server and the node.
+  "s4HungAtConnect", "s4HungAtSend", "s4HungAtBody", "s4HungAtParse", "s4HungPhaseUnknown",
+  "s4DiagChans",   // GAUGE: bitmask of the undici channels this runtime actually published
 ]);
 
 // signal -> order latency, milliseconds. Upper bound of each bucket.

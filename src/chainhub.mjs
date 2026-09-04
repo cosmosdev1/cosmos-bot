@@ -95,6 +95,7 @@ async function rpc(method, params) {
  * @param {(msg:string)=>void} log
  */
 import { createChainCursor } from "./chain-cursor.mjs";
+import * as diag from "./rpc-diag.mjs";
 export function startChainHub({ onLog, onBeat, log = console.log, warn = console.warn }) {
   // CONTIGUOUS GAP-AWARE CURSOR (owner 2026-08-30): the seal source for the canonical driver. Fed by
   // newHeads (every header), live logs, disconnects and every backfill chunk's outcome.
@@ -114,7 +115,20 @@ export function startChainHub({ onLog, onBeat, log = console.log, warn = console
     rpcMeter.calls++; rpcMeter.byMethod[method] = (rpcMeter.byMethod[method] || 0) + 1;
     for (const url of HTTP) {
       const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), ms || 8000);
-      try { const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 7, method, params }), signal: ctl.signal }); const j = await r.json().catch(() => null); if (j && j.result !== undefined) return j.result; }
+      // OBSERVATION ONLY (owner 2026-09-03): the attempt is wrapped so the socket diagnostics can name
+      // the transport phase a stalled call died in. diag.label runs fn immediately and passes the
+      // promise through .finally(), so the fetch, its abort signal and its error propagation are
+      // exactly what they were; with the module uninstalled every call here is a no-op.
+      try {
+        const j = await diag.label(`hub:${method}`, async () => {
+          const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 7, method, params }), signal: ctl.signal });
+          const rec = diag.beginBodyRead();
+          const parsed = await r.json().catch(() => null);
+          diag.endParse(rec);
+          return parsed;
+        });
+        if (j && j.result !== undefined) return j.result;
+      }
       catch { /* next endpoint */ } finally { clearTimeout(t); }
     }
     rpcMeter.fails++;
