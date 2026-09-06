@@ -852,6 +852,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // HUB SHORTCUT SWITCH (owner mission 2026-09-06, high-capture canary): false = this user's poll path
   // ignores the box-wide enterable set and evaluates every signal itself. Undefined = shortcut on.
   qtState.hubShortcut = settings.hub_shortcut === false ? false : undefined;
+  // HIGH-CAPTURE V1 (owner 2026-09-06): after TIER + WINDOW only hard constraints may stop an attempt
+  // for this user; the five old strategy gates are switched off (src/high-capture.mjs). Default off.
+  qtState.highCapture = settings.high_capture === true;
   // 1-in-N sampling BELOW WINDOW_OPEN, server-delivered so it can be widened for a bounded window
   // and reverted without a restart. Undefined leaves opp-trace on its env default (8).
   qtState.copyTraceSample = Number(settings.copy_trace_sample) > 0 ? Number(settings.copy_trace_sample) : undefined;
