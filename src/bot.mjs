@@ -845,6 +845,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // PHASE 3A: opportunity tracing. Server-controlled like every flag above, so it is genuinely hot -
   // one cycle, no restart. A Fly secret would NOT be: changing one restarts the Machine.
   qtState.copyTraceOn = settings.copy_trace === true;
+  // 1-in-N sampling BELOW WINDOW_OPEN, server-delivered so it can be widened for a bounded window
+  // and reverted without a restart. Undefined leaves opp-trace on its env default (8).
+  qtState.copyTraceSample = Number(settings.copy_trace_sample) > 0 ? Number(settings.copy_trace_sample) : undefined;
   // SPORTS/ESPORTS CLOCK (2026-09-02): server-controlled, one cycle, no restart. Default off.
   qtState.clockV2 = settings.clock_v2 === true;
   // The rolling buy-volume governors differ per strategy (v2 recycles inside a 1h-4h window), and

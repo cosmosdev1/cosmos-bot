@@ -179,7 +179,14 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
     lastOn = on;
     return on;
   };
-  const SUB_ELIGIBLE_SAMPLE = Number.isFinite(Number(sampleN)) && Number(sampleN) > 0 ? Number(sampleN) : DEF_SUB_SAMPLE;
+  // LIVE SAMPLE RATE. sampleN may be a number OR a getter, so the server can widen or narrow
+  // sub-WINDOW_OPEN coverage within a cycle instead of needing a Fly secret and a fleet restart.
+  // Reverting is then a flag flip, which is the property that makes raising coverage safe at all.
+  // Any non-positive or unreadable value falls back to the env default - it can never become 0.
+  const subSampleN = () => {
+    try { const v = Number(typeof sampleN === "function" ? sampleN() : sampleN); return Number.isFinite(v) && v > 0 ? v : DEF_SUB_SAMPLE; }
+    catch { return DEF_SUB_SAMPLE; }
+  };
   const MAX_TRACKED = Number.isFinite(Number(maxTracked)) && Number(maxTracked) > 0 ? Number(maxTracked) : DEF_MAX_TRACKED;
   const MAX_BUFFER = Number.isFinite(Number(maxBuffer)) && Number(maxBuffer) > 0 ? Number(maxBuffer) : DEF_MAX_BUFFER;
   const MAX_ATT = Number.isFinite(Number(maxAttempts)) && Number(maxAttempts) > 0 ? Number(maxAttempts) : MAX_ATTEMPTS;
@@ -241,7 +248,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
         };
         // sampling: everything that reaches the window is kept; below it, a deterministic 1-in-N
         r.sampled = true;
-        r.subSample = (hash32(id) % SUB_ELIGIBLE_SAMPLE) === 0;
+        r.subSample = (hash32(id) % subSampleN()) === 0;
         live.set(id, r);
         evict();
       }

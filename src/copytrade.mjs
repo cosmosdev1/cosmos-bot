@@ -556,6 +556,10 @@ export function startCopyTrade(deps) {
   const trace = createTracer({
     userId: String(process.env.COSMOS_USER_ID || process.env.COSMOS_BOT_TAG || ""),
     enabled: () => state.copyTraceOn === true || /^(1|true|yes|on)$/i.test(process.env.COPY_TRACE || ""),
+    // Server-delivered sub-WINDOW_OPEN sample rate, read LIVE (see opp-trace subSampleN). Raising
+    // coverage to classify a bucket is then a flag flip that reverts in one cycle, instead of a Fly
+    // secret plus a fleet restart to set AND another to undo.
+    sampleN: () => state.copyTraceSample,
   });
   state.copyTrace = trace;
   /** one handle per (signal, path); all downstream calls are chainable and total */
