@@ -845,6 +845,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // PHASE 3A: opportunity tracing. Server-controlled like every flag above, so it is genuinely hot -
   // one cycle, no restart. A Fly secret would NOT be: changing one restarts the Machine.
   qtState.copyTraceOn = settings.copy_trace === true;
+  // PER-USER ENTRY FLOOR, server-delivered. Undefined leaves the bot on its $55 default; a
+  // non-positive or unparseable value is ignored for the same reason. Entry floor only.
+  qtState.minPortfolioUsd = Number(settings.min_portfolio_usd) > 0 ? Number(settings.min_portfolio_usd) : undefined;
   // 1-in-N sampling BELOW WINDOW_OPEN, server-delivered so it can be widened for a bounded window
   // and reverted without a restart. Undefined leaves opp-trace on its env default (8).
   qtState.copyTraceSample = Number(settings.copy_trace_sample) > 0 ? Number(settings.copy_trace_sample) : undefined;

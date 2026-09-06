@@ -480,6 +480,20 @@ function candleTarget(sig, portfolio) {
 }
 
 const ONESHOT_MIN_PORTFOLIO_USD = N("COPY_MIN_PORTFOLIO_USD", 55); // owner 2026-08-11: was \$75
+// PER-USER ENTRY FLOOR (owner 2026-09-06). The floor is otherwise a fleet-wide env constant, so a
+// one-account experiment would mean a Fly change that moves EVERY bot and needs a restart to set and
+// another to revert. The server may now deliver min_portfolio_usd for a single account on
+// /v1/account, exactly like copy_trace.
+//
+// FALLS BACK HARD. Anything missing, non-numeric, non-positive or unreadable yields the $55 default,
+// so a bad or absent override can only ever be MORE conservative - never less. It is read ONLY by
+// the portfolio entry floor below; tiering, window, price, sizing, the $2 floor, the 7% gate,
+// authorization and every exit path are untouched.
+let stateRef = null;
+const minPortfolioUsd = () => {
+  try { const v = Number(stateRef?.minPortfolioUsd); return Number.isFinite(v) && v > 0 ? v : ONESHOT_MIN_PORTFOLIO_USD; }
+  catch { return ONESHOT_MIN_PORTFOLIO_USD; }
+};
 
 function targetUsd(sig, unit, portfolio) {
   // HOSTED FLOOR (owner 2026-08-04, lowered to \$55 on 2026-08-11): a portfolio under the floor
@@ -494,7 +508,7 @@ function targetUsd(sig, unit, portfolio) {
   // Bot-side so the fleet does not burn sign-gate calls on orders the gate would refuse anyway;
   // the app warns on the same line (MIN_PORTFOLIO_USD in lib/portfolio-floor.ts - keep them equal).
   // Legacy self-hosted bots (ONESHOT off) are untouched.
-  if (ONESHOT && !(portfolio >= ONESHOT_MIN_PORTFOLIO_USD)) return { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
+  if (ONESHOT && !(portfolio >= minPortfolioUsd())) return { target: 0, ceiling: 0, beats: 0, beatUsd: 0 };
   if (CANDLE_ENGINE && isCandleSig(sig)) return candleTarget(sig, portfolio);
   if (ONESHOT) return oneShotTarget(sig, portfolio);
   // THE 20-TIER LADDER (owner 2026-08-02) — the future non-one-shot sizing, BUILT AND OFF
@@ -539,6 +553,7 @@ function targetUsd(sig, unit, portfolio) {
 
 export function startCopyTrade(deps) {
   const { pm, cosmos, store, placeWithRetry, sharesFor, sizeForSignal, state } = deps;
+  stateRef = state;   // for the per-user entry floor read by module-level sizing helpers
   // WHY-NO-ORDER TELEMETRY (gate-funnel audit 2026-08-05): 3,036 server-APPROVED signals died
   // silently inside the fleet's bots in 48h - every refusal logged only to Fly, invisible from the
   // DB. Count each refusal reason here (numbers normalised to # so "target $3.20" and "target
@@ -915,7 +930,7 @@ export function startCopyTrade(deps) {
       // accounts, all comfortably above the line; the moment it went fleet-wide (median portfolio
       // $32) it became 730 of 743 denials in six minutes, each one a database write and a serverless
       // invocation for an account that CANNOT trade. Same line the app warns on.
-      if (ONESHOT && !(portfolio >= ONESHOT_MIN_PORTFOLIO_USD)) return { target: 0, beats: null };
+      if (ONESHOT && !(portfolio >= minPortfolioUsd())) return { target: 0, beats: null };
       const own = v2Pct(sig);
       const pct = own == null ? Number(sig.tier_pct_resolved) : own;
       if (!Number.isFinite(pct) || pct <= 0) return { target: 0, beats: null };
@@ -1004,10 +1019,10 @@ export function startCopyTrade(deps) {
     if (!(target > 0)) {
       if (V2()) {
         const pct = v2Pct(sig) ?? Number(sig.tier_pct_resolved);
-        tr.block(!(state.portfolio >= ONESHOT_MIN_PORTFOLIO_USD) ? "portfolio_floor" : "tier_zero",
+        tr.block(!(state.portfolio >= minPortfolioUsd()) ? "portfolio_floor" : "tier_zero",
           { port: Math.round(state.portfolio || 0), his_usd: Math.round(Number(sig.his_cost_usd) || 0), pct: Number.isFinite(pct) ? pct : null });
-        return skip(!(state.portfolio >= ONESHOT_MIN_PORTFOLIO_USD)
-          ? "portfolio $" + Math.round(state.portfolio || 0) + " under the $" + ONESHOT_MIN_PORTFOLIO_USD + " floor"
+        return skip(!(state.portfolio >= minPortfolioUsd())
+          ? "portfolio $" + Math.round(state.portfolio || 0) + " under the $" + minPortfolioUsd() + " floor"
           : "below his tier ladder (his $" + Math.round(Number(sig.his_cost_usd) || 0) + " -> " + (Number.isFinite(pct) ? pct + "%" : "no tiers computed") + ")");
       }
       tr.block("tier_zero", { his_usd: Math.round(Number(sig.his_cost_usd) || 0), port: Math.round(state.portfolio || 0) });
