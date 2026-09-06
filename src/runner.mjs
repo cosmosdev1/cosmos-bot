@@ -24,6 +24,7 @@ import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseProcStat } from "./proc.mjs";
 import { wedgeDecisions, WEDGE_EXIT_CODE, RUNNER_STALE_MS } from "./liveness.mjs";
+import { shardQuery } from "./runner-shard.mjs";
 import { deriveCap } from "./admission.mjs";
 import { merge as mMerge, emptyAggregate as mEmpty } from "./metrics.mjs";
 import { qualifyingFillIds, fillsFromLog } from "./fills.mjs";
@@ -113,7 +114,7 @@ async function flushMetrics() {
     const rosters = [...childRoster.entries()].filter(([u]) => kids.has(u)).map(([u, r]) => { const v = rosterMap.get(u), ack = childAck.get(u); return { u, at: r.at, src: r.source, n: r.n, w: r.list, vr: v ? { version: v.v, at: v.at, n: v.w.length, w: v.w.slice(0, 250) } : null, ack: ack || null, dd: childDd.get(u) || null }; });
     // a pushed roster the child never acknowledged within 60 s is an IPC delivery failure - counted
     for (const [u, v] of rosterMap) { if (kids.has(u) && Date.now() - v.at > 60_000 && (childAck.get(u)?.version ?? 0) < v.v) mMerge(fleetMetrics, { rosterAckMiss: 1 }); }
-    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: process.env.FLY_MACHINE_ID || "runner", s4Samples: samples, rosters, stuckTicks, epoch: rosterEpoch });
+    body = JSON.stringify({ m, window_s: Math.round(METRICS_MS / 1000), host: SQ.host, s4Samples: samples, rosters, stuckTicks, epoch: rosterEpoch });
   } catch (e) { warnFlush(`body build failed: ${e.message}`); clearTimeout(t); return; }
   try {
     const r = await fetch(`${API}/api/cloud/runner/metrics`, { method: "POST", headers: { "content-type": "application/json", "x-runner-secret": SECRET }, body, signal: ctl.signal });
@@ -199,7 +200,13 @@ function broadcast(msg) {
 // SHARDING (scale build Inc 1.3, 2026-08-17): RUNNER_SHARD="i/N" gives this VM a disjoint,
 // stable slice of the fleet (hashed server-side on user_id). Unset = the whole fleet, as before.
 // Capacity now grows by adding VMs instead of raising one box's cap.
-const SHARD = /^\d+\/\d+$/.test(process.env.RUNNER_SHARD || "") ? process.env.RUNNER_SHARD : "";
+const SQ = shardQuery(process.env);
+const SHARD = SQ.shard;
+// TWO-SHARD RUNNER (owner 2026-09-07): the SERVER may decide this VM's slice from its process group
+// (RUNNER_SHARD_MAP on the platform). The roster answers with the slice it applied; "none" means this
+// group is unmapped while a map exists - the server then returns NO accounts and the reconcile below
+// stops every child, which is the safe shape (never "all": that is how two VMs run the same account).
+let serverShard = null;
 
 async function roster() {
   const ctl = new AbortController();
@@ -209,6 +216,8 @@ async function roster() {
     // has been wrong in both directions before - see the roster route's note).
     const qs = new URLSearchParams();
     if (SHARD) qs.set("shard", SHARD);
+    if (SQ.group) qs.set("group", SQ.group);
+    if (SQ.machine) qs.set("machine", SQ.machine);
     qs.set("cap", String(MAX));
     const url = `${API}/api/cloud/runner/roster?${qs.toString()}`;
     const r = await fetch(url, { headers: { "x-runner-secret": SECRET }, signal: ctl.signal });
@@ -216,6 +225,8 @@ async function roster() {
     if (!r.ok) { log(`roster HTTP ${r.status}`); return null; }
     const j = await r.json().catch(() => null);
     if (typeof j?.s4_mode === "string" && j.s4_mode !== s4Mode) { log(`s4 mode ${s4Mode} -> ${j.s4_mode} (roster)`); s4Mode = j.s4_mode; }
+    if (typeof j?.shard === "string" && j.shard !== serverShard) { log(`shard assignment ${serverShard ?? "?"} -> ${j.shard} (group ${SQ.group || "(none)"}, machine ${SQ.machine || "?"})`); serverShard = j.shard; }
+    if (j?.shard === "none") { log(`ALARM: group ${SQ.group || "(none)"} is not in the server's RUNNER_SHARD_MAP - assigned NOTHING; stopping every child until it is mapped`); alertPlatform(`runner group ${SQ.group || "(none)"} (${SQ.machine || "?"}) unmapped - running nothing`, kids.size); }
     // CANARY LIST (owner 2026-08-30): the whales for which Stage 4 is authoritative for execution.
     // Served by the roster every minute from fleet_control, so adding or removing a whale takes one
     // cycle and no deploy - that is the kill switch. Pushed to every child only when it CHANGES.
@@ -530,7 +541,7 @@ function alertPlatform(note, count) {
   }).catch(() => {}).finally(() => clearTimeout(t));
 }
 
-log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}${HUB_ENABLED ? ", chainhub ON" : ""} · wedge backstop ${Math.round(RUNNER_STALE_MS / 60000)} min`);
+log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}${HUB_ENABLED ? ", chainhub ON" : ""} · wedge backstop ${Math.round(RUNNER_STALE_MS / 60000)} min · group ${SQ.group || "(none)"} machine ${SQ.machine || "?"}${SHARD ? " env shard " + SHARD : ""}`);
 
 // Start the shared subscription BEFORE any child, so the first wallets reported find a live hub.
 // Loaded dynamically so a box with the hub off never even parses it.
