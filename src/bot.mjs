@@ -827,6 +827,16 @@ async function maybeStartEngines(settings, pm, cosmos) {
   qtState.copytrade = wantCopy;
   qtState.cert15 = wantCert;
   qtState.copyFills = process.env.COPYTRADE_ENABLED === "1" || settings.copytrade === true;   // may we copy his live FILLS?
+  // ENGINE-OFF ATTRIBUTION (observation only, 2026-09-06). 10.8% of traced opportunities died at
+  // "engine_off" and could not be classified after the fact, because bot_health is upserted and
+  // keeps no history. Every input needed is already computed right here, so the REASON is recorded
+  // at the moment the decision is made and attached to the trace. Nothing reads it for trading.
+  qtState.copyOffWhy = settings.bot_enabled === false ? "user_stop"
+    : halted ? "authority_halt"
+    : qtState.ddHalt === true ? "dd_halt"
+    : settings.copytrade === true ? null
+    : "server_flag_off";
+  qtState.settingsAt = Date.now();   // freshness of the state above, for stale/offline attribution
   // TIERED COPY v2: server-delivered so one Vercel flip moves the WHOLE fleet (hosted + legacy) in
   // a cycle. The local env var stays as a dev override.
   qtState.strategyV2 = settings.strategy_v2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_STRATEGY_V2 || "");

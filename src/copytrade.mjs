@@ -960,13 +960,22 @@ export function startCopyTrade(deps) {
     if (meta?.s4 && meta?.fillId) return withS4Attribution({ fillId: meta.fillId, group: sig?.group_id }, () => fastOpenInner(sig, meta));
     return fastOpenInner(sig, meta);
   }
+  // ENGINE-OFF CONTEXT (observation only). Attaches the state that DECIDED the refusal, so each
+  // engine_off opportunity can be classified as intentional-off / stale / transient rather than
+  // guessed at afterwards. Pure reads of values already in memory; total, and never awaited.
+  const engineCtx = () => { try {
+    const age = state.settingsAt ? Math.round((Date.now() - state.settingsAt) / 1000) : null;
+    return { ct: state.copytrade === false ? 0 : 1, cf: state.copyFills === false ? 0 : 1,
+             why: state.copyOffWhy ?? null, sAge: age };
+  } catch { return {}; } };
+
   async function fastOpenInner(sig, meta = {}) {
     const tr = T(sig, "fast");
     tr.stage(STAGE.SEEN).stage(STAGE.HUB_ENTERABLE).stage(STAGE.DRIVER_PICKED);
-    if (state.copytrade === false) { tr.block("engine_off"); return; }
+    if (state.copytrade === false) { tr.block("engine_off", engineCtx()); return; }
     if (Date.now() < budgetPausedUntil) { tr.block("budget_paused"); return; }   // budget breaker: no entries until the window frees
     // The fast path IS the whale-fill path. A bot that only has the adopt flag must never take one.
-    if (state.copyFills === false) { tr.block("engine_off"); return; }
+    if (state.copyFills === false) { tr.block("engine_off", engineCtx()); return; }
     if (state.cash == null || state.sizing == null) { tr.block("no_cycle_state"); return; }      // no cycle data yet -> can't size
     tr.stage(STAGE.ENGINE_READY);
     const positions = store.load();
