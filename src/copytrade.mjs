@@ -681,7 +681,8 @@ export function startCopyTrade(deps) {
   // LOCAL x SERVER matrix can be read off real attempts. BUY only - this function is BUY only.
   let shadow2gN = 0;
   const SHADOW_2G_MAX = Number(process.env.COPY_2G_SHADOW_MAX ?? 60);
-  const floorGuard = () => floorGuardVerdict({ cash: state.cash, pmValue: state.pmValue, portfolioAt: state.portfolioAt, env: process.env });
+  // the guard's line is the SERVER's backstop line for this user (floor - 5), never the fleet constant
+  const floorGuard = () => floorGuardVerdict({ cash: state.cash, pmValue: state.pmValue, portfolioAt: state.portfolioAt, env: process.env, floorUsd: minPortfolioUsd() - 5 });
   const shadow2g = (fg, r) => {
     if (shadow2gN >= SHADOW_2G_MAX) return;
     shadow2gN++;
@@ -1219,7 +1220,10 @@ export function startCopyTrade(deps) {
       // and removes the duplicated window/tier/price arithmetic this loop used to redo per child.
       // ONLY applied to ENTRY candidates we do not already hold - a held position must still walk
       // the loop below for top-ups and for the exit bookkeeping the feed drives.
-      if (enterableKeys && !positions[sig.condition_id]
+      // Per-user bypass (state.hubShortcut === false, server-delivered): measured 2026-09-06, the hub was
+      // the current blocker on 16% of in-window tier-positive opportunities that were never attempted.
+      // Bypassed, the loop below applies every gate itself - nothing is skipped, only the shortcut.
+      if (enterableKeys && state.hubShortcut !== false && !positions[sig.condition_id]
           && !enterableKeys.has(`${sig.condition_id}|${String(sig.outcome).toLowerCase()}`)) { tr.block("hub_not_enterable", { hub_age_s: Math.round((Date.now() - hubAt) / 1000) }); stats.hubSkipped = (stats.hubSkipped ?? 0) + 1; mInc("skip"); continue; }
       tr.stage(STAGE.HUB_ENTERABLE);
       // ADOPT-ONLY users see ONLY adopt signals. The whale-fill copies (kind "new") are aviv's alone.

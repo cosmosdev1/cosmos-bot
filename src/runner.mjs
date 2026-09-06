@@ -23,6 +23,7 @@
 import { spawn } from "node:child_process";
 import { mkdirSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { parseProcStat } from "./proc.mjs";
+import { wedgeDecisions, WEDGE_EXIT_CODE, RUNNER_STALE_MS } from "./liveness.mjs";
 import { deriveCap } from "./admission.mjs";
 import { merge as mMerge, emptyAggregate as mEmpty } from "./metrics.mjs";
 import { qualifyingFillIds, fillsFromLog } from "./fills.mjs";
@@ -299,8 +300,19 @@ function start(a) {
   const tag = a.user_id.slice(0, 8);
   child.stdout.on("data", (d) => process.stdout.write(`[${tag}] ${d}`));
   child.stderr.on("data", (d) => process.stderr.write(`[${tag}] ${d}`));
+  // The record exists BEFORE the message handler so the handler can stamp it. The wedge-restart stamp
+  // is carried across a respawn, or the cooldown would reset with every restart it is meant to limit.
+  const rec = { child, startedAt: Date.now(), backoffMs: kids.get(a.user_id)?.backoffMs ?? 30_000, entry: a,
+    lastCycleOkAt: 0, cycleStreak: 0, lastCycleErr: null, lastWedgeRestartAt: kids.get(a.user_id)?.lastWedgeRestartAt || 0 };
   // Children report the wallets they follow; the hub subscribes to the union of all of them.
   child.on("message", (m) => {
+    // COMPLETED-CYCLE HEARTBEAT (owner 2026-09-06): ok only when cycle() RETURNED NORMALLY. This is the
+    // liveness the wedge backstop in reconcile() requires; a live process alone is not proof of health.
+    if (m?.t === "cycle") {
+      if (m.ok === true) { rec.lastCycleOkAt = Number(m.at) || Date.now(); rec.cycleStreak = 0; rec.lastCycleErr = null; }
+      else { rec.cycleStreak = Number(m.streak) || rec.cycleStreak + 1; rec.lastCycleErr = String(m.err || "").slice(0, 160); mMerge(fleetMetrics, { cycleFail: 1 }); }
+      return;
+    }
     if (m?.t === "wallets" && Array.isArray(m.list)) { childWallets.set(a.user_id, m.list); childRoster.set(a.user_id, { at: Number(m.at) || Date.now(), source: m.source || null, n: m.list.length, list: m.list.slice(0, 250) }); syncHubWallets(); if (!childAck.has(a.user_id)) pushRoster(a.user_id); }
     // a child's single counter increment (roster refresh outcomes); merge() drops unknown keys
     else if (m?.t === "metric" && typeof m.k === "string") { mMerge(fleetMetrics, { [m.k]: 1 }); }
@@ -313,11 +325,14 @@ function start(a) {
     else if (m?.t === "s4gap" && s4) { s4.replay(child, Number(m.from) || 0, Number(m.to) || 0); }
     else if (m?.t === "s4sample" && s4 && m.s) { s4.sample({ ...m.s, user: String(a.user_id).slice(0, 8) }); }
   });
-  const rec = { child, startedAt: Date.now(), backoffMs: kids.get(a.user_id)?.backoffMs ?? 30_000, entry: a };
   child.on("exit", (code, sig) => {
     const uptimeS = Math.round((Date.now() - rec.startedAt) / 1000);
     log(`bot ${tag} exited code=${code} sig=${sig} uptime=${uptimeS}s`);
     noteChildExit(uptimeS);
+    if (code === WEDGE_EXIT_CODE) {
+      mMerge(fleetMetrics, { wedgeExit: 1 });
+      log(`WEDGE EXIT ${tag}: the child stopped completing cycles and exited itself (${rec.cycleStreak} consecutive cycle failures, last: ${rec.lastCycleErr || "none reported"}) - respawn after backoff`);
+    }
     // A child that survived 10+ minutes earns a fresh backoff; a crash loop doubles up to 10 min.
     rec.backoffMs = uptimeS > 600 ? 30_000 : Math.min(rec.backoffMs * 2, 600_000);
     rec.child = null;
@@ -340,6 +355,20 @@ function stop(userId, why) {
     const c = rec.child;
     setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* already gone */ } }, 10_000).unref();
   }
+}
+
+// WEDGED-CHILD RESTART (owner 2026-09-06): this child only. It stays in `kids`, so the exit handler
+// sets its crash backoff and the next reconcile pass respawns it exactly like a crash - positions,
+// seen-set and the drawdown latch all live in /data/u-<id> and survive, as they do on every deploy.
+function restartWedged(userId, why) {
+  const rec = kids.get(userId);
+  if (!rec?.child) return;
+  rec.lastWedgeRestartAt = Date.now();
+  mMerge(fleetMetrics, { wedgeRestart: 1 });
+  log(`WEDGE RESTART ${userId.slice(0, 8)}: ${why} - restarting this child only`);
+  const c = rec.child;
+  try { c.kill("SIGTERM"); } catch { /* already gone */ }
+  setTimeout(() => { try { c.kill("SIGKILL"); } catch { /* already gone */ } }, 10_000).unref();
 }
 
 function uptimeSeconds() {
@@ -445,6 +474,18 @@ async function reconcile() {
   // is one IPC message per child per minute and it also carries any change in the hosted set.
   for (const userId of kids.keys()) pushRoster(userId);
 
+  // WEDGED-CHILD BACKSTOP (owner 2026-09-06). A child that is alive but has not completed a cycle in
+  // RUNNER_STALE_MS is restarted - that child only, most-stale first, at most a few per pass, never
+  // twice inside the cooldown. The child normally exits itself at 10 minutes (bot.mjs); this catches
+  // the case it cannot. When many are stale at once nothing is restarted: that is a platform or
+  // network fault, and it pages instead. Rules and thresholds: liveness.mjs.
+  {
+    const d = wedgeDecisions([...kids.entries()].map(([u, r]) => [u, { alive: Boolean(r.child), startedAt: r.startedAt, lastCycleOkAt: r.lastCycleOkAt, lastCycleErr: r.lastCycleErr, cycleStreak: r.cycleStreak, lastWedgeRestartAt: r.lastWedgeRestartAt }]));
+    if (d.refused) { mMerge(fleetMetrics, { wedgeRefused: 1 }); log(`ALARM: ${d.refused}`); alertPlatform(`runner: ${d.refused}`, d.stale); }
+    for (const x of d.restart) restartWedged(x.userId, x.reason);
+    if (d.stale && !d.restart.length && !d.refused) log(`wedge backstop: ${d.stale} stale child(ren) inside the restart cooldown - leaving them to the exit path`);
+  }
+
   // COUNT the starvation instead of break-ing blind (scale build Inc 0.5): every deferred account
   // is user money with no manager, and that must page, not whisper in a Fly log.
   let running = [...kids.values()].filter((k) => k.child).length;
@@ -489,7 +530,7 @@ function alertPlatform(note, count) {
   }).catch(() => {}).finally(() => clearTimeout(t));
 }
 
-log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}${HUB_ENABLED ? ", chainhub ON" : ""}`);
+log(`hosted runner up - api ${API}, max ${MAX} bots, data ${DATA_ROOT}${HUB_ENABLED ? ", chainhub ON" : ""} · wedge backstop ${Math.round(RUNNER_STALE_MS / 60000)} min`);
 
 // Start the shared subscription BEFORE any child, so the first wallets reported find a live hub.
 // Loaded dynamically so a box with the hub off never even parses it.

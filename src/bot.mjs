@@ -16,6 +16,7 @@ import { log, warn, err } from "./log.mjs";
 import { startQTable } from "./qtable.mjs";
 import { startFleetStateWatch, fleetHalted, fleetReason } from "./fleetstate.mjs";
 import { drawdownCheck, drawdownState } from "./drawdown.mjs";
+import { cycleLiveness, WEDGE_EXIT_CODE } from "./liveness.mjs";
 
 // Config comes from config.json (local install via `npm run setup`) OR env vars (cloud/24-7
 // deploy — Render/Railway/Docker, where there's no interactive terminal). Env vars win so a
@@ -848,6 +849,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // PER-USER ENTRY FLOOR, server-delivered. Undefined leaves the bot on its $55 default; a
   // non-positive or unparseable value is ignored for the same reason. Entry floor only.
   qtState.minPortfolioUsd = Number(settings.min_portfolio_usd) > 0 ? Number(settings.min_portfolio_usd) : undefined;
+  // HUB SHORTCUT SWITCH (owner mission 2026-09-06, high-capture canary): false = this user's poll path
+  // ignores the box-wide enterable set and evaluates every signal itself. Undefined = shortcut on.
+  qtState.hubShortcut = settings.hub_shortcut === false ? false : undefined;
   // 1-in-N sampling BELOW WINDOW_OPEN, server-delivered so it can be widened for a bounded window
   // and reverted without a restart. Undefined leaves opp-trace on its env default (8).
   qtState.copyTraceSample = Number(settings.copy_trace_sample) > 0 ? Number(settings.copy_trace_sample) : undefined;
@@ -1571,25 +1575,41 @@ async function main() {
   // cycle doesn't just stop trading and heartbeats, it silently breaks the 10-minute fleet-update
   // guarantee too. All network calls now carry timeouts, but this interval is the hard promise: if a
   // full cycle hasn't COMPLETED in 10 minutes, exit so the launcher relaunches us clean.
-  let lastCycleDone = Date.now();
+  // COMPLETED MEANS RETURNED NORMALLY (owner 2026-09-06). The stamp used to sit after the catch, so a
+  // cycle that threw on its first await - cosmos.account() is line one of cycle() - counted as done:
+  // no state refresh, no heartbeat, engines running on stale settings, and a satisfied watchdog. Four
+  // children sat like that for 98 minutes with COSMOS_LAUNCHER=1 present. Accounting is in
+  // liveness.mjs; the runner receives the same verdict over IPC and backstops this exit at 15 min.
+  const live = cycleLiveness();
+  const wedgeMs = Number(process.env.COSMOS_CYCLE_WEDGE_MS || 600_000);
   setInterval(() => {
-    if (Date.now() - lastCycleDone > Number(process.env.COSMOS_CYCLE_WEDGE_MS || 600_000)) {
-      if (process.env.COSMOS_LAUNCHER === "1") {
-        err(`cycle WEDGED: no completed cycle for ${Math.round((Date.now() - lastCycleDone) / 1000)}s - exiting for a launcher restart`);
-        process.exit(1);
-      }
-      err(`cycle WEDGED for ${Math.round((Date.now() - lastCycleDone) / 1000)}s and no launcher present - bot is effectively DEAD until restarted`);
+    const stale = live.staleMs();
+    if (stale <= wedgeMs) return;
+    const why = `no normally completed cycle for ${Math.round(stale / 1000)}s (${live.streak} consecutive cycle failures, last: ${live.lastErr || "none - a cycle is hanging"})`;
+    if (process.env.COSMOS_LAUNCHER === "1") {
+      err(`cycle WEDGED: ${why} - exiting for a launcher restart`);
+      process.exit(WEDGE_EXIT_CODE);
     }
+    err(`cycle WEDGED: ${why} and no launcher present - bot is effectively DEAD until restarted`);
   }, 60_000).unref?.();
+  // one small IPC message per cycle, hosted only; the runner's wedge backstop keys off it
+  const sendCycle = (ok) => {
+    if (!HOSTED || typeof process.send !== "function") return;
+    try { process.send({ t: "cycle", ok, at: Date.now(), streak: live.streak, err: ok ? undefined : live.lastErr }); } catch { /* parent gone; its exit path covers us */ }
+  };
   // eslint-disable-next-line no-constant-condition
   while (true) {
     maybeSelfUpdate(); // pull + relaunch on a new commit (throttled to every SELF_UPDATE_MS)
+    let ok = true;
     try {
       await cycle(cosmos, pm);
     } catch (e) {
+      ok = false;
+      live.fail(e);
       err("cycle:", e.message);
     }
-    lastCycleDone = Date.now();
+    if (ok) live.ok();
+    sendCycle(ok);
     await sleep((config.pollSeconds ?? 30) * 1000);
   }
 }

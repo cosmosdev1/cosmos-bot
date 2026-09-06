@@ -25,6 +25,7 @@ export const KEYS = Object.freeze([
   "fill",      // fills observed
   "deny",      // order attempts refused by the platform gate
   "reap",      // orphan processes reaped (runner only)
+  "cycleFail", "wedgeExit", "wedgeRestart", "wedgeRefused",   // child liveness (2026-09-06): thrown cycles; self-exits; runner-forced restarts; mass-stale refusals
   // STAGE 4 SHADOW (2026-08-29) - fixed cardinality like everything above. Hub side:
   "s4EvalAttempt", // /fill-eval HTTP attempts, retries included
   "s4EvalOk",      // successful responses

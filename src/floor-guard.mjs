@@ -33,8 +33,13 @@ function num(v, fallback) { const n = Number(v); return Number.isFinite(n) && n 
  *   portfolioAt ms timestamp of the cycle that produced them, or null before the first cycle
  * @returns {{ verdict: "deny"|"allow"|"unknown", gateLike: number|null, line: number, reason: string }}
  */
-export function floorGuardVerdict({ cash, pmValue, portfolioAt, now = Date.now(), env = {} }) {
-  const floor = num(env.COPY_2G_GATE_FLOOR_USD, DEFAULTS.GATE_FLOOR_USD);
+export function floorGuardVerdict({ cash, pmValue, portfolioAt, now = Date.now(), env = {}, floorUsd = null }) {
+  // PER-USER FLOOR (owner 2026-09-06): the caller passes the gate line it resolved for THIS user
+  // (min_portfolio_usd - 5, the server's own rule in risk.ts). Without it the guard kept refusing at
+  // the fleet default while the server, carrying the user's override, would have allowed - the exact
+  // bot/server mismatch the end-to-end floor exists to remove. The env knob still overrides both.
+  const perUser = Number(floorUsd);
+  const floor = num(env.COPY_2G_GATE_FLOOR_USD, Number.isFinite(perUser) && perUser > 0 ? perUser : DEFAULTS.GATE_FLOOR_USD);
   const margin = num(env.COPY_2G_MARGIN_USD, DEFAULTS.MARGIN_USD);
   const maxAge = num(env.COPY_2G_MAX_AGE_MS, DEFAULTS.MAX_AGE_MS);
   const line = floor - margin;

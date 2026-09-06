@@ -43,7 +43,10 @@ ok("a child sending nothing is harmless", (merge(agg,null),agg.cc===17));
 console.log("\nbounded memory");
 for(let i=0;i<50000;i++){ inc("cc"); observe(i%30000); }
 const big=snapshot();
-ok("50k observations produce a fixed-size payload", JSON.stringify(big).length < 400);
+// FIXED-SIZE means it does not grow with observations: 50k must land within digit-width of 100.
+for(let i=0;i<100;i++){ inc("cc"); observe(i); }
+const small=snapshot();
+ok("50k observations produce a fixed-size payload (within 40 chars of 100 observations)", Math.abs(JSON.stringify(big).length - JSON.stringify(small).length) <= 40);
 ok("  and the counter is exact", big.cc===50000);
 
 console.log(`\n${pass} passed, ${fail} failed`);
