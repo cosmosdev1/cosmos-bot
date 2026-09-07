@@ -49,6 +49,6 @@ ck("a missing ask never fabricates a price (no ask, no midpoint -> null)", /if \
 ck("every priceFor call site passes the trace", count(/priceFor\(sig\.token_id, [^\n]*, tr\)/g) === 4);
 ck("the no_book memo is lifted by a fresh usable ask, else blocks venue_no_book", /if \(top && top\.ask > 0\) \{ noBookUntil\.delete\(tok\);/.test(src) && /tr\?\.block\("venue_no_book", \{ bid: top\?\.bid \?\? null, ask: top\?\.ask \?\? null \}\)/.test(src));
 const bot = fs.readFileSync(new URL("../src/bot.mjs", import.meta.url), "utf8");
-ck("bot maps settings.high_capture === true only (never truthy strings)", /qtState\.highCapture = settings\.high_capture === true;/.test(bot));
+ck("bot maps settings.high_capture === true only, AND only when HOSTED (self-hosted never activates the profile)", /qtState\.highCapture = HOSTED && settings\.high_capture === true;/.test(bot));
 console.log("\n" + (fail === 0 ? "ALL PASS" : "FAILURES") + ": " + pass + " passed, " + fail + " failed");
 assert.equal(fail, 0);

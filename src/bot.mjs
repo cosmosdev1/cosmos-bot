@@ -854,7 +854,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   qtState.hubShortcut = settings.hub_shortcut === false ? false : undefined;
   // HIGH-CAPTURE V1 (owner 2026-09-06): after TIER + WINDOW only hard constraints may stop an attempt
   // for this user; the five old strategy gates are switched off (src/high-capture.mjs). Default off.
-  qtState.highCapture = settings.high_capture === true;
+  // HOSTED ONLY (owner 2026-09-07): hosted is the product; the 9 legacy self-hosted bots must not change
+  // behaviour. The server already decides by cloud-account row; this is the belt to that brace.
+  qtState.highCapture = HOSTED && settings.high_capture === true;
   // 1-in-N sampling BELOW WINDOW_OPEN, server-delivered so it can be widened for a bounded window
   // and reverted without a restart. Undefined leaves opp-trace on its env default (8).
   qtState.copyTraceSample = Number(settings.copy_trace_sample) > 0 ? Number(settings.copy_trace_sample) : undefined;
