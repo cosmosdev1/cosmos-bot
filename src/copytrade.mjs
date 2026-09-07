@@ -52,6 +52,12 @@ const DENY_COOLDOWN_MS = N("COPY_DENY_COOLDOWN_MS", 120_000);   // wait before r
 // of them at once means the exchange, not the markets.
 const venueRefusals = new Map();                                   // cid -> when it refused
 let venueBackoffUntil = 0;
+// SERVER no_book MEMO (2026-09-07): the gate refused this token because the venue has no live book /
+// no best ask. Re-asking every cycle is a gate call and a cloud_orders row each time (measured: 525 and
+// 317 identical denials on two settled legs in one night). Per token, 10 minutes, then re-evaluated -
+// a timer, never a terminal verdict. Applies to every profile: it changes nothing about the first attempt.
+const noBookUntil = new Map();
+const NO_BOOK_MEMO_MS = N("COPY_NO_BOOK_MEMO_MS", 10 * 60_000);
 const VENUE_WINDOW_MS = N("COPY_VENUE_WINDOW_MS", 5 * 60_000);
 const VENUE_MIN_MARKETS = N("COPY_VENUE_MIN_MARKETS", 3);
 const VENUE_BACKOFF_MS = N("COPY_VENUE_BACKOFF_MS", 5 * 60_000);
@@ -608,8 +614,17 @@ export function startCopyTrade(deps) {
   let alive = true;
 
   async function priceFor(tokenId, capCents, floorCents) {
-    const mid = await pm.getPriceCents(tokenId, { fresh: true });   // ENTRY: never a cached price
-    if (mid == null) return null;
+    let mid = await pm.getPriceCents(tokenId, { fresh: true });   // ENTRY: never a cached price
+    // HIGH-CAPTURE (owner 2026-09-07): a BUY executes against the ASK. With an empty bid side the venue
+    // reports no midpoint, and the entry was refused as "no price" although the order was executable
+    // (measured 2026-09-06 22:04-22:31Z: four thin election markets, 0 bids / 33-49 asks - the only
+    // NOT_HARD class in 69 eligible). The best ask IS what such an order pays, so it stands in. The
+    // default profile keeps the old behaviour: no midpoint, no entry.
+    if ((mid == null || !(mid > 0)) && !G().priceBand && typeof pm.getBestAskCents === "function") {
+      const ask = await pm.getBestAskCents(tokenId);
+      if (ask != null && ask > 0) mid = ask;
+    }
+    if (mid == null || !(mid > 0)) return null;
     lastMid.set(tokenId, mid);
     lastMidAt.set(tokenId, Date.now());   // Phase 3A: age of the price the order was built on   // the executable price; priceFor RETURNS the FAK ceiling, not this
 
@@ -665,6 +680,7 @@ export function startCopyTrade(deps) {
       return false;
     }
     const tok = String(sig.token_id);
+    if ((noBookUntil.get(tok) ?? 0) > Date.now()) { tr?.block("venue_no_book"); bumpSkip("venue: no live book (server) - re-check in " + Math.ceil((noBookUntil.get(tok) - Date.now()) / 60000) + "min"); return false; }
     if (inFlightBuys.has(tok)) { tr?.block("inflight"); bumpSkip("buy-in-flight"); return false; }
     inFlightBuys.add(tok);
     try {
@@ -748,6 +764,7 @@ export function startCopyTrade(deps) {
       // (not Polymarket) was refusing every buy for two days (2026-07-26 incident).
       const why = String(r.body?.polymarket?.error ?? r.error ?? r.err ?? r.status ?? "");
       tr?.sign(r.cloudCode || "venue", !r.cloudCode).venue(why.slice(0, 60) || "zero-fill", 0);
+      if (r.cloudCode === "no_book") noBookUntil.set(String(sig.token_id), Date.now() + NO_BOOK_MEMO_MS);
       if (r.cloudCode === "day_budget" || r.cloudCode === "hour_budget" || /exceed the (daily|hourly) budget/i.test(why)) {
         budgetPausedUntil = Date.now() + BUDGET_PAUSE_MS;
         bumpSkip("budget-paused");

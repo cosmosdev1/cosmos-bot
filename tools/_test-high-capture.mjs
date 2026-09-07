@@ -29,11 +29,17 @@ ck("price_gate is behind the profile at both sites, and nowhere bare", count(/G\
 ck("entry band is behind the profile at both sites (pair legs keep their arb cap)", count(/G\(\)\.priceBand \|\| sig\.is_pair \? inPlayBand\(sig, cap, floor\) : \{ cap: G\(\)\.entryCap, floor: G\(\)\.entryFloor \}/g) === 2);
 ck("add band is behind the profile at both sites", count(/G\(\)\.priceBand \? addCapFor\(sig\) : G\(\)\.entryCap, G\(\)\.priceBand \? MIN_ADD_CENTS : G\(\)\.entryFloor/g) === 2);
 // hard gates must never be guarded by the profile
-for (const hard of ["cash_insufficient", "local_floor", "portfolio_floor", "cooldown", "inflight", "already_holding", "buy_once", "no_rebuy", "add_below_min", "target_below_min", "tier_zero", "window_dead", "window_wait"]) {
+ck("server no_book is remembered per token for a bounded time and re-checked, never terminal", /noBookUntil\.set\(String\(sig\.token_id\), Date\.now\(\) \+ NO_BOOK_MEMO_MS\)/.test(src) && /tr\?\.block\("venue_no_book"\)/.test(src) && /NO_BOOK_MEMO_MS = N\("COPY_NO_BOOK_MEMO_MS", 10 \* 60_000\)/.test(src));
+for (const hard of ["cash_insufficient", "local_floor", "portfolio_floor", "cooldown", "inflight", "already_holding", "buy_once", "no_rebuy", "add_below_min", "target_below_min", "tier_zero", "window_dead", "window_wait", "venue_no_book"]) {
   const lines = src.split("\n").filter((l) => l.includes(`"${hard}"`));
   ck(`hard gate ${hard} is never behind G() (${lines.length} site(s))`, lines.length > 0 && lines.every((l) => !/G\(\)\./.test(l)));
 }
 ck("the profile is consulted only through G()", count(/gateProfile\(/g) === 1 && /const G = \(\) => gateProfile\(state\.highCapture === true, V2_MAX_ENTRY_CENTS\)/.test(src));
+// ask fallback (2026-09-07): only when there is no midpoint, only for high-capture, never a cached price
+ck("no-midpoint entries fall back to the best ASK under high-capture only", count(/\(mid == null \|\| !\(mid > 0\)\) && !G\(\)\.priceBand && typeof pm\.getBestAskCents === "function"/g) === 1);
+ck("the fallback reads the live book through getBestAskCents", /const ask = await pm\.getBestAskCents\(tokenId\);/.test(src));
+const pmSrc = fs.readFileSync(new URL("../src/polymarket.mjs", import.meta.url), "utf8");
+ck("polymarket.getBestAskCents exists and returns the LOWEST resting ask with size", /async getBestAskCents\(tokenId\)/.test(pmSrc) && /price < best/.test(pmSrc.slice(pmSrc.indexOf("async getBestAskCents")).slice(0, 900)));
 const bot = fs.readFileSync(new URL("../src/bot.mjs", import.meta.url), "utf8");
 ck("bot maps settings.high_capture === true only (never truthy strings)", /qtState\.highCapture = settings\.high_capture === true;/.test(bot));
 console.log("\n" + (fail === 0 ? "ALL PASS" : "FAILURES") + ": " + pass + " passed, " + fail + " failed");

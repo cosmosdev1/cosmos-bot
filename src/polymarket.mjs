@@ -979,6 +979,26 @@ export async function makePolymarket(config) {
       }
     },
 
+    // The LIVE best ask in cents - the lowest price a seller is currently resting: what a BUY pays.
+    // Mirrors getBestBidCents. Returns null with NO ask at all (nothing to buy) or an unreadable book.
+    // Exists for HIGH-CAPTURE entries (2026-09-07): the midpoint is undefined when the bid side is
+    // empty, and four thin election markets with 0 bids / 33-49 asks were refused as "no price".
+    async getBestAskCents(tokenId) {
+      try {
+        const book = await client.getOrderBook(tokenId);
+        const asks = book?.asks || book?.sells || [];
+        let best = 0;
+        for (const a of asks) {
+          const price = Number(a?.price ?? a?.[0] ?? 0);
+          const size = Number(a?.size ?? a?.[1] ?? 0);
+          if (price > 0 && size > 0 && (best === 0 || price < best)) best = price;
+        }
+        return best > 0 ? Math.round(best * 100) : null;
+      } catch {
+        return null;
+      }
+    },
+
     // CONTEMPORANEOUS BOOK SNAPSHOT (Phase 3A). ONE getOrderBook call returning everything the
     // order-time trace needs: best bid, best ask, the mid they imply, and how much USD rests at or
     // below a limit. Phase 2 could not settle the stale-entry-cap hypothesis because no historical
