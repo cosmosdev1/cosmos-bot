@@ -202,7 +202,11 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
   // The digest includes the attempt count, so a second attempt always ships even when it ends at the
   // same stage with the same blocker as the first.
   const digestOf = (r) =>
-    `${r.stageMax}|${r.blockAtMax ?? ""}|${r.attemptCount}|${r.terminal ? 1 : 0}|${r.signCode ?? ""}|${r.venueResult ?? ""}|${r.bookRev}|${r.eligN || 0}`;
+    `${r.stageMax}|${r.blockAtMax ?? ""}|${r.attemptCount}|${r.terminal ? 1 : 0}|${r.signCode ?? ""}|${r.venueResult ?? ""}|${r.bookRev}|${r.eligN || 0}|${evSig(r)}`;
+  // the current event's disposition is part of the digest: a new blocker seen during it, its first attempt,
+  // or its end must re-ship the row so the server's per-event record is complete
+  const evSig = (r) => { const e = r.events && r.events[r.events.length - 1]; return e ? `${e.n}:${e.blocks.length}:${e.by ?? ""}:${e.an ?? ""}` : ""; };
+  const MAX_EVENTS = 6, MAX_EVENT_BLOCKS = 8;
   // ELIGIBILITY EVENTS (owner 2026-09-07). The owner's invariant applies at the moment an opportunity
   // becomes authorized + tier-positive + inside the window; the ledger's denominator is the TIME of
   // that event, not when the row was first seen. A block from this set means the opportunity is NOT
@@ -249,7 +253,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           firstAt: now(), lastAt: now(), evals: 0,
           stageMax: 0, blockAtMax: null, blockFirst: null, blockLast: null,
           terminal: false, attempted: false,
-          eligOpen: false, eligAt: 0, eligN: 0,
+          eligOpen: false, eligAt: 0, eligN: 0, events: [],
           attempts: [], attemptCount: 0, bookRev: 0,
           signCode: null, venueResult: null, filledUsd: null, ctx: null,
           sig: null, emitted: null,
@@ -293,7 +297,13 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           const v = Number(s) || 0;
           if (v > r.stageMax) { r.stageMax = v; r.blockAtMax = null; markDirty(r); }
           // a new eligibility event: reaching the window after a non-eligible state (see PRE_ELIGIBILITY_BLOCKS)
-          if (v >= STAGE.WINDOW_OPEN && !r.eligOpen) { r.eligOpen = true; r.eligAt = now(); r.eligN = (r.eligN || 0) + 1; markDirty(r); }
+          if (v >= STAGE.WINDOW_OPEN && !r.eligOpen) {
+            r.eligOpen = true; r.eligAt = now(); r.eligN = (r.eligN || 0) + 1;
+            // one record per event: what blocked it, its first attempt, and what ended it (bounded)
+            r.events.push({ n: r.eligN, at: r.eligAt, blocks: [], end: null, by: null, an: null, aa: null });
+            if (r.events.length > MAX_EVENTS) r.events = r.events.slice(-MAX_EVENTS);
+            markDirty(r);
+          }
         } catch { /* never throw into trading */ }
         return this;
       },
@@ -306,6 +316,13 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           const name = String(b).slice(0, 48);
           if (!r.blockFirst) r.blockFirst = name;
           r.blockLast = name;
+          {
+            const ev = r.events && r.events[r.events.length - 1];
+            if (ev && ev.end == null) {
+              if (!ev.blocks.includes(name) && ev.blocks.length < MAX_EVENT_BLOCKS) { ev.blocks.push(name); markDirty(r); }
+              if (PRE_ELIGIBILITY_BLOCKS.has(name)) { ev.end = now(); ev.by = name; markDirty(r); }
+            }
+          }
           if (PRE_ELIGIBILITY_BLOCKS.has(name)) r.eligOpen = false;   // not eligible now: the next WINDOW_OPEN is a new event
           if (r.blockAtMax !== name) { r.blockAtMax = name; if (ctx) r.ctx = compact(ctx); markDirty(r); }
           if (isTerminal(name) && !r.terminal) { r.terminal = true; markDirty(r); }
@@ -334,6 +351,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           // slice keeps object identity, so a probe still in flight for a kept attempt lands
           // correctly; one whose attempt was clamped away mutates an orphan and is discarded.
           r.attempts = clampAttempts(r.attempts, MAX_ATT);
+          { const ev = r.events && r.events[r.events.length - 1]; if (ev && ev.end == null && ev.an == null) { ev.an = r.attemptCount; ev.aa = now(); } }   // the event's first attempt
           if (!r.pathAtFirstAttempt) r.pathAtFirstAttempt = r.lastPath;
           if (r.stageMax < STAGE.SIGN_REQUESTED) { r.stageMax = STAGE.SIGN_REQUESTED; r.blockAtMax = null; }
           markDirty(r);
@@ -486,6 +504,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           a: r.attempted, at: r.attempts.map(wireAttempt), an: r.attemptCount,
           sc: r.signCode, vr: r.venueResult, fu: r.filledUsd, x: r.ctx,
           e: r.eligAt ? Math.round(r.eligAt / 1000) : null, en: r.eligN || 0,   // latest eligibility event (unix s) and how many
+          ev: (r.events || []).map((v) => ({ n: v.n, at: Math.round(v.at / 1000), end: v.end ? Math.round(v.end / 1000) : null, by: v.by, bl: v.blocks, an: v.an, aa: v.aa ? Math.round(v.aa / 1000) : null })),
         });
         // A TERMINAL RECORD IS KEPT, NEVER FREED HERE. Deleting it looked like a memory win, but the
         // engine goes on iterating that row for the rest of its life: the next evaluation would

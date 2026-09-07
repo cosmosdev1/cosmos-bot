@@ -45,5 +45,26 @@ const open = (t, tok) => t.open({ tokenId: tok, gen: 0, path: "poll", conditionI
   const rows = t.drain(10);
   ck("a row that never reached the window carries e = null, en = 0", rows.length === 1 && rows[0].e === null && rows[0].en === 0);
 }
+{ // 7. EVENT RECORDS: two events on one row, each with its own blockers, attempt and end
+  const t = mk();
+  open(t, "h").stage(STAGE.WINDOW_OPEN).block("cash_insufficient", { need: 5, cash: 1 });   // event 1: eligible, hard-blocked
+  open(t, "h").block("window_dead", { h_left: -0.2 });                                          // event 1 ends
+  t.drain(10);
+  open(t, "h").stage(STAGE.TIER_RESOLVED).stage(STAGE.WINDOW_OPEN);                            // event 2 (window re-opened)
+  open(t, "h").block("cooldown"); open(t, "h").stage(STAGE.WINDOW_OPEN).attempt({ kind: "open", usd: 2 });   // event 2: transient then attempted
+  const [row] = t.drain(10);
+  const ev = row && row.ev;
+  ck("row ships two event records", Array.isArray(ev) && ev.length === 2 && ev[0].n === 1 && ev[1].n === 2);
+  ck("event 1 carries its own blockers and its ender", ev[0].bl.join() === "cash_insufficient,window_dead" && ev[0].by === "window_dead" && ev[0].end >= ev[0].at && ev[0].an === null);
+  ck("event 2 carries only its blockers and its first attempt", ev[1].bl.join() === "cooldown" && ev[1].an === 1 && ev[1].aa >= ev[1].at && ev[1].end === null);
+  ck("the digest re-ships on a new blocker within the event", (() => { open(t, "h").block("price_gate"); return t.drain(10).length === 1; })());
+  ck("re-delivering the same state does not ship again (idempotent at the source)", t.drain(10).length === 0);
+}
+{ // 8. bounded: never more than 6 event records, oldest dropped
+  const t = mk();
+  for (let i = 0; i < 9; i++) { open(t, "z").stage(STAGE.WINDOW_OPEN); open(t, "z").block("window_dead"); }
+  const [row] = t.drain(10);
+  ck("event list capped at 6, latest kept", row.ev.length === 6 && row.ev[5].n === 9 && row.en === 9);
+}
 console.log("\n" + (fail === 0 ? "ALL PASS" : "FAILURES") + ": " + pass + " passed, " + fail + " failed");
 assert.equal(fail, 0);
