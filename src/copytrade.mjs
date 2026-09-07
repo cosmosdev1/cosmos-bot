@@ -613,16 +613,23 @@ export function startCopyTrade(deps) {
   const stats = { signals: 0, opens: 0, adds: 0, fills: 0, waiting: 0 };
   let alive = true;
 
-  async function priceFor(tokenId, capCents, floorCents) {
+  async function priceFor(tokenId, capCents, floorCents, tr = null) {
     let mid = await pm.getPriceCents(tokenId, { fresh: true });   // ENTRY: never a cached price
     // HIGH-CAPTURE (owner 2026-09-07): a BUY executes against the ASK. With an empty bid side the venue
     // reports no midpoint, and the entry was refused as "no price" although the order was executable
     // (measured 2026-09-06 22:04-22:31Z: four thin election markets, 0 bids / 33-49 asks - the only
     // NOT_HARD class in 69 eligible). The best ask IS what such an order pays, so it stands in. The
     // default profile keeps the old behaviour: no midpoint, no entry.
-    if ((mid == null || !(mid > 0)) && !G().priceBand && typeof pm.getBestAskCents === "function") {
-      const ask = await pm.getBestAskCents(tokenId);
-      if (ask != null && ask > 0) mid = ask;
+    //
+    // DECISION-TIME BOOK CONTEXT, observation only (owner 2026-09-07): for high-capture entries the top
+    // of book is read once, fresh, and stamped on the opportunity trace BEFORE any order is built -
+    // best bid, best ask, the mid actually used, its source (midpoint | best_ask | none), the venue's
+    // book timestamp and the read latency. It never changes what is priced or whether an order is sent.
+    if (!G().priceBand && typeof pm.getBookTopCents === "function") {
+      const top = await pm.getBookTopCents(tokenId);
+      let src = mid > 0 ? "midpoint" : "none";
+      if (!(mid > 0) && top.ask > 0) { mid = top.ask; src = "best_ask"; }
+      if (tr) { try { tr.note("px", { bid: top.bid, ask: top.ask, mid: mid > 0 ? mid : null, src, book_ts: top.book_ts, read_ms: top.read_ms }); } catch { /* observation only */ } }
     }
     if (mid == null || !(mid > 0)) return null;
     lastMid.set(tokenId, mid);
@@ -680,7 +687,13 @@ export function startCopyTrade(deps) {
       return false;
     }
     const tok = String(sig.token_id);
-    if ((noBookUntil.get(tok) ?? 0) > Date.now()) { tr?.block("venue_no_book"); bumpSkip("venue: no live book (server) - re-check in " + Math.ceil((noBookUntil.get(tok) - Date.now()) / 60000) + "min"); return false; }
+    if ((noBookUntil.get(tok) ?? 0) > Date.now()) {
+      // The memo suppresses IDENTICAL unavailable-book retries only: a fresh live read showing a usable
+      // ask lifts it immediately (owner 2026-09-07), so a recovered book is never held back by the timer.
+      const top = typeof pm.getBookTopCents === "function" ? await pm.getBookTopCents(tok) : null;
+      if (top && top.ask > 0) { noBookUntil.delete(tok); tr?.note("px", { bid: top.bid, ask: top.ask, src: "memo_lifted", book_ts: top.book_ts }); }
+      else { tr?.block("venue_no_book", { bid: top?.bid ?? null, ask: top?.ask ?? null }); bumpSkip("venue: no live book (server) - re-check in " + Math.ceil((noBookUntil.get(tok) - Date.now()) / 60000) + "min"); return false; }
+    }
     if (inFlightBuys.has(tok)) { tr?.block("inflight"); bumpSkip("buy-in-flight"); return false; }
     inFlightBuys.add(tok);
     try {
@@ -1093,7 +1106,7 @@ export function startCopyTrade(deps) {
       let add = Math.min(target, posCeil) - held;
       if (add < MIN_ADD_USD) { tr.block("add_below_min"); return; }                              // at/over the ceiling or fully sized (steady-state)
       if (!ONESHOT && copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); return skip("exposure cap (add $" + add.toFixed(2) + ")"); }
-      const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor);
+      const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
       if (px == null) { tr.block("price_out_of_band"); return skip("add price out of band"); }
       { const rb = v2ReserveBlocked(sig, add); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
@@ -1132,7 +1145,7 @@ export function startCopyTrade(deps) {
     // HIGH-CAPTURE: the owner's v2 ceiling and the 1c tick, no in-play band, no per-signal cap. A pair
     // leg keeps its arb cap (both legs above the $1 redemption is an economic impossibility, not strategy).
     const band = G().priceBand || sig.is_pair ? inPlayBand(sig, cap, floor) : { cap: G().entryCap, floor: G().entryFloor };
-    const px = await priceFor(sig.token_id, band.cap, band.floor);
+    const px = await priceFor(sig.token_id, band.cap, band.floor, tr);
     if (px == null) { tr.block("price_out_of_band", { cap: band.cap, floor: band.floor }); return skip("price out of band (cap " + band.cap + "c)"); }
     tr.stage(STAGE.PRICED);
     const execC = lastMid.get(sig.token_id) ?? px;
@@ -1286,7 +1299,7 @@ export function startCopyTrade(deps) {
         if (copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); continue; }      // copytrade never exceeds its slice
         // ALREADY IN: he's reinforcing, so we follow him up — but an adopt add stays inside the
         // ±20c-of-his-entry band (addCapFor); only non-adopt whale-fill adds ride to the flat cap.
-        const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor);
+        const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
         if (px == null) { tr.block("price_out_of_band"); continue; }
         if (v2ReserveBlocked(sig, add)) { tr.block("reserve_blocked"); continue; }
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
@@ -1324,7 +1337,7 @@ export function startCopyTrade(deps) {
           : Math.min(capMax2, Number(sig.max_entry_cents) || capMax2);
         const floor = sig.is_pair ? 1 : (String(sig.category).toUpperCase() === "SPORTS" ? 3 : MIN_ENTRY_CENTS);
         const band = G().priceBand || sig.is_pair ? inPlayBand(sig, cap, floor) : { cap: G().entryCap, floor: G().entryFloor };   // HIGH-CAPTURE: see the fast path
-        const px = await priceFor(sig.token_id, band.cap, band.floor);
+        const px = await priceFor(sig.token_id, band.cap, band.floor, tr);
         if (px == null) { tr.block("price_out_of_band", { cap: band.cap, floor: band.floor, mid: lastMid.get(sig.token_id) ?? null }); continue; }
         tr.stage(STAGE.PRICED);
         // Same first-leg gate as the fast path (owner 2026-08-18): unconditional under v2, and the

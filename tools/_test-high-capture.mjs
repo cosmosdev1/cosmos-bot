@@ -29,17 +29,25 @@ ck("price_gate is behind the profile at both sites, and nowhere bare", count(/G\
 ck("entry band is behind the profile at both sites (pair legs keep their arb cap)", count(/G\(\)\.priceBand \|\| sig\.is_pair \? inPlayBand\(sig, cap, floor\) : \{ cap: G\(\)\.entryCap, floor: G\(\)\.entryFloor \}/g) === 2);
 ck("add band is behind the profile at both sites", count(/G\(\)\.priceBand \? addCapFor\(sig\) : G\(\)\.entryCap, G\(\)\.priceBand \? MIN_ADD_CENTS : G\(\)\.entryFloor/g) === 2);
 // hard gates must never be guarded by the profile
-ck("server no_book is remembered per token for a bounded time and re-checked, never terminal", /noBookUntil\.set\(String\(sig\.token_id\), Date\.now\(\) \+ NO_BOOK_MEMO_MS\)/.test(src) && /tr\?\.block\("venue_no_book"\)/.test(src) && /NO_BOOK_MEMO_MS = N\("COPY_NO_BOOK_MEMO_MS", 10 \* 60_000\)/.test(src));
+ck("server no_book is remembered per token for a bounded time and re-checked, never terminal", /noBookUntil\.set\(String\(sig\.token_id\), Date\.now\(\) \+ NO_BOOK_MEMO_MS\)/.test(src) && /tr\?\.block\("venue_no_book", \{/.test(src) && /NO_BOOK_MEMO_MS = N\("COPY_NO_BOOK_MEMO_MS", 10 \* 60_000\)/.test(src));
 for (const hard of ["cash_insufficient", "local_floor", "portfolio_floor", "cooldown", "inflight", "already_holding", "buy_once", "no_rebuy", "add_below_min", "target_below_min", "tier_zero", "window_dead", "window_wait", "venue_no_book"]) {
   const lines = src.split("\n").filter((l) => l.includes(`"${hard}"`));
   ck(`hard gate ${hard} is never behind G() (${lines.length} site(s))`, lines.length > 0 && lines.every((l) => !/G\(\)\./.test(l)));
 }
 ck("the profile is consulted only through G()", count(/gateProfile\(/g) === 1 && /const G = \(\) => gateProfile\(state\.highCapture === true, V2_MAX_ENTRY_CENTS\)/.test(src));
 // ask fallback (2026-09-07): only when there is no midpoint, only for high-capture, never a cached price
-ck("no-midpoint entries fall back to the best ASK under high-capture only", count(/\(mid == null \|\| !\(mid > 0\)\) && !G\(\)\.priceBand && typeof pm\.getBestAskCents === "function"/g) === 1);
-ck("the fallback reads the live book through getBestAskCents", /const ask = await pm\.getBestAskCents\(tokenId\);/.test(src));
+ck("no-midpoint entries fall back to the best ASK under high-capture only (one live top-of-book read)", count(/if \(!G\(\)\.priceBand && typeof pm\.getBookTopCents === "function"\) \{\r?\n\s+const top = await pm\.getBookTopCents\(tokenId\);/g) === 1);
+ck("the fallback never uses a cached price: getPriceCents is called fresh", /pm\.getPriceCents\(tokenId, \{ fresh: true \}\)/.test(src));
 const pmSrc = fs.readFileSync(new URL("../src/polymarket.mjs", import.meta.url), "utf8");
 ck("polymarket.getBestAskCents exists and returns the LOWEST resting ask with size", /async getBestAskCents\(tokenId\)/.test(pmSrc) && /price < best/.test(pmSrc.slice(pmSrc.indexOf("async getBestAskCents")).slice(0, 900)));
+// decision-time book context (2026-09-07): recorded BEFORE any order is built, high-capture only, observation only
+ck("priceFor stamps px {bid, ask, mid, src, book_ts} on the trace for high-capture entries", /tr\.note\("px", \{ bid: top\.bid, ask: top\.ask, mid: mid > 0 \? mid : null, src, book_ts: top\.book_ts, read_ms: top\.read_ms \}\)/.test(src));
+ck("the book context is guarded by !G().priceBand (never read for the default profile)", /if \(!G\(\)\.priceBand && typeof pm\.getBookTopCents === "function"\) \{/.test(src));
+ck("price source is best_ask ONLY when the midpoint is unavailable", /if \(!\(mid > 0\) && top\.ask > 0\) \{ mid = top\.ask; src = "best_ask"; \}/.test(src));
+ck("the book is read LIVE (getBookTopCents calls getOrderBook, no cache)", /async getBookTopCents\(tokenId\) \{\r?\n\s+const t0 = Date\.now\(\);\r?\n\s+try \{\r?\n\s+const book = await client\.getOrderBook\(tokenId\);/.test(pmSrc));
+ck("a missing ask never fabricates a price (no ask, no midpoint -> null)", /if \(mid == null \|\| !\(mid > 0\)\) return null;/.test(src) && /bid: bid > 0 \? Math\.round\(bid \* 100\) : null, ask: ask > 0 \? Math\.round\(ask \* 100\) : null/.test(pmSrc));
+ck("every priceFor call site passes the trace", count(/priceFor\(sig\.token_id, [^\n]*, tr\)/g) === 4);
+ck("the no_book memo is lifted by a fresh usable ask, else blocks venue_no_book", /if \(top && top\.ask > 0\) \{ noBookUntil\.delete\(tok\);/.test(src) && /tr\?\.block\("venue_no_book", \{ bid: top\?\.bid \?\? null, ask: top\?\.ask \?\? null \}\)/.test(src));
 const bot = fs.readFileSync(new URL("../src/bot.mjs", import.meta.url), "utf8");
 ck("bot maps settings.high_capture === true only (never truthy strings)", /qtState\.highCapture = settings\.high_capture === true;/.test(bot));
 console.log("\n" + (fail === 0 ? "ALL PASS" : "FAILURES") + ": " + pass + " passed, " + fail + " failed");

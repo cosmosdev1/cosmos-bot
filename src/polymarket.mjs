@@ -979,6 +979,25 @@ export async function makePolymarket(config) {
       }
     },
 
+    // TOP OF BOOK, one live read (owner 2026-09-07, observation for HIGH-CAPTURE entries and the ask
+    // fallback): best bid (highest resting with size), best ask (lowest resting with size), and the
+    // venue's book timestamp when it sends one. Nulls on any failure; no caller may fabricate a price
+    // from a missing side - a missing ask means "no usable ask".
+    async getBookTopCents(tokenId) {
+      const t0 = Date.now();
+      try {
+        const book = await client.getOrderBook(tokenId);
+        const bids = book?.bids || book?.buys || [], asks = book?.asks || book?.sells || [];
+        let bid = 0, ask = 0;
+        for (const b of bids) { const p = Number(b?.price ?? b?.[0] ?? 0), s = Number(b?.size ?? b?.[1] ?? 0); if (p > bid && s > 0) bid = p; }
+        for (const a of asks) { const p = Number(a?.price ?? a?.[0] ?? 0), s = Number(a?.size ?? a?.[1] ?? 0); if (p > 0 && s > 0 && (ask === 0 || p < ask)) ask = p; }
+        const ts = Number(book?.timestamp ?? book?.ts ?? 0);
+        return { bid: bid > 0 ? Math.round(bid * 100) : null, ask: ask > 0 ? Math.round(ask * 100) : null, book_ts: ts > 0 ? ts : null, read_ms: Date.now() - t0 };
+      } catch {
+        return { bid: null, ask: null, book_ts: null, read_ms: Date.now() - t0, err: true };
+      }
+    },
+
     // The LIVE best ask in cents - the lowest price a seller is currently resting: what a BUY pays.
     // Mirrors getBestBidCents. Returns null with NO ask at all (nothing to buy) or an unreadable book.
     // Exists for HIGH-CAPTURE entries (2026-09-07): the midpoint is undefined when the bid side is

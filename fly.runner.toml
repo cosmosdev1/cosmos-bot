@@ -45,7 +45,7 @@ primary_region = 'arn'
   # 683MB available while children were still spawning - too close to the 2026-08-05 OOM, so 8192.
   # These values are what the MACHINE actually runs; a `fly deploy` reverts the machine to whatever
   # is written HERE, so this block and the live machine must be kept in step.
-  memory = '8gb'
+  memory = '16gb'   # LIVE VALUE 2026-09-07 (fly machine list: performance-2x:16384MB); the stale 8gb would have SHRUNK the box on the next deploy
   cpu_kind = 'performance'
   cpus = 2
 
