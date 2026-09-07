@@ -41,7 +41,7 @@ ck("the fallback never uses a cached price: getPriceCents is called fresh", /pm\
 const pmSrc = fs.readFileSync(new URL("../src/polymarket.mjs", import.meta.url), "utf8");
 ck("polymarket.getBestAskCents exists and returns the LOWEST resting ask with size", /async getBestAskCents\(tokenId\)/.test(pmSrc) && /price < best/.test(pmSrc.slice(pmSrc.indexOf("async getBestAskCents")).slice(0, 900)));
 // decision-time book context (2026-09-07): recorded BEFORE any order is built, high-capture only, observation only
-ck("priceFor stamps px {bid, ask, mid, src, book_ts} on the trace for high-capture entries", /tr\.note\("px", \{ bid: top\.bid, ask: top\.ask, mid: mid > 0 \? mid : null, src, book_ts: top\.book_ts, read_ms: top\.read_ms \}\)/.test(src));
+ck("priceFor stamps px_bid/px_ask/px_mid/px_src/px_ts/px_ms as SCALARS on the trace for high-capture entries", /tr\.note\("px_bid", top\.bid\)\.note\("px_ask", top\.ask\)\.note\("px_mid", mid > 0 \? mid : null\)\.note\("px_src", src\)\.note\("px_ts", top\.book_ts\)\.note\("px_ms", top\.read_ms\)/.test(src) && !/tr\.note\("px", \{/.test(src));
 ck("the book context is guarded by !G().priceBand (never read for the default profile)", /if \(!G\(\)\.priceBand && typeof pm\.getBookTopCents === "function"\) \{/.test(src));
 ck("price source is best_ask ONLY when the midpoint is unavailable", /if \(!\(mid > 0\) && top\.ask > 0\) \{ mid = top\.ask; src = "best_ask"; \}/.test(src));
 ck("the book is read LIVE (getBookTopCents calls getOrderBook, no cache)", /async getBookTopCents\(tokenId\) \{\r?\n\s+const t0 = Date\.now\(\);\r?\n\s+try \{\r?\n\s+const book = await client\.getOrderBook\(tokenId\);/.test(pmSrc));

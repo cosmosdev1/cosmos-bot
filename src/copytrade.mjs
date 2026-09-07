@@ -629,7 +629,8 @@ export function startCopyTrade(deps) {
       const top = await pm.getBookTopCents(tokenId);
       let src = mid > 0 ? "midpoint" : "none";
       if (!(mid > 0) && top.ask > 0) { mid = top.ask; src = "best_ask"; }
-      if (tr) { try { tr.note("px", { bid: top.bid, ask: top.ask, mid: mid > 0 ? mid : null, src, book_ts: top.book_ts, read_ms: top.read_ms }); } catch { /* observation only */ } }
+      // scalars, one note each: the trace's compact() flattens nested objects to "[object Object]"
+      if (tr) { try { tr.note("px_bid", top.bid).note("px_ask", top.ask).note("px_mid", mid > 0 ? mid : null).note("px_src", src).note("px_ts", top.book_ts).note("px_ms", top.read_ms); } catch { /* observation only */ } }
     }
     if (mid == null || !(mid > 0)) return null;
     lastMid.set(tokenId, mid);
@@ -691,7 +692,7 @@ export function startCopyTrade(deps) {
       // The memo suppresses IDENTICAL unavailable-book retries only: a fresh live read showing a usable
       // ask lifts it immediately (owner 2026-09-07), so a recovered book is never held back by the timer.
       const top = typeof pm.getBookTopCents === "function" ? await pm.getBookTopCents(tok) : null;
-      if (top && top.ask > 0) { noBookUntil.delete(tok); tr?.note("px", { bid: top.bid, ask: top.ask, src: "memo_lifted", book_ts: top.book_ts }); }
+      if (top && top.ask > 0) { noBookUntil.delete(tok); try { tr?.note("px_bid", top.bid).note("px_ask", top.ask).note("px_src", "memo_lifted").note("px_ts", top.book_ts); } catch { /* observation only */ } }
       else { tr?.block("venue_no_book", { bid: top?.bid ?? null, ask: top?.ask ?? null }); bumpSkip("venue: no live book (server) - re-check in " + Math.ceil((noBookUntil.get(tok) - Date.now()) / 60000) + "min"); return false; }
     }
     if (inFlightBuys.has(tok)) { tr?.block("inflight"); bumpSkip("buy-in-flight"); return false; }
