@@ -202,7 +202,14 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
   // The digest includes the attempt count, so a second attempt always ships even when it ends at the
   // same stage with the same blocker as the first.
   const digestOf = (r) =>
-    `${r.stageMax}|${r.blockAtMax ?? ""}|${r.attemptCount}|${r.terminal ? 1 : 0}|${r.signCode ?? ""}|${r.venueResult ?? ""}|${r.bookRev}`;
+    `${r.stageMax}|${r.blockAtMax ?? ""}|${r.attemptCount}|${r.terminal ? 1 : 0}|${r.signCode ?? ""}|${r.venueResult ?? ""}|${r.bookRev}|${r.eligN || 0}`;
+  // ELIGIBILITY EVENTS (owner 2026-09-07). The owner's invariant applies at the moment an opportunity
+  // becomes authorized + tier-positive + inside the window; the ledger's denominator is the TIME of
+  // that event, not when the row was first seen. A block from this set means the opportunity is NOT
+  // eligible right now, so the next evaluation that reaches WINDOW_OPEN is a new event with its own
+  // time - a window transition, or a later whale ADD that crosses the tier. Blocks after the window
+  // (cash, price, dedup, venue) leave the event open: the opportunity is eligible and merely stopped.
+  const PRE_ELIGIBILITY_BLOCKS = new Set(["window_wait", "window_dead", "tier_zero", "portfolio_floor", "engine_off", "no_cycle_state", "hub_not_enterable", "driver_not_picked", "budget_paused", "s4_marker_suppressed", "pre_game_closed"]);
 
   function evict() {
     if (live.size <= MAX_TRACKED) return;
@@ -242,6 +249,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           firstAt: now(), lastAt: now(), evals: 0,
           stageMax: 0, blockAtMax: null, blockFirst: null, blockLast: null,
           terminal: false, attempted: false,
+          eligOpen: false, eligAt: 0, eligN: 0,
           attempts: [], attemptCount: 0, bookRev: 0,
           signCode: null, venueResult: null, filledUsd: null, ctx: null,
           sig: null, emitted: null,
@@ -284,6 +292,8 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
         try {
           const v = Number(s) || 0;
           if (v > r.stageMax) { r.stageMax = v; r.blockAtMax = null; markDirty(r); }
+          // a new eligibility event: reaching the window after a non-eligible state (see PRE_ELIGIBILITY_BLOCKS)
+          if (v >= STAGE.WINDOW_OPEN && !r.eligOpen) { r.eligOpen = true; r.eligAt = now(); r.eligN = (r.eligN || 0) + 1; markDirty(r); }
         } catch { /* never throw into trading */ }
         return this;
       },
@@ -296,6 +306,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           const name = String(b).slice(0, 48);
           if (!r.blockFirst) r.blockFirst = name;
           r.blockLast = name;
+          if (PRE_ELIGIBILITY_BLOCKS.has(name)) r.eligOpen = false;   // not eligible now: the next WINDOW_OPEN is a new event
           if (r.blockAtMax !== name) { r.blockAtMax = name; if (ctx) r.ctx = compact(ctx); markDirty(r); }
           if (isTerminal(name) && !r.terminal) { r.terminal = true; markDirty(r); }
         } catch { /* never throw into trading */ }
@@ -474,6 +485,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           b: r.blockAtMax, b1: r.blockFirst, term: r.terminal,
           a: r.attempted, at: r.attempts.map(wireAttempt), an: r.attemptCount,
           sc: r.signCode, vr: r.venueResult, fu: r.filledUsd, x: r.ctx,
+          e: r.eligAt ? Math.round(r.eligAt / 1000) : null, en: r.eligN || 0,   // latest eligibility event (unix s) and how many
         });
         // A TERMINAL RECORD IS KEPT, NEVER FREED HERE. Deleting it looked like a memory win, but the
         // engine goes on iterating that row for the rest of its life: the next evaluation would
