@@ -31,7 +31,8 @@ const DRY = process.env.COPYTRADE_DRY === "1";
 import { inc as mInc } from "./metrics.mjs";
 import { withS4Attribution } from "./remote-signer.mjs";
 import { gateProfile } from "./high-capture.mjs";
-import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, fillIdsOnRow, conditionHeldUsd, conditionRoomUsd, CONDITION_CAP_PCT } from "./distinct-add.mjs";
+import { sourceId, newestFillIdOnRow, rememberSource, seenSource } from "./source-identity.mjs";
+import { NC_PCTS_HOSTED, NC_PCTS_LEGACY, CANDLE_PCTS, POSITION_CEIL_PCT_HOSTED, pctFromBands as ladderPct } from "./tier-ladder.mjs";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
 // How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
 // so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
@@ -909,11 +910,13 @@ export function startCopyTrade(deps) {
   // user. Server-delivered per user (settings.high_capture); the default profile is byte-for-byte the
   // old behaviour. Hard gates are not in the profile and cannot be switched by it.
   const G = () => gateProfile(state.highCapture === true, V2_MAX_ENTRY_CENTS);
-  // DISTINCT-ADD semantics (owner 2026-09-07): server-switched per user (settings.distinct_add), default off = the
-  // tier-transition top-up unchanged. Only the two ADD branches and the open-clip source records consult it.
-  const DISTINCT_ADD = () => state.distinctAdd === true;
   clockV2On = () => state.clockV2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_CLOCK_V2 || "");
   const V2_FLOOR_USD = Number(process.env.COPY_V2_FLOOR_USD) || 2;
+  // PER-POSITION CEILING (owner ruling 2026-09-08): hosted 6.5% - a full tier-1 6% executes under it with 0.5% headroom
+  // below the server's 7% per-condition hard cap (lib/cloud/risk.ts, untouched). Legacy keeps MAX_POSITION_PCT (5).
+  const positionCeilPct = () => (ONESHOT ? POSITION_CEIL_PCT_HOSTED : MAX_POSITION_PCT);
+  // TOP-UP MINIMUM: hosted $2 (the v2 sizing floor); legacy keeps the $1 scale-in increment.
+  const addFloorUsd = () => (ONESHOT ? V2_FLOOR_USD : MIN_ADD_USD);
   // Crypto cash reserve: the LAST 10% of the portfolio is crypto-only. A NON-candle buy needs cash
   // >= 10% of portfolio before it and may not take cash under 6% after. Candles spend freely.
   function v2ReserveBlocked(sig, amountUsd) {
@@ -939,16 +942,10 @@ export function startCopyTrade(deps) {
   // wallets[0].auto_tiers.v2, so a v2 bot resolves its own number and needs no schema change.
   // 5/3/2 -> 4/3/2 with the widened ranks (owner 2026-08-19). The RANKS live server-side (they decide
   // the dollar thresholds stamped on the signal); the bot only needs the matching percentages.
-  const V2_NC_PCTS = [5, 4, 3], V2_CANDLE_PCTS = [3, 2];
-  const pctFromBands = (cost, t, pcts) => {
-    if (!t) return null;
-    const ladder = [t.t1_usd, t.t2_usd, t.t3_usd];
-    for (let i = 0; i < pcts.length; i++) {
-      const th = Number(ladder[i]);
-      if (Number.isFinite(th) && cost >= th) return pcts[i];
-    }
-    return 0;                                   // below his lowest tier: no entry
-  };
+  // TIER LADDER (owner ruling 2026-09-08): hosted production is 6/5/4, aligned to the server stamp; the legacy
+  // self-hosted bots keep 5/4/3 byte-for-byte (standing rule). Candles 3/2 for both. src/tier-ladder.mjs.
+  const V2_NC_PCTS = ONESHOT ? NC_PCTS_HOSTED : NC_PCTS_LEGACY, V2_CANDLE_PCTS = CANDLE_PCTS;
+  const pctFromBands = ladderPct;
   function v2Pct(sig) {
     const v2t = sig?.wallets?.[0]?.auto_tiers?.v2;
     if (!v2t) return null;                      // thresholds not computed yet -> caller falls back
@@ -1090,39 +1087,10 @@ export function startCopyTrade(deps) {
     // FLOORED at the $1 Polymarket minimum (2026-07-25): a bare 5% ceiling made every portfolio
     // under $20 skip EVERY signal ("per-position cap below $1 min") — fleet copy-trading stopped for
     // all but one account the hour the 5% cap shipped. $1 on a $10 account is still a sane cap.
-    const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // hard ceiling for THIS market
+    const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * positionCeilPct()) / 100);   // hard ceiling for THIS market
     const mine = primary && sameSide(primary) ? primary : (positions[compKey]?.source === "copytrade" ? positions[compKey] : null);
     if (mine) {
       if (ONESHOT && !V2()) { tr.block("already_holding"); return; }  // one-shot never follows him up; v2 DOES - tier escalation IS the top-up
-      if (DISTINCT_ADD()) {
-        // DISTINCT-ADD SEMANTICS (owner 2026-09-07, src/distinct-add.mjs): this whale fill is its own copy opportunity,
-        // keyed by the fill's on-chain identity. The same fill re-delivered is not a new one; a pre-existing position
-        // starts its watermark at the current count (no retroactive adds). Every hard gate below is unchanged.
-        const whale = String(sig.wallets?.[0]?.wallet || "").toLowerCase();
-        const srcId = sourceId({ path: "fast", whale, token: sig.token_id, fillId: meta?.fillId, hisShares: sig.his_shares });
-        if (!srcId || seenSource(mine, srcId)) return;
-        if (mine.src_hi == null) rememberSource(mine, null, sig.his_shares);
-        rememberSource(mine, srcId, (Number(mine.src_hi) || 0) + (Number(meta?.shares) || 0));
-        store.save(positions);
-        tr.source(srcId, "add");
-        if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); return skip("no adds after an exit (v2)"); }
-        const boundTo = String(mine.copy_wallet || "").toLowerCase();
-        if (G().driverMatch && boundTo && whale && whale !== boundTo) { tr.block("add_driver_mismatch"); return skip("add: signal driver " + whale.slice(0, 10) + " is not the whale we entered with"); }
-        // CANONICAL CEILING (owner ruling 2026-09-08): room under 7% of the portfolio across the whole condition.
-        const held = conditionHeldUsd(positions, sig.condition_id);
-        const condCeil = ((state.portfolio || 0) * CONDITION_CAP_PCT) / 100;
-        const sz = addSize({ tierUsd: target, held, floorUsd: V2_FLOOR_USD, roomUsd: conditionRoomUsd(state.portfolio, held) });
-        if (!sz.add) { tr.block("condition_ceiling", { held: Number(held.toFixed(2)), ceil: Number(condCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); return; }
-        const add = sz.add;
-        if (!ONESHOT && copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); return skip("exposure cap (add $" + add.toFixed(2) + ")"); }
-        const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
-        if (px == null) { tr.block("price_out_of_band"); return skip("add price out of band"); }
-        { const rb = v2ReserveBlocked(sig, add); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
-        const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
-        if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
-        if (ok) buyTimes.push(Date.now());
-        return;
-      }
       // NEVER REBUY AFTER AN EXIT (owner 2026-08-13): once ANY mirror-sell fired on this signal,
       // adds are dead for good - a top-up after our own exit would buy back what we just sold.
       if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); return skip("no adds after an exit (v2)"); }
@@ -1136,14 +1104,20 @@ export function startCopyTrade(deps) {
       const boundTo = String(mine.copy_wallet || "").toLowerCase();
       if (G().driverMatch && boundTo && driver && driver !== boundTo) { tr.block("add_driver_mismatch"); return skip("add: signal driver " + driver.slice(0, 10) + " is not the whale we entered with"); }
       const held = Number(mine.size_usd) || 0;
-      // Never let one position grow past the per-position ceiling, whatever the target says.
+      // TIER-CROSSING TOP-UP (owner 2026-09-08): target = tier% x portfolio clipped to the ceiling, top-up = target - held,
+      // no order under the minimum. The whale fill behind it is the source event (whale, asset, tx), executed at most
+      // once across the fast and poll paths (src/source-identity.mjs).
+      const srcId = sourceId({ path: "fast", whale: driver, token: sig.token_id, fillId: meta?.fillId });
+      if (srcId && seenSource(mine, srcId)) { tr.block("source_done"); return; }
       let add = Math.min(target, posCeil) - held;
-      if (add < MIN_ADD_USD) { tr.block("add_below_min"); return; }                              // at/over the ceiling or fully sized (steady-state)
+      if (add < addFloorUsd()) { tr.block("add_below_min"); return; }                              // at/over the ceiling or fully sized (steady-state)
       if (!ONESHOT && copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); return skip("exposure cap (add $" + add.toFixed(2) + ")"); }
       const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
       if (px == null) { tr.block("price_out_of_band"); return skip("add price out of band"); }
       { const rb = v2ReserveBlocked(sig, add); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
+      tr.source(srcId || sourceId({ path: "poll", whale: driver, token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
+      if (ok && srcId) { rememberSource(mine, srcId); store.save(positions); }
       if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
       if (ok) buyTimes.push(Date.now());
       return;
@@ -1192,10 +1166,7 @@ export function startCopyTrade(deps) {
     if (G().priceGate && (ONESHOT || V2()) && tooFarFromHisEntry(sig, execC, holdsPairSibling(positions, sig))) { tr.block("price_gate", { mid: execC, his_avg: Math.round(hisAvgCents(sig) ?? 0) }); return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)"); }
     tr.stage(STAGE.PRICE_GATE_PASS);
     { const rb = v2ReserveBlocked(sig, target); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
-    const openSrc = DISTINCT_ADD() ? sourceId({ path: "fast", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, fillId: meta?.fillId, hisShares: sig.his_shares }) : null;
-    if (openSrc) tr.source(openSrc, "open");
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key, tr);
-    if (openSrc && ok && positions[key]) { rememberSource(positions[key], openSrc, sig.his_shares); store.save(positions); }
     if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
   }
@@ -1323,48 +1294,17 @@ export function startCopyTrade(deps) {
       else if (positions[compKey]?.source === "copytrade") mine = positions[compKey];
 
       // Same $1 floor as the fast path: 5% of a sub-$20 portfolio is below the exchange minimum.
-      const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // per-position ceiling (owner incident 2026-07-22)
+      const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * positionCeilPct()) / 100);   // per-position ceiling (owner incident 2026-07-22)
       if (mine) {
         if (ONESHOT && !V2()) { tr.block("already_holding"); continue; }   // v2 tops up to the escalated tier target
-        if (DISTINCT_ADD()) {
-          // DISTINCT-ADD SEMANTICS (owner 2026-09-07, src/distinct-add.mjs): a distinct whale ADD shows here as a higher
-          // cumulative share count on the row after the server sweep. Unchanged count = the same fill re-polled, not a
-          // new event. Pre-existing positions start at the current count. Every hard gate below is unchanged.
-          if (mine.src_hi == null) { rememberSource(mine, null, sig.his_shares); for (const id of (fillIdsOnRow(sig) || [])) rememberSource(mine, id, null); store.save(positions); continue; }
-          // TRUE IDENTITY when the row carries his fills (tx hashes): one unseen fill per cycle, oldest first. AGGREGATED
-          // FALLBACK only when the row carries none: the share delta may hide several fills, so it is recorded as "agg"
-          // and never counted as a distinct source event by the ledger.
-          const whale = String(sig.wallets?.[0]?.wallet || "").toLowerCase();
-          const ids = fillIdsOnRow(sig);
-          let srcId = null, srcKind = "add";
-          if (ids) { srcId = ids.find((id) => !seenSource(mine, id)) || null; if (!srcId) { if (Number(sig.his_shares) > (Number(mine.src_hi) || 0)) rememberSource(mine, null, sig.his_shares); continue; } }
-          else { if (!isNewPollAdd(sig.his_shares, mine.src_hi)) continue; srcId = sourceId({ path: "poll", whale, token: sig.token_id, hisShares: sig.his_shares }); srcKind = "agg"; }
-          if (!srcId || seenSource(mine, srcId)) continue;
-          rememberSource(mine, srcId, sig.his_shares);
-          store.save(positions);
-          tr.source(srcId, srcKind);
-          if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); continue; }
-          if (s4Verdict === "suppress") { tr.block("s4_marker_suppressed"); stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
-          const held = conditionHeldUsd(positions, sig.condition_id);   // CANONICAL CEILING: 7% of the portfolio per condition
-          const condCeil = ((state.portfolio || 0) * CONDITION_CAP_PCT) / 100;
-          const sz = addSize({ tierUsd: target, held, floorUsd: V2_FLOOR_USD, roomUsd: conditionRoomUsd(state.portfolio, held) });
-          if (!sz.add) { tr.block("condition_ceiling", { held: Number(held.toFixed(2)), ceil: Number(condCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); continue; }
-          const add = sz.add;
-          if (G().rateLimit && rateLimited()) { tr.block("rate_limited"); continue; }
-          if (copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); continue; }
-          const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
-          if (px == null) { tr.block("price_out_of_band"); continue; }
-          if (v2ReserveBlocked(sig, add)) { tr.block("reserve_blocked"); continue; }
-          const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
-          if (ok) buyTimes.push(Date.now());
-          continue;
-        }
         if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); continue; }   // never rebuy after an exit (v2)
         // the same authority rule applies to a TOP-UP: for a canary whale's decided market the fast
         // path owns the size, and this tick must not add on top of it from the old row
         if (s4Verdict === "suppress") { tr.block("s4_marker_suppressed"); stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
+        const srcId = newestFillIdOnRow(sig);   // the whale fill that most recently moved his position (server-stamped tx)
+        if (srcId && seenSource(mine, srcId)) { tr.block("source_done"); continue; }   // its top-up already executed (fast path)
         const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
-        if (add < MIN_ADD_USD) { tr.block("add_below_min"); continue; }                                // at the ceiling or no transition worth an order
+        if (add < addFloorUsd()) { tr.block("add_below_min"); continue; }                                // at the ceiling or no transition worth an order
         if (G().rateLimit && rateLimited()) { tr.block("rate_limited"); continue; }
         if (copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); continue; }      // copytrade never exceeds its slice
         // ALREADY IN: he's reinforcing, so we follow him up — but an adopt add stays inside the
@@ -1372,7 +1312,9 @@ export function startCopyTrade(deps) {
         const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
         if (px == null) { tr.block("price_out_of_band"); continue; }
         if (v2ReserveBlocked(sig, add)) { tr.block("reserve_blocked"); continue; }
+        tr.source(srcId || sourceId({ path: "poll", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
+        if (ok && srcId) { rememberSource(mine, srcId); store.save(positions); }
         if (ok) buyTimes.push(Date.now());
       } else {
         // v2 entry window - the "scan all the time" path. Skipping here costs nothing: this loop
@@ -1415,10 +1357,7 @@ export function startCopyTrade(deps) {
         if (G().priceGate && (ONESHOT || V2()) && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px, holdsPairSibling(positions, sig))) { tr.block("price_gate", { mid: lastMid.get(sig.token_id) ?? px, his_avg: Math.round(hisAvgCents(sig) ?? 0) }); continue; }   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
         tr.stage(STAGE.PRICE_GATE_PASS);
         if (v2ReserveBlocked(sig, target)) { tr.block("reserve_blocked"); continue; }
-        const openSrc = DISTINCT_ADD() ? sourceId({ path: "poll", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, hisShares: sig.his_shares }) : null;
-        if (openSrc) tr.source(openSrc, "open");
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key, tr);
-        if (openSrc && ok && positions[key]) { rememberSource(positions[key], openSrc, sig.his_shares); store.save(positions); }
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
       }
     }
