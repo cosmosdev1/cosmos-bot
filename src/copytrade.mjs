@@ -31,6 +31,7 @@ const DRY = process.env.COPYTRADE_DRY === "1";
 import { inc as mInc } from "./metrics.mjs";
 import { withS4Attribution } from "./remote-signer.mjs";
 import { gateProfile } from "./high-capture.mjs";
+import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource } from "./distinct-add.mjs";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
 // How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
 // so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
@@ -908,6 +909,9 @@ export function startCopyTrade(deps) {
   // user. Server-delivered per user (settings.high_capture); the default profile is byte-for-byte the
   // old behaviour. Hard gates are not in the profile and cannot be switched by it.
   const G = () => gateProfile(state.highCapture === true, V2_MAX_ENTRY_CENTS);
+  // DISTINCT-ADD semantics (owner 2026-09-07): server-switched per user (settings.distinct_add), default off = the
+  // tier-transition top-up unchanged. Only the two ADD branches and the open-clip source records consult it.
+  const DISTINCT_ADD = () => state.distinctAdd === true;
   clockV2On = () => state.clockV2 === true || /^(1|true|yes|on)$/i.test(process.env.COPY_CLOCK_V2 || "");
   const V2_FLOOR_USD = Number(process.env.COPY_V2_FLOOR_USD) || 2;
   // Crypto cash reserve: the LAST 10% of the portfolio is crypto-only. A NON-candle buy needs cash
@@ -1090,6 +1094,33 @@ export function startCopyTrade(deps) {
     const mine = primary && sameSide(primary) ? primary : (positions[compKey]?.source === "copytrade" ? positions[compKey] : null);
     if (mine) {
       if (ONESHOT && !V2()) { tr.block("already_holding"); return; }  // one-shot never follows him up; v2 DOES - tier escalation IS the top-up
+      if (DISTINCT_ADD()) {
+        // DISTINCT-ADD SEMANTICS (owner 2026-09-07, src/distinct-add.mjs): this whale fill is its own copy opportunity,
+        // keyed by the fill's on-chain identity. The same fill re-delivered is not a new one; a pre-existing position
+        // starts its watermark at the current count (no retroactive adds). Every hard gate below is unchanged.
+        const whale = String(sig.wallets?.[0]?.wallet || "").toLowerCase();
+        const srcId = sourceId({ path: "fast", whale, token: sig.token_id, fillId: meta?.fillId, hisShares: sig.his_shares });
+        if (!srcId || seenSource(mine, srcId)) return;
+        if (mine.src_hi == null) rememberSource(mine, null, sig.his_shares);
+        rememberSource(mine, srcId, (Number(mine.src_hi) || 0) + (Number(meta?.shares) || 0));
+        store.save(positions);
+        tr.source(srcId, "add");
+        if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); return skip("no adds after an exit (v2)"); }
+        const boundTo = String(mine.copy_wallet || "").toLowerCase();
+        if (G().driverMatch && boundTo && whale && whale !== boundTo) { tr.block("add_driver_mismatch"); return skip("add: signal driver " + whale.slice(0, 10) + " is not the whale we entered with"); }
+        const held = Number(mine.size_usd) || 0;
+        const sz = addSize({ tierUsd: target, held, posCeil, floorUsd: V2_FLOOR_USD });
+        if (!sz.add) { tr.block("position_ceiling", { held: Number(held.toFixed(2)), ceil: Number(posCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); return; }
+        const add = sz.add;
+        if (!ONESHOT && copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); return skip("exposure cap (add $" + add.toFixed(2) + ")"); }
+        const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
+        if (px == null) { tr.block("price_out_of_band"); return skip("add price out of band"); }
+        { const rb = v2ReserveBlocked(sig, add); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
+        const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
+        if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
+        if (ok) buyTimes.push(Date.now());
+        return;
+      }
       // NEVER REBUY AFTER AN EXIT (owner 2026-08-13): once ANY mirror-sell fired on this signal,
       // adds are dead for good - a top-up after our own exit would buy back what we just sold.
       if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); return skip("no adds after an exit (v2)"); }
@@ -1159,7 +1190,10 @@ export function startCopyTrade(deps) {
     if (G().priceGate && (ONESHOT || V2()) && tooFarFromHisEntry(sig, execC, holdsPairSibling(positions, sig))) { tr.block("price_gate", { mid: execC, his_avg: Math.round(hisAvgCents(sig) ?? 0) }); return skip("price " + execC + "c vs his avg " + Math.round(hisAvgCents(sig)) + "c (>" + Math.round(COPY_GAP_REL * 100) + "%)"); }
     tr.stage(STAGE.PRICE_GATE_PASS);
     { const rb = v2ReserveBlocked(sig, target); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
+    const openSrc = DISTINCT_ADD() ? sourceId({ path: "fast", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, fillId: meta?.fillId, hisShares: sig.his_shares }) : null;
+    if (openSrc) tr.source(openSrc, "open");
     const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key, tr);
+    if (openSrc && ok && positions[key]) { rememberSource(positions[key], openSrc, sig.his_shares); store.save(positions); }
     if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
     if (ok) { buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
   }
@@ -1290,6 +1324,33 @@ export function startCopyTrade(deps) {
       const posCeil = Math.max(MIN_ORDER_USD, ((state.portfolio || 0) * MAX_POSITION_PCT) / 100);   // per-position ceiling (owner incident 2026-07-22)
       if (mine) {
         if (ONESHOT && !V2()) { tr.block("already_holding"); continue; }   // v2 tops up to the escalated tier target
+        if (DISTINCT_ADD()) {
+          // DISTINCT-ADD SEMANTICS (owner 2026-09-07, src/distinct-add.mjs): a distinct whale ADD shows here as a higher
+          // cumulative share count on the row after the server sweep. Unchanged count = the same fill re-polled, not a
+          // new event. Pre-existing positions start at the current count. Every hard gate below is unchanged.
+          if (mine.src_hi == null) { rememberSource(mine, null, sig.his_shares); store.save(positions); continue; }
+          if (!isNewPollAdd(sig.his_shares, mine.src_hi)) continue;
+          const whale = String(sig.wallets?.[0]?.wallet || "").toLowerCase();
+          const srcId = sourceId({ path: "poll", whale, token: sig.token_id, hisShares: sig.his_shares });
+          if (!srcId || seenSource(mine, srcId)) continue;
+          rememberSource(mine, srcId, sig.his_shares);
+          store.save(positions);
+          tr.source(srcId, "add");
+          if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); continue; }
+          if (s4Verdict === "suppress") { tr.block("s4_marker_suppressed"); stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
+          const held = Number(mine.size_usd) || 0;
+          const sz = addSize({ tierUsd: target, held, posCeil, floorUsd: V2_FLOOR_USD });
+          if (!sz.add) { tr.block("position_ceiling", { held: Number(held.toFixed(2)), ceil: Number(posCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); continue; }
+          const add = sz.add;
+          if (G().rateLimit && rateLimited()) { tr.block("rate_limited"); continue; }
+          if (copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); continue; }
+          const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
+          if (px == null) { tr.block("price_out_of_band"); continue; }
+          if (v2ReserveBlocked(sig, add)) { tr.block("reserve_blocked"); continue; }
+          const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
+          if (ok) buyTimes.push(Date.now());
+          continue;
+        }
         if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); continue; }   // never rebuy after an exit (v2)
         // the same authority rule applies to a TOP-UP: for a canary whale's decided market the fast
         // path owns the size, and this tick must not add on top of it from the old row
@@ -1346,7 +1407,10 @@ export function startCopyTrade(deps) {
         if (G().priceGate && (ONESHOT || V2()) && tooFarFromHisEntry(sig, lastMid.get(sig.token_id) ?? px, holdsPairSibling(positions, sig))) { tr.block("price_gate", { mid: lastMid.get(sig.token_id) ?? px, his_avg: Math.round(hisAvgCents(sig) ?? 0) }); continue; }   // >20% (rel) from his avg entry - too late (owner 2026-08-06)
         tr.stage(STAGE.PRICE_GATE_PASS);
         if (v2ReserveBlocked(sig, target)) { tr.block("reserve_blocked"); continue; }
+        const openSrc = DISTINCT_ADD() ? sourceId({ path: "poll", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, hisShares: sig.his_shares }) : null;
+        if (openSrc) tr.source(openSrc, "open");
         const ok = await buy(sig, Math.min(target, state.cash ?? 0), px, "open", positions, null, key, tr);
+        if (openSrc && ok && positions[key]) { rememberSource(positions[key], openSrc, sig.his_shares); store.save(positions); }
         if (ok) { openCopy++; buyTimes.push(Date.now()); seen[seenKey] = Date.now(); saveSeen(seen); }
       }
     }

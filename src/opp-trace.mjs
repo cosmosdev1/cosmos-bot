@@ -155,7 +155,7 @@ export function clampAttempts(list, max = MAX_ATTEMPTS) {
 
 const NOOP = Object.freeze({
   id: null, sampled: false,
-  stage() { return this; }, block() { return this; }, attempt() { return this; },
+  stage() { return this; }, block() { return this; }, attempt() { return this; }, source() { return this; },
   bookProbe() { return this; }, orderSent() { return this; },
   sign() { return this; }, venue() { return this; }, note() { return this; },
 });
@@ -202,11 +202,14 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
   // The digest includes the attempt count, so a second attempt always ships even when it ends at the
   // same stage with the same blocker as the first.
   const digestOf = (r) =>
-    `${r.stageMax}|${r.blockAtMax ?? ""}|${r.attemptCount}|${r.terminal ? 1 : 0}|${r.signCode ?? ""}|${r.venueResult ?? ""}|${r.bookRev}|${r.eligN || 0}|${evSig(r)}`;
+    `${r.stageMax}|${r.blockAtMax ?? ""}|${r.attemptCount}|${r.terminal ? 1 : 0}|${r.signCode ?? ""}|${r.venueResult ?? ""}|${r.bookRev}|${r.eligN || 0}|${evSig(r)}|${seSig(r)}`;
+  // the latest source event's disposition is part of the digest too: a new source, its blocker or its attempt re-ships the row
+  const seSig = (r) => { const n = r.sources ? r.sources.length : 0; const s = n ? r.sources[n - 1] : null; return s ? `${n}:${s.blocks.length}:${s.by ?? ""}:${s.an ?? ""}` : "0"; };
   // the current event's disposition is part of the digest: a new blocker seen during it, its first attempt,
   // or its end must re-ship the row so the server's per-event record is complete
   const evSig = (r) => { const e = r.events && r.events[r.events.length - 1]; return e ? `${e.n}:${e.blocks.length}:${e.by ?? ""}:${e.an ?? ""}` : ""; };
   const MAX_EVENTS = 6, MAX_EVENT_BLOCKS = 8;
+  const MAX_SOURCES = 12;   // distinct whale BUY/ADD source events kept per row (owner 2026-09-07)
   // ELIGIBILITY EVENTS (owner 2026-09-07). The owner's invariant applies at the moment an opportunity
   // becomes authorized + tier-positive + inside the window; the ledger's denominator is the TIME of
   // that event, not when the row was first seen. A block from this set means the opportunity is NOT
@@ -254,6 +257,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           stageMax: 0, blockAtMax: null, blockFirst: null, blockLast: null,
           terminal: false, attempted: false,
           eligOpen: false, eligAt: 0, eligN: 0, events: [],
+          sources: [],   // distinct source events (whale fill identity), each closed by its own block or attempt
           attempts: [], attemptCount: 0, bookRev: 0,
           signCode: null, venueResult: null, filledUsd: null, ctx: null,
           sig: null, emitted: null,
@@ -324,6 +328,8 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
             }
           }
           if (PRE_ELIGIBILITY_BLOCKS.has(name)) r.eligOpen = false;   // not eligible now: the next WINDOW_OPEN is a new event
+          { const s = r.sources && r.sources[r.sources.length - 1];
+            if (s && s.end == null) { if (!s.blocks.includes(name) && s.blocks.length < MAX_EVENT_BLOCKS) s.blocks.push(name); s.end = now(); s.by = name; markDirty(r); } }   // a source event terminates on its first blocker
           if (r.blockAtMax !== name) { r.blockAtMax = name; if (ctx) r.ctx = compact(ctx); markDirty(r); }
           if (isTerminal(name) && !r.terminal) { r.terminal = true; markDirty(r); }
         } catch { /* never throw into trading */ }
@@ -335,6 +341,22 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
        * (the mid the production priceFor() just fetched, the cap from the signal row, the limit and
        * size the engine computed). No I/O, so nothing here can delay the order.
        */
+      /**
+       * Open ONE record for a distinct whale BUY/ADD source event (owner 2026-09-07). Idempotent per id:
+       * the same whale fill re-observed is not a new event. The record is closed by the first block()
+       * or attempt() of the evaluation that opened it, so every source event terminates exactly once.
+       */
+      source(id, kind) {
+        try {
+          if (!id) return this;
+          if (!r.sources) r.sources = [];
+          if (r.sources.some((s) => s.id === String(id))) return this;
+          r.sources.push({ id: String(id).slice(0, 160), k: kind ? String(kind).slice(0, 8) : null, at: now(), p: r.lastPath, blocks: [], an: null, aa: null, end: null, by: null });
+          if (r.sources.length > MAX_SOURCES) r.sources = r.sources.slice(-MAX_SOURCES);
+          markDirty(r);
+        } catch { /* never throw into trading */ }
+        return this;
+      },
       attempt(a) {
         try {
           r.attempted = true;
@@ -347,11 +369,13 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
             usd: a?.usd ?? null, shares: a?.shares ?? null,
             row_age_h: a?.rowAgeH ?? null, whale_avg_c: a?.whaleAvgC ?? null,
             path: r.lastPath,
+            src: (r.sources && r.sources.length && r.sources[r.sources.length - 1].end == null) ? r.sources[r.sources.length - 1].id : null,
           }));
           // slice keeps object identity, so a probe still in flight for a kept attempt lands
           // correctly; one whose attempt was clamped away mutates an orphan and is discarded.
           r.attempts = clampAttempts(r.attempts, MAX_ATT);
           { const ev = r.events && r.events[r.events.length - 1]; if (ev && ev.end == null && ev.an == null) { ev.an = r.attemptCount; ev.aa = now(); } }   // the event's first attempt
+          { const s = r.sources && r.sources[r.sources.length - 1]; if (s && s.end == null) { s.an = r.attemptCount; s.aa = now(); s.end = now(); s.by = "attempt"; } }   // the source event terminates in this attempt
           if (!r.pathAtFirstAttempt) r.pathAtFirstAttempt = r.lastPath;
           if (r.stageMax < STAGE.SIGN_REQUESTED) { r.stageMax = STAGE.SIGN_REQUESTED; r.blockAtMax = null; }
           markDirty(r);
@@ -505,6 +529,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           sc: r.signCode, vr: r.venueResult, fu: r.filledUsd, x: r.ctx,
           e: r.eligAt ? Math.round(r.eligAt / 1000) : null, en: r.eligN || 0,   // latest eligibility event (unix s) and how many
           ev: (r.events || []).map((v) => ({ n: v.n, at: Math.round(v.at / 1000), end: v.end ? Math.round(v.end / 1000) : null, by: v.by, bl: v.blocks, an: v.an, aa: v.aa ? Math.round(v.aa / 1000) : null })),
+          se: (r.sources || []).map((s) => ({ id: s.id, k: s.k, at: Math.round(s.at / 1000), p: s.p, bl: s.blocks, an: s.an, aa: s.aa ? Math.round(s.aa / 1000) : null, end: s.end ? Math.round(s.end / 1000) : null, by: s.by })),
         });
         // A TERMINAL RECORD IS KEPT, NEVER FREED HERE. Deleting it looked like a memory win, but the
         // engine goes on iterating that row for the rest of its life: the next evaluation would

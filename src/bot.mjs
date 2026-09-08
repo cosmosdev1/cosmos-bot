@@ -857,6 +857,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // HOSTED ONLY (owner 2026-09-07): hosted is the product; the 9 legacy self-hosted bots must not change
   // behaviour. The server already decides by cloud-account row; this is the belt to that brace.
   qtState.highCapture = HOSTED && settings.high_capture === true;
+  // DISTINCT-ADD semantics (owner 2026-09-07, canary): every distinct whale BUY/ADD while Tier+Window positive is
+  // its own copy opportunity (src/distinct-add.mjs). Server-switched per user, hosted only, default off.
+  qtState.distinctAdd = HOSTED && settings.distinct_add === true;
   // 1-in-N sampling BELOW WINDOW_OPEN, server-delivered so it can be widened for a bounded window
   // and reverted without a restart. Undefined leaves opp-trace on its env default (8).
   qtState.copyTraceSample = Number(settings.copy_trace_sample) > 0 ? Number(settings.copy_trace_sample) : undefined;

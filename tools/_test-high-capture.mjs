@@ -23,11 +23,11 @@ ck("profile has NO key for any hard gate", !("cash" in on) && !("floor" in on) &
 const src = fs.readFileSync(new URL("../src/copytrade.mjs", import.meta.url), "utf8");
 const count = (re) => (src.match(re) || []).length;
 ck("venue_backoff is behind the profile", count(/G\(\)\.venueBackoff && Date\.now\(\) < venueBackoffUntil/g) === 1);
-ck("rate_limited is behind the profile at all 3 sites (the fast path checks once for entry and top-up), and nowhere bare", count(/G\(\)\.rateLimit && rateLimited\(\)/g) === 3 && count(/if \(rateLimited\(\)\)/g) === 0);
-ck("add_driver_mismatch is behind the profile", count(/G\(\)\.driverMatch && boundTo/g) === 1);
+ck("rate_limited is behind the profile at all 4 sites (fast: once for entry and top-up; poll: legacy add, distinct add, open), and nowhere bare", count(/G\(\)\.rateLimit && rateLimited\(\)/g) === 4 && count(/if \(rateLimited\(\)\)/g) === 0);
+ck("add_driver_mismatch is behind the profile at both fast-path add sites (legacy + distinct-add)", count(/G\(\)\.driverMatch && boundTo/g) === 2);
 ck("price_gate is behind the profile at both sites, and nowhere bare", count(/G\(\)\.priceGate && \(ONESHOT \|\| V2\(\)\) && tooFarFromHisEntry/g) === 2 && count(/if \(\(ONESHOT \|\| V2\(\)\) && tooFarFromHisEntry/g) === 0);
 ck("entry band is behind the profile at both sites (pair legs keep their arb cap)", count(/G\(\)\.priceBand \|\| sig\.is_pair \? inPlayBand\(sig, cap, floor\) : \{ cap: G\(\)\.entryCap, floor: G\(\)\.entryFloor \}/g) === 2);
-ck("add band is behind the profile at both sites", count(/G\(\)\.priceBand \? addCapFor\(sig\) : G\(\)\.entryCap, G\(\)\.priceBand \? MIN_ADD_CENTS : G\(\)\.entryFloor/g) === 2);
+ck("add band is behind the profile at all 4 add sites (legacy + distinct-add, fast + poll)", count(/G\(\)\.priceBand \? addCapFor\(sig\) : G\(\)\.entryCap, G\(\)\.priceBand \? MIN_ADD_CENTS : G\(\)\.entryFloor/g) === 4);
 // hard gates must never be guarded by the profile
 ck("server no_book is remembered per token for a bounded time and re-checked, never terminal", /noBookUntil\.set\(String\(sig\.token_id\), Date\.now\(\) \+ NO_BOOK_MEMO_MS\)/.test(src) && /tr\?\.block\("venue_no_book", \{/.test(src) && /NO_BOOK_MEMO_MS = N\("COPY_NO_BOOK_MEMO_MS", 10 \* 60_000\)/.test(src));
 for (const hard of ["cash_insufficient", "local_floor", "portfolio_floor", "cooldown", "inflight", "already_holding", "buy_once", "no_rebuy", "add_below_min", "target_below_min", "tier_zero", "window_dead", "window_wait", "venue_no_book"]) {
@@ -46,7 +46,7 @@ ck("the book context is guarded by !G().priceBand (never read for the default pr
 ck("price source is best_ask ONLY when the midpoint is unavailable", /if \(!\(mid > 0\) && top\.ask > 0\) \{ mid = top\.ask; src = "best_ask"; \}/.test(src));
 ck("the book is read LIVE (getBookTopCents calls getOrderBook, no cache)", /async getBookTopCents\(tokenId\) \{\r?\n\s+const t0 = Date\.now\(\);\r?\n\s+try \{\r?\n\s+const book = await client\.getOrderBook\(tokenId\);/.test(pmSrc));
 ck("a missing ask never fabricates a price (no ask, no midpoint -> null)", /if \(mid == null \|\| !\(mid > 0\)\) return null;/.test(src) && /bid: bid > 0 \? Math\.round\(bid \* 100\) : null, ask: ask > 0 \? Math\.round\(ask \* 100\) : null/.test(pmSrc));
-ck("every priceFor call site passes the trace", count(/priceFor\(sig\.token_id, [^\n]*, tr\)/g) === 4);
+ck("every priceFor call site passes the trace (2 opens + 4 adds)", count(/priceFor\(sig\.token_id, [^\n]*, tr\)/g) === 6);
 ck("the no_book memo is lifted by a fresh usable ask, else blocks venue_no_book", /if \(top && top\.ask > 0\) \{ noBookUntil\.delete\(tok\);/.test(src) && /tr\?\.block\("venue_no_book", \{ bid: top\?\.bid \?\? null, ask: top\?\.ask \?\? null \}\)/.test(src));
 const bot = fs.readFileSync(new URL("../src/bot.mjs", import.meta.url), "utf8");
 ck("bot maps settings.high_capture === true only, AND only when HOSTED (self-hosted never activates the profile)", /qtState\.highCapture = HOSTED && settings\.high_capture === true;/.test(bot));
