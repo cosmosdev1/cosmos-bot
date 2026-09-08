@@ -914,9 +914,9 @@ export function startCopyTrade(deps) {
   const V2_FLOOR_USD = Number(process.env.COPY_V2_FLOOR_USD) || 2;
   // PER-POSITION CEILING (owner ruling 2026-09-08): hosted 6.5% - a full tier-1 6% executes under it with 0.5% headroom
   // below the server's 7% per-condition hard cap (lib/cloud/risk.ts, untouched). Legacy keeps MAX_POSITION_PCT (5).
-  const positionCeilPct = () => (ONESHOT ? POSITION_CEIL_PCT_HOSTED : MAX_POSITION_PCT);
+  const positionCeilPct = () => (LADDER_V2() ? POSITION_CEIL_PCT_HOSTED : MAX_POSITION_PCT);
   // TOP-UP MINIMUM: hosted $2 (the v2 sizing floor); legacy keeps the $1 scale-in increment.
-  const addFloorUsd = () => (ONESHOT ? V2_FLOOR_USD : MIN_ADD_USD);
+  const addFloorUsd = () => (LADDER_V2() ? V2_FLOOR_USD : MIN_ADD_USD);
   // Crypto cash reserve: the LAST 10% of the portfolio is crypto-only. A NON-candle buy needs cash
   // >= 10% of portfolio before it and may not take cash under 6% after. Candles spend freely.
   function v2ReserveBlocked(sig, amountUsd) {
@@ -942,9 +942,12 @@ export function startCopyTrade(deps) {
   // wallets[0].auto_tiers.v2, so a v2 bot resolves its own number and needs no schema change.
   // 5/3/2 -> 4/3/2 with the widened ranks (owner 2026-08-19). The RANKS live server-side (they decide
   // the dollar thresholds stamped on the signal); the bot only needs the matching percentages.
-  // TIER LADDER (owner ruling 2026-09-08): hosted production is 6/5/4, aligned to the server stamp; the legacy
-  // self-hosted bots keep 5/4/3 byte-for-byte (standing rule). Candles 3/2 for both. src/tier-ladder.mjs.
-  const V2_NC_PCTS = ONESHOT ? NC_PCTS_HOSTED : NC_PCTS_LEGACY, V2_CANDLE_PCTS = CANDLE_PCTS;
+  // TIER LADDER (owner ruling 2026-09-08, STAGED): 6/5/4 + the 6.5% ceiling + the $2 top-up minimum + source-tx dedup
+  // apply only to a hosted user the server switches on (settings.tier_ladder_v2). Everyone else - and every legacy
+  // self-hosted bot - keeps 5/4/3, the 5% ceiling and the $1 increment byte-for-byte. src/tier-ladder.mjs.
+  const LADDER_V2 = () => ONESHOT && state.tierLadderV2 === true;
+  const ncPcts = () => (LADDER_V2() ? NC_PCTS_HOSTED : NC_PCTS_LEGACY);
+  const V2_CANDLE_PCTS = CANDLE_PCTS;
   const pctFromBands = ladderPct;
   function v2Pct(sig) {
     const v2t = sig?.wallets?.[0]?.auto_tiers?.v2;
@@ -958,7 +961,7 @@ export function startCopyTrade(deps) {
       if (dur !== 15 && dur !== 60) return 0;
       return pctFromBands(cost, v2t.candle, V2_CANDLE_PCTS);
     }
-    return pctFromBands(cost, v2t.nc, V2_NC_PCTS);
+    return pctFromBands(cost, v2t.nc, ncPcts());
   }
   function sizeFor(sig, unitBasis, portfolio) {
     if (V2()) {
@@ -1107,7 +1110,7 @@ export function startCopyTrade(deps) {
       // TIER-CROSSING TOP-UP (owner 2026-09-08): target = tier% x portfolio clipped to the ceiling, top-up = target - held,
       // no order under the minimum. The whale fill behind it is the source event (whale, asset, tx), executed at most
       // once across the fast and poll paths (src/source-identity.mjs).
-      const srcId = sourceId({ path: "fast", whale: driver, token: sig.token_id, fillId: meta?.fillId });
+      const srcId = LADDER_V2() ? sourceId({ path: "fast", whale: driver, token: sig.token_id, fillId: meta?.fillId }) : null;
       if (srcId && seenSource(mine, srcId)) { tr.block("source_done"); return; }
       let add = Math.min(target, posCeil) - held;
       if (add < addFloorUsd()) { tr.block("add_below_min"); return; }                              // at/over the ceiling or fully sized (steady-state)
@@ -1115,7 +1118,7 @@ export function startCopyTrade(deps) {
       const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
       if (px == null) { tr.block("price_out_of_band"); return skip("add price out of band"); }
       { const rb = v2ReserveBlocked(sig, add); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
-      tr.source(srcId || sourceId({ path: "poll", whale: driver, token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
+      if (LADDER_V2()) tr.source(srcId || sourceId({ path: "poll", whale: driver, token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
       if (ok && srcId) { rememberSource(mine, srcId); store.save(positions); }
       if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
@@ -1301,7 +1304,7 @@ export function startCopyTrade(deps) {
         // the same authority rule applies to a TOP-UP: for a canary whale's decided market the fast
         // path owns the size, and this tick must not add on top of it from the old row
         if (s4Verdict === "suppress") { tr.block("s4_marker_suppressed"); stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
-        const srcId = newestFillIdOnRow(sig);   // the whale fill that most recently moved his position (server-stamped tx)
+        const srcId = LADDER_V2() ? newestFillIdOnRow(sig) : null;   // the whale fill that most recently moved his position (server-stamped tx)
         if (srcId && seenSource(mine, srcId)) { tr.block("source_done"); continue; }   // its top-up already executed (fast path)
         const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
         if (add < addFloorUsd()) { tr.block("add_below_min"); continue; }                                // at the ceiling or no transition worth an order
@@ -1312,7 +1315,7 @@ export function startCopyTrade(deps) {
         const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
         if (px == null) { tr.block("price_out_of_band"); continue; }
         if (v2ReserveBlocked(sig, add)) { tr.block("reserve_blocked"); continue; }
-        tr.source(srcId || sourceId({ path: "poll", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
+        if (LADDER_V2()) tr.source(srcId || sourceId({ path: "poll", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
         if (ok && srcId) { rememberSource(mine, srcId); store.save(positions); }
         if (ok) buyTimes.push(Date.now());

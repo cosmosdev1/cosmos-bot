@@ -857,6 +857,9 @@ async function maybeStartEngines(settings, pm, cosmos) {
   // HOSTED ONLY (owner 2026-09-07): hosted is the product; the 9 legacy self-hosted bots must not change
   // behaviour. The server already decides by cloud-account row; this is the belt to that brace.
   qtState.highCapture = HOSTED && settings.high_capture === true;
+  // TIER LADDER 6/5/4 + 6.5% ceiling + $2 top-up minimum + source-tx dedup (owner 2026-09-08, staged canary): server-switched
+  // per user, hosted only, default off = the old 5/4/3 sizing byte-for-byte.
+  qtState.tierLadderV2 = HOSTED && settings.tier_ladder_v2 === true;
   // 1-in-N sampling BELOW WINDOW_OPEN, server-delivered so it can be widened for a bounded window
   // and reverted without a restart. Undefined leaves opp-trace on its env default (8).
   qtState.copyTraceSample = Number(settings.copy_trace_sample) > 0 ? Number(settings.copy_trace_sample) : undefined;
