@@ -31,7 +31,7 @@ const DRY = process.env.COPYTRADE_DRY === "1";
 import { inc as mInc } from "./metrics.mjs";
 import { withS4Attribution } from "./remote-signer.mjs";
 import { gateProfile } from "./high-capture.mjs";
-import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, fillIdsOnRow } from "./distinct-add.mjs";
+import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, fillIdsOnRow, conditionHeldUsd, conditionRoomUsd, CONDITION_CAP_PCT } from "./distinct-add.mjs";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
 // How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
 // so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
@@ -1108,9 +1108,11 @@ export function startCopyTrade(deps) {
         if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); return skip("no adds after an exit (v2)"); }
         const boundTo = String(mine.copy_wallet || "").toLowerCase();
         if (G().driverMatch && boundTo && whale && whale !== boundTo) { tr.block("add_driver_mismatch"); return skip("add: signal driver " + whale.slice(0, 10) + " is not the whale we entered with"); }
-        const held = Number(mine.size_usd) || 0;
-        const sz = addSize({ tierUsd: target, held, posCeil, floorUsd: V2_FLOOR_USD });
-        if (!sz.add) { tr.block("position_ceiling", { held: Number(held.toFixed(2)), ceil: Number(posCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); return; }
+        // CANONICAL CEILING (owner ruling 2026-09-08): room under 7% of the portfolio across the whole condition.
+        const held = conditionHeldUsd(positions, sig.condition_id);
+        const condCeil = ((state.portfolio || 0) * CONDITION_CAP_PCT) / 100;
+        const sz = addSize({ tierUsd: target, held, floorUsd: V2_FLOOR_USD, roomUsd: conditionRoomUsd(state.portfolio, held) });
+        if (!sz.add) { tr.block("condition_ceiling", { held: Number(held.toFixed(2)), ceil: Number(condCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); return; }
         const add = sz.add;
         if (!ONESHOT && copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); return skip("exposure cap (add $" + add.toFixed(2) + ")"); }
         const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
@@ -1343,9 +1345,10 @@ export function startCopyTrade(deps) {
           tr.source(srcId, srcKind);
           if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); continue; }
           if (s4Verdict === "suppress") { tr.block("s4_marker_suppressed"); stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
-          const held = Number(mine.size_usd) || 0;
-          const sz = addSize({ tierUsd: target, held, posCeil, floorUsd: V2_FLOOR_USD });
-          if (!sz.add) { tr.block("position_ceiling", { held: Number(held.toFixed(2)), ceil: Number(posCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); continue; }
+          const held = conditionHeldUsd(positions, sig.condition_id);   // CANONICAL CEILING: 7% of the portfolio per condition
+          const condCeil = ((state.portfolio || 0) * CONDITION_CAP_PCT) / 100;
+          const sz = addSize({ tierUsd: target, held, floorUsd: V2_FLOOR_USD, roomUsd: conditionRoomUsd(state.portfolio, held) });
+          if (!sz.add) { tr.block("condition_ceiling", { held: Number(held.toFixed(2)), ceil: Number(condCeil.toFixed(2)), room: Number(sz.room.toFixed(2)) }); continue; }
           const add = sz.add;
           if (G().rateLimit && rateLimited()) { tr.block("rate_limited"); continue; }
           if (copyExposure(positions) + add > exposureCap) { tr.block("exposure_cap"); continue; }

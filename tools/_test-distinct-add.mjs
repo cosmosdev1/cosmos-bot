@@ -6,7 +6,7 @@
 //      gate is still consulted inside the new branches; no SELL/exit site references the switch.
 import assert from "node:assert";
 import fs from "node:fs";
-import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, POLL_SHARES_TOL, fillIdsOnRow } from "../src/distinct-add.mjs";
+import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, POLL_SHARES_TOL, fillIdsOnRow, conditionHeldUsd, conditionRoomUsd, CONDITION_CAP_PCT } from "../src/distinct-add.mjs";
 import { createTracer, STAGE } from "../src/opp-trace.mjs";
 let pass = 0, fail = 0;
 const ck = (n, c) => { if (c) { pass++; console.log("  ok   " + n); } else { fail++; console.log("  FAIL " + n); } };
@@ -30,6 +30,12 @@ ck("tier size below the floor is lifted to the $2 floor when there is room", add
 ck("held at or over the ceiling -> position_ceiling", addSize({ tierUsd: 6, held: 5, posCeil: 5, floorUsd: 2 }).why === "position_ceiling" && addSize({ tierUsd: 6, held: 9, posCeil: 5, floorUsd: 2 }).why === "position_ceiling");
 { const p = {}; rememberSource(p, "a", 10); rememberSource(p, "b", 8); ck("rememberSource keeps ids and only raises the watermark", seenSource(p, "a") && seenSource(p, "b") && !seenSource(p, "c") && p.src_hi === 10); rememberSource(p, null, 12); ck("watermark can be seeded without an id", p.src_hi === 12 && Object.keys(p.src).length === 2); for (let i = 0; i < 60; i++) rememberSource(p, "x" + i, 0); ck("ids are bounded (50) - the oldest fall off", Object.keys(p.src).length === 50 && !seenSource(p, "a")); }
 ck("seenSource is false on a position without a src map", seenSource({}, "a") === false && seenSource(null, "a") === false);
+ck("canonical ceiling is the 7% per-condition cap, not the 5% per-position constant", CONDITION_CAP_PCT === 7);
+{ const pos = { c1: { condition_id: "c1", source: "copytrade", size_usd: 3 }, "c1#tok": { condition_id: "c1", source: "copytrade", size_usd: 2 }, c2: { condition_id: "c2", source: "copytrade", size_usd: 9 }, q: { condition_id: "c1", source: "quant", size_usd: 50 } };
+  ck("condition exposure sums BOTH sides of the condition, copytrade only", conditionHeldUsd(pos, "c1") === 5 && conditionHeldUsd(pos, "c2") === 9 && conditionHeldUsd(pos, "zz") === 0);
+  ck("room = 7% of portfolio minus condition exposure, never negative", conditionRoomUsd(100, 5) === 2 && conditionRoomUsd(100, 9) === 0 && conditionRoomUsd(0, 0) === 0);
+  ck("a distinct add is tier-sized, clipped to the 7% room, floored at $2, HARD_RISK when the room is under $2", addSize({ tierUsd: 6, held: 5, floorUsd: 2, roomUsd: conditionRoomUsd(100, 5) }).add === 2 && addSize({ tierUsd: 6, held: 0, floorUsd: 2, roomUsd: conditionRoomUsd(100, 0) }).add === 6 && addSize({ tierUsd: 6, held: 6, floorUsd: 2, roomUsd: conditionRoomUsd(100, 6) }).why === "position_ceiling");
+  ck("an add can never take the condition past 7%", [0, 1, 3, 5, 6, 6.9].every((h) => h + addSize({ tierUsd: 6, held: h, floorUsd: 2, roomUsd: conditionRoomUsd(100, h) }).add <= 7 + 1e-9)); }
 
 // ---- 2. tracer -----------------------------------------------------------------------------------------
 { let t = 1_000_000; const tr = createTracer({ userId: "u", now: () => (t += 1000), enabled: true, sampleN: 1 });
@@ -54,7 +60,8 @@ ck("the legacy top-up arithmetic is still present at both sites (flag off = byte
 ck("legacy add_below_min still guards both legacy sites", count(/if \(add < MIN_ADD_USD\) \{ tr\.block\("add_below_min"\)/g) === 2);
 ck("new branches: one source record per evaluation, opened AFTER the dedup check (no record for a re-observed fill)", count(/tr\.source\(srcId, "add"\)/g) === 1 && count(/tr\.source\(srcId, srcKind\)/g) === 1 && count(/seenSource\(mine, srcId\)\) return;/g) === 1 && count(/seenSource\(mine, srcId\)\) continue;/g) === 1);
 ck("new branches keep no_rebuy (HARD_DUPLICATE after an exit) at both sites", count(/if \(V2\(\) && \(Number\(sig\.sell_seq\) \|\| 0\) > 0\) \{ tr\.block\("no_rebuy"\)/g) === 4);
-ck("new branches size ONE add under the ceiling with the $2 floor (position_ceiling is a HARD_RISK blocker)", count(/addSize\(\{ tierUsd: target, held, posCeil, floorUsd: V2_FLOOR_USD \}\)/g) === 2 && count(/tr\.block\("position_ceiling"/g) === 2);
+ck("new branches size ONE add under the CANONICAL 7% condition room with the $2 floor (condition_ceiling = HARD_RISK); the legacy 5% posCeil is not consulted there", count(/addSize\(\{ tierUsd: target, held, floorUsd: V2_FLOOR_USD, roomUsd: conditionRoomUsd\(state\.portfolio, held\) \}\)/g) === 2 && count(/tr\.block\("condition_ceiling"/g) === 2 && count(/const held = conditionHeldUsd\(positions, sig\.condition_id\)/g) === 2 && count(/tr\.block\("position_ceiling"/g) === 0);
+ck("legacy paths still use the 5% per-position ceiling (flag off = byte-for-byte)", count(/const posCeil = Math\.max\(MIN_ORDER_USD, \(\(state\.portfolio \|\| 0\) \* MAX_POSITION_PCT\) \/ 100\);/g) === 2);
 ck("new branches keep the exposure cap, the reserve and the cash clamp at both sites", count(/copyExposure\(positions\) \+ add > exposureCap/g) === 4 && count(/v2ReserveBlocked\(sig, add\)/g) === 4 && count(/buy\(sig, Math\.min\(add, state\.cash \?\? 0\), px, "add"/g) === 4);
 ck("poll branch: unknown watermark is seeded (with every stamped fill marked seen) and skipped - no retroactive add", count(/if \(mine\.src_hi == null\) \{ rememberSource\(mine, null, sig\.his_shares\); for \(const id of \(fillIdsOnRow\(sig\) \|\| \[\]\)\) rememberSource\(mine, id, null\); store\.save\(positions\); continue; \}/g) === 1);
 ck("poll branch: stamped fills give true identity (one unseen fill per cycle, oldest first); no fills -> aggregated fallback marked \"agg\"", count(/const ids = fillIdsOnRow\(sig\);/g) === 1 && count(/srcId = ids\.find\(\(id\) => !seenSource\(mine, id\)\) \|\| null;/g) === 1 && count(/srcKind = "agg";/g) === 1 && count(/tr\.source\(srcId, srcKind\)/g) === 1);

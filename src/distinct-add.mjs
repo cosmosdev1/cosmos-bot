@@ -50,13 +50,26 @@ export function isNewPollAdd(hisShares, watermark) {
  * Size ONE distinct add: the tier size for this trade, clipped to the room left under the per-position
  * ceiling, never below the $2 sizing floor. No room for a floor-sized order = position_ceiling (HARD_RISK).
  */
-export function addSize({ tierUsd, held, posCeil, floorUsd }) {
-  const room = Math.max(0, (Number(posCeil) || 0) - (Number(held) || 0));
+export function addSize({ tierUsd, held, posCeil, floorUsd, roomUsd }) {
+  const room = roomUsd != null ? Math.max(0, Number(roomUsd) || 0) : Math.max(0, (Number(posCeil) || 0) - (Number(held) || 0));
   const floor = Number(floorUsd) || 0;
   if (room < floor || !(room > 0)) return { add: 0, why: "position_ceiling", room };
   const add = Math.max(floor, Math.min(Number(tierUsd) || 0, room));
   return { add, why: null, room };
 }
+
+/**
+ * CONDITION EXPOSURE for the canonical ceiling (owner ruling 2026-09-08): the bot's 5% per-position constant is stale
+ * legacy strategy behaviour; the hard invariant is the server's 7% PER-CONDITION cap. A distinct ADD is sized by the
+ * tier rule and clipped only by the room left under 7% of the portfolio across BOTH sides of the condition, mirrored
+ * here so the bot refuses locally before spending a signature. Never exceeds 7%.
+ */
+export const CONDITION_CAP_PCT = 7;
+export function conditionHeldUsd(positions, conditionId) {
+  let s = 0; for (const p of Object.values(positions || {})) if (p && String(p.condition_id) === String(conditionId) && p.source === "copytrade") s += Number(p.size_usd) || 0;
+  return s;
+}
+export function conditionRoomUsd(portfolioUsd, heldUsd) { return Math.max(0, (Number(portfolioUsd) || 0) * CONDITION_CAP_PCT / 100 - (Number(heldUsd) || 0)); }
 
 /** Record a source id on the position and raise the whale-share watermark (bounded, in place). */
 export function rememberSource(pos, id, hisShares, max = 50) {
