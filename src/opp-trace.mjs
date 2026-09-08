@@ -346,12 +346,12 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
        * the same whale fill re-observed is not a new event. The record is closed by the first block()
        * or attempt() of the evaluation that opened it, so every source event terminates exactly once.
        */
-      source(id, kind) {
+      source(id, kind, extra) {
         try {
           if (!id) return this;
           if (!r.sources) r.sources = [];
           if (r.sources.some((s) => s.id === String(id))) return this;
-          r.sources.push({ id: String(id).slice(0, 160), k: kind ? String(kind).slice(0, 8) : null, at: now(), p: r.lastPath, blocks: [], an: null, aa: null, end: null, by: null });
+          r.sources.push({ id: String(id).slice(0, 160), k: kind ? String(kind).slice(0, 8) : null, at: now(), p: r.lastPath, blocks: [], an: null, aa: null, end: null, by: null, tb: Number.isFinite(Number(extra?.tb)) ? Number(extra.tb) : null, ta: Number.isFinite(Number(extra?.ta)) ? Number(extra.ta) : null });
           if (r.sources.length > MAX_SOURCES) r.sources = r.sources.slice(-MAX_SOURCES);
           markDirty(r);
         } catch { /* never throw into trading */ }
@@ -529,7 +529,7 @@ export function createTracer({ userId, now = Date.now, enabled = true, sampleN, 
           sc: r.signCode, vr: r.venueResult, fu: r.filledUsd, x: r.ctx,
           e: r.eligAt ? Math.round(r.eligAt / 1000) : null, en: r.eligN || 0,   // latest eligibility event (unix s) and how many
           ev: (r.events || []).map((v) => ({ n: v.n, at: Math.round(v.at / 1000), end: v.end ? Math.round(v.end / 1000) : null, by: v.by, bl: v.blocks, an: v.an, aa: v.aa ? Math.round(v.aa / 1000) : null })),
-          se: (r.sources || []).map((s) => ({ id: s.id, k: s.k, at: Math.round(s.at / 1000), p: s.p, bl: s.blocks, an: s.an, aa: s.aa ? Math.round(s.aa / 1000) : null, end: s.end ? Math.round(s.end / 1000) : null, by: s.by })),
+          se: (r.sources || []).map((s) => ({ id: s.id, k: s.k, at: Math.round(s.at / 1000), p: s.p, bl: s.blocks, an: s.an, aa: s.aa ? Math.round(s.aa / 1000) : null, end: s.end ? Math.round(s.end / 1000) : null, by: s.by, tb: s.tb, ta: s.ta })),
         });
         // A TERMINAL RECORD IS KEPT, NEVER FREED HERE. Deleting it looked like a memory win, but the
         // engine goes on iterating that row for the rest of its life: the next evaluation would

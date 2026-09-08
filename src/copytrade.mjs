@@ -949,6 +949,19 @@ export function startCopyTrade(deps) {
   const ncPcts = () => (LADDER_V2() ? NC_PCTS_HOSTED : NC_PCTS_LEGACY);
   const V2_CANDLE_PCTS = CANDLE_PCTS;
   const pctFromBands = ladderPct;
+  // CROSSING OBSERVATION (owner 2026-09-08): tier at our last fill on the position vs the tier now. An upward move is a
+  // tier crossing - one ledger record per (crossing, whale fill), opened BEFORE any gate so it terminates as an attempt
+  // or as the gate that stopped it. Observation only: the top-up arithmetic below is untouched by it.
+  const tierForCost = (sig, cost) => { const v2t = sig?.wallets?.[0]?.auto_tiers?.v2; if (!v2t) return null; return isCandleSig(sig) ? pctFromBands(Number(cost) || 0, v2t.candle, V2_CANDLE_PCTS) : pctFromBands(Number(cost) || 0, v2t.nc, ncPcts()); };
+  const observeCrossing = (tr, mine, sig, srcId, whale, positions) => {
+    if (!LADDER_V2()) return;
+    const ta = v2Pct(sig), tb = tierForCost(sig, mine?.copy_his_cost);
+    if (ta == null || tb == null) return;
+    if (!(ta > tb)) { if (Number(mine?.copy_tier_seen) > ta) { mine.copy_tier_seen = ta; store.save(positions); } return; }   // his tier fell: a later re-crossing is a new crossing
+    if (Number(mine?.copy_tier_seen) >= ta) return;                       // this crossing already terminated once
+    mine.copy_tier_seen = ta; store.save(positions);
+    tr.source(srcId || sourceId({ path: "poll", whale, token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg", { tb, ta });
+  };
   function v2Pct(sig) {
     const v2t = sig?.wallets?.[0]?.auto_tiers?.v2;
     if (!v2t) return null;                      // thresholds not computed yet -> caller falls back
@@ -1111,6 +1124,7 @@ export function startCopyTrade(deps) {
       // no order under the minimum. The whale fill behind it is the source event (whale, asset, tx), executed at most
       // once across the fast and poll paths (src/source-identity.mjs).
       const srcId = LADDER_V2() ? sourceId({ path: "fast", whale: driver, token: sig.token_id, fillId: meta?.fillId }) : null;
+      observeCrossing(tr, mine, sig, srcId, driver, positions);
       if (srcId && seenSource(mine, srcId)) { tr.block("source_done"); return; }
       let add = Math.min(target, posCeil) - held;
       if (add < addFloorUsd()) { tr.block("add_below_min"); return; }                              // at/over the ceiling or fully sized (steady-state)
@@ -1118,7 +1132,6 @@ export function startCopyTrade(deps) {
       const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
       if (px == null) { tr.block("price_out_of_band"); return skip("add price out of band"); }
       { const rb = v2ReserveBlocked(sig, add); if (rb) { tr.block("reserve_blocked"); return skip(rb); } }
-      if (LADDER_V2()) tr.source(srcId || sourceId({ path: "poll", whale: driver, token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
       const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
       if (ok && srcId) { rememberSource(mine, srcId); store.save(positions); }
       if (meta?.s4) { mInc("s4CanaryIntent"); if (ok) mInc("s4CanaryFilled"); }
@@ -1305,6 +1318,7 @@ export function startCopyTrade(deps) {
         // path owns the size, and this tick must not add on top of it from the old row
         if (s4Verdict === "suppress") { tr.block("s4_marker_suppressed"); stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
         const srcId = LADDER_V2() ? newestFillIdOnRow(sig) : null;   // the whale fill that most recently moved his position (server-stamped tx)
+        observeCrossing(tr, mine, sig, srcId, String(sig.wallets?.[0]?.wallet || ""), positions);
         if (srcId && seenSource(mine, srcId)) { tr.block("source_done"); continue; }   // its top-up already executed (fast path)
         const add = Math.min(target, posCeil) - (Number(mine.size_usd) || 0);
         if (add < addFloorUsd()) { tr.block("add_below_min"); continue; }                                // at the ceiling or no transition worth an order
@@ -1315,7 +1329,6 @@ export function startCopyTrade(deps) {
         const px = await priceFor(sig.token_id, G().priceBand ? addCapFor(sig) : G().entryCap, G().priceBand ? MIN_ADD_CENTS : G().entryFloor, tr);
         if (px == null) { tr.block("price_out_of_band"); continue; }
         if (v2ReserveBlocked(sig, add)) { tr.block("reserve_blocked"); continue; }
-        if (LADDER_V2()) tr.source(srcId || sourceId({ path: "poll", whale: String(sig.wallets?.[0]?.wallet || ""), token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg");
         const ok = await buy(sig, Math.min(add, state.cash ?? 0), px, "add", positions, mine, sig.condition_id, tr);
         if (ok && srcId) { rememberSource(mine, srcId); store.save(positions); }
         if (ok) buyTimes.push(Date.now());
