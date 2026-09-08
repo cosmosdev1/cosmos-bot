@@ -6,16 +6,19 @@
 //      gate is still consulted inside the new branches; no SELL/exit site references the switch.
 import assert from "node:assert";
 import fs from "node:fs";
-import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, POLL_SHARES_TOL } from "../src/distinct-add.mjs";
+import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, POLL_SHARES_TOL, fillIdsOnRow } from "../src/distinct-add.mjs";
 import { createTracer, STAGE } from "../src/opp-trace.mjs";
 let pass = 0, fail = 0;
 const ck = (n, c) => { if (c) { pass++; console.log("  ok   " + n); } else { fail++; console.log("  FAIL " + n); } };
 
 // ---- 1. helpers ---------------------------------------------------------------------------------------
 const W = "0xABCDEF0000000000000000000000000000000001", T = "123456789";
-ck("fast id = whale + token + the on-chain fill identity, lower-cased whale", sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#12#0" }) === "f:" + W.toLowerCase() + ":" + T + ":0xtx#12#0");
+ck("fast id = whale + token + the whale's TX (one order = one source event), lower-cased", sourceId({ path: "fast", whale: W, token: T, fillId: "0xTX#12#0" }) === "f:" + W.toLowerCase() + ":" + T + ":0xtx");
 ck("same fill re-delivered -> the same id (dedup key)", sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#12#0" }) === sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#12#0" }));
-ck("a different fill of the same whale on the same token -> a different id", sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#12#1" }) !== sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#12#0" }));
+ck("several maker fills of ONE whale order (same tx, other log/item) -> the SAME id, not several events", sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#12#1" }) === sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#13#0" }));
+ck("a different whale order (other tx) -> a different id", sourceId({ path: "fast", whale: W, token: T, fillId: "0xother#1#0" }) !== sourceId({ path: "fast", whale: W, token: T, fillId: "0xtx#12#0" }));
+ck("poll row with stamped fills -> tx-level ids identical to the fast path's, oldest first", JSON.stringify(fillIdsOnRow({ token_id: T, wallets: [{ wallet: W, fills: [{ tx: "0xB" }, { tx: "0xA" }] }] })) === JSON.stringify(["f:" + W.toLowerCase() + ":" + T + ":0xa", "f:" + W.toLowerCase() + ":" + T + ":0xb"]) && fillIdsOnRow({ token_id: T, wallets: [{ wallet: W, fills: [{ tx: "0xA" }] }] })[0] === sourceId({ path: "fast", whale: W, token: T, fillId: "0xA#3#0" }));
+ck("poll row WITHOUT stamped fills -> null (aggregated fallback applies, never claimed distinct)", fillIdsOnRow({ token_id: T, wallets: [{ wallet: W }] }) === null && fillIdsOnRow({ token_id: T, wallets: [{ wallet: W, fills: "junk" }] }) === null);
 ck("poll id = whale + token + cumulative shares (2dp); unchanged row -> same id", sourceId({ path: "poll", whale: W, token: T, hisShares: 1234.567 }) === "p:" + W.toLowerCase() + ":" + T + ":1234.57" && sourceId({ path: "poll", whale: W, token: T, hisShares: 1234.567 }) === sourceId({ path: "poll", whale: W, token: T, hisShares: 1234.5671 }));
 ck("fast path without a fill id falls back to the poll identity, never null-ids a real fill", sourceId({ path: "fast", whale: W, token: T, hisShares: 10 }) === "p:" + W.toLowerCase() + ":" + T + ":10.00");
 ck("no whale / no token / no shares -> null (nothing to key on)", sourceId({ path: "poll", whale: "", token: T, hisShares: 10 }) === null && sourceId({ path: "poll", whale: W, token: "", hisShares: 10 }) === null && sourceId({ path: "poll", whale: W, token: T, hisShares: 0 }) === null);
@@ -49,11 +52,12 @@ const count = (re) => (src.match(re) || []).length;
 ck("the switch is consulted at exactly 4 sites: fast ADD, poll ADD, fast open clip, poll open clip", count(/DISTINCT_ADD\(\)/g) === 4);
 ck("the legacy top-up arithmetic is still present at both sites (flag off = byte-for-byte old behaviour)", count(/let add = Math\.min\(target, posCeil\) - held;/g) === 1 && count(/const add = Math\.min\(target, posCeil\) - \(Number\(mine\.size_usd\) \|\| 0\);/g) === 1);
 ck("legacy add_below_min still guards both legacy sites", count(/if \(add < MIN_ADD_USD\) \{ tr\.block\("add_below_min"\)/g) === 2);
-ck("new branches: one source record per evaluation, opened AFTER the dedup check (no record for a re-observed fill)", count(/tr\.source\(srcId, "add"\)/g) === 2 && count(/seenSource\(mine, srcId\)\) return;/g) === 1 && count(/seenSource\(mine, srcId\)\) continue;/g) === 1);
+ck("new branches: one source record per evaluation, opened AFTER the dedup check (no record for a re-observed fill)", count(/tr\.source\(srcId, "add"\)/g) === 1 && count(/tr\.source\(srcId, srcKind\)/g) === 1 && count(/seenSource\(mine, srcId\)\) return;/g) === 1 && count(/seenSource\(mine, srcId\)\) continue;/g) === 1);
 ck("new branches keep no_rebuy (HARD_DUPLICATE after an exit) at both sites", count(/if \(V2\(\) && \(Number\(sig\.sell_seq\) \|\| 0\) > 0\) \{ tr\.block\("no_rebuy"\)/g) === 4);
 ck("new branches size ONE add under the ceiling with the $2 floor (position_ceiling is a HARD_RISK blocker)", count(/addSize\(\{ tierUsd: target, held, posCeil, floorUsd: V2_FLOOR_USD \}\)/g) === 2 && count(/tr\.block\("position_ceiling"/g) === 2);
 ck("new branches keep the exposure cap, the reserve and the cash clamp at both sites", count(/copyExposure\(positions\) \+ add > exposureCap/g) === 4 && count(/v2ReserveBlocked\(sig, add\)/g) === 4 && count(/buy\(sig, Math\.min\(add, state\.cash \?\? 0\), px, "add"/g) === 4);
-ck("poll branch: unknown watermark is seeded and skipped (no retroactive add); unchanged count is skipped silently", count(/if \(mine\.src_hi == null\) \{ rememberSource\(mine, null, sig\.his_shares\); store\.save\(positions\); continue; \}/g) === 1 && count(/if \(!isNewPollAdd\(sig\.his_shares, mine\.src_hi\)\) continue;/g) === 1);
+ck("poll branch: unknown watermark is seeded (with every stamped fill marked seen) and skipped - no retroactive add", count(/if \(mine\.src_hi == null\) \{ rememberSource\(mine, null, sig\.his_shares\); for \(const id of \(fillIdsOnRow\(sig\) \|\| \[\]\)\) rememberSource\(mine, id, null\); store\.save\(positions\); continue; \}/g) === 1);
+ck("poll branch: stamped fills give true identity (one unseen fill per cycle, oldest first); no fills -> aggregated fallback marked \"agg\"", count(/const ids = fillIdsOnRow\(sig\);/g) === 1 && count(/srcId = ids\.find\(\(id\) => !seenSource\(mine, id\)\) \|\| null;/g) === 1 && count(/srcKind = "agg";/g) === 1 && count(/tr\.source\(srcId, srcKind\)/g) === 1);
 ck("fast branch: the fill's shares raise the watermark so the next sweep does not re-count the same fill", count(/rememberSource\(mine, srcId, \(Number\(mine\.src_hi\) \|\| 0\) \+ \(Number\(meta\?\.shares\) \|\| 0\)\)/g) === 1);
 ck("open clips record their source and seed the watermark only when the flag is on", count(/const openSrc = DISTINCT_ADD\(\) \? sourceId\(/g) === 2 && count(/if \(openSrc && ok && positions\[key\]\) \{ rememberSource\(positions\[key\], openSrc, sig\.his_shares\)/g) === 2);
 ck("the strategy gates inside the new branches still go through the high-capture profile", count(/G\(\)\.priceBand \? addCapFor\(sig\) : G\(\)\.entryCap, G\(\)\.priceBand \? MIN_ADD_CENTS : G\(\)\.entryFloor/g) === 4 && count(/G\(\)\.driverMatch && boundTo/g) === 2);

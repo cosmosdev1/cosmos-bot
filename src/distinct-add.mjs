@@ -20,10 +20,19 @@
 export function sourceId({ path, whale, token, fillId, hisShares }) {
   const w = String(whale || "").toLowerCase(), t = String(token || "");
   if (!w || !t) return null;
-  if (path === "fast" && fillId) return `f:${w}:${t}:${String(fillId)}`;
+  // one whale ORDER can match several makers (several logs, one tx): identity is the tx, so both paths agree
+  if (path === "fast" && fillId) return `f:${w}:${t}:${String(fillId).split("#")[0].toLowerCase()}`;
   const s = Number(hisShares);
   if (!Number.isFinite(s) || s <= 0) return null;
   return `p:${w}:${t}:${s.toFixed(2)}`;
+}
+
+/** Distinct fill ids stamped on the row by the server sweep (wallets[0].fills, newest first), oldest first here. */
+export function fillIdsOnRow(sig) {
+  const w = String(sig?.wallets?.[0]?.wallet || "").toLowerCase(), t = String(sig?.token_id || "");
+  const fills = Array.isArray(sig?.wallets?.[0]?.fills) ? sig.wallets[0].fills : null;
+  if (!w || !t || !fills) return null;                       // null = the row carries no identity (aggregated fallback applies)
+  return fills.map((f) => String(f?.tx || "").toLowerCase()).filter(Boolean).reverse().map((tx) => `f:${w}:${t}:${tx}`);
 }
 
 /** The server sweep's own "same shares" tolerance: below it the row is not considered changed. */

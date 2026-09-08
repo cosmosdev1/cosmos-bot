@@ -31,7 +31,7 @@ const DRY = process.env.COPYTRADE_DRY === "1";
 import { inc as mInc } from "./metrics.mjs";
 import { withS4Attribution } from "./remote-signer.mjs";
 import { gateProfile } from "./high-capture.mjs";
-import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource } from "./distinct-add.mjs";
+import { sourceId, isNewPollAdd, addSize, rememberSource, seenSource, fillIdsOnRow } from "./distinct-add.mjs";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
 // How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
 // so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
@@ -1328,14 +1328,19 @@ export function startCopyTrade(deps) {
           // DISTINCT-ADD SEMANTICS (owner 2026-09-07, src/distinct-add.mjs): a distinct whale ADD shows here as a higher
           // cumulative share count on the row after the server sweep. Unchanged count = the same fill re-polled, not a
           // new event. Pre-existing positions start at the current count. Every hard gate below is unchanged.
-          if (mine.src_hi == null) { rememberSource(mine, null, sig.his_shares); store.save(positions); continue; }
-          if (!isNewPollAdd(sig.his_shares, mine.src_hi)) continue;
+          if (mine.src_hi == null) { rememberSource(mine, null, sig.his_shares); for (const id of (fillIdsOnRow(sig) || [])) rememberSource(mine, id, null); store.save(positions); continue; }
+          // TRUE IDENTITY when the row carries his fills (tx hashes): one unseen fill per cycle, oldest first. AGGREGATED
+          // FALLBACK only when the row carries none: the share delta may hide several fills, so it is recorded as "agg"
+          // and never counted as a distinct source event by the ledger.
           const whale = String(sig.wallets?.[0]?.wallet || "").toLowerCase();
-          const srcId = sourceId({ path: "poll", whale, token: sig.token_id, hisShares: sig.his_shares });
+          const ids = fillIdsOnRow(sig);
+          let srcId = null, srcKind = "add";
+          if (ids) { srcId = ids.find((id) => !seenSource(mine, id)) || null; if (!srcId) { if (Number(sig.his_shares) > (Number(mine.src_hi) || 0)) rememberSource(mine, null, sig.his_shares); continue; } }
+          else { if (!isNewPollAdd(sig.his_shares, mine.src_hi)) continue; srcId = sourceId({ path: "poll", whale, token: sig.token_id, hisShares: sig.his_shares }); srcKind = "agg"; }
           if (!srcId || seenSource(mine, srcId)) continue;
           rememberSource(mine, srcId, sig.his_shares);
           store.save(positions);
-          tr.source(srcId, "add");
+          tr.source(srcId, srcKind);
           if (V2() && (Number(sig.sell_seq) || 0) > 0) { tr.block("no_rebuy"); continue; }
           if (s4Verdict === "suppress") { tr.block("s4_marker_suppressed"); stats.s4Suppressed = (stats.s4Suppressed ?? 0) + 1; mInc("s4CanarySuppressed"); continue; }
           const held = Number(mine.size_usd) || 0;
