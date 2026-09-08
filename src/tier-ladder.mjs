@@ -36,3 +36,17 @@ export function topUp({ pct, portfolioUsd, heldUsd, ceilPct, floorUsd }) {
   const add = Math.max(0, Math.min(target, cap) - held);
   return { target, cap, add, order: add >= (Number(floorUsd) || 0) && add > 0 };
 }
+
+/**
+ * WHALE-TIER WATERMARK (owner 2026-09-08). Crossing detection is about the WHALE's tier state, never about whether
+ * Cosmos filled the previous top-up. `watermark` = the last processed whale tier for this position; `newTier` = his
+ * tier now. Exactly one crossing opens when newTier > watermark; the watermark moves to newTier either way (up or
+ * down), so a later same-tier ADD is not a crossing and a genuine fall then re-rise is a new crossing.
+ * A null/unknown watermark is seeded with `seed` (the tier we last sized at) without opening a crossing when equal.
+ */
+export function whaleTierStep({ watermark, newTier, seed }) {
+  const nt = Number(newTier);
+  if (newTier == null || !Number.isFinite(nt)) return { watermark, crossing: false, tierBefore: null };   // unknown tier: touch nothing
+  const wm = Number.isFinite(Number(watermark)) && watermark != null ? Number(watermark) : (Number.isFinite(Number(seed)) && seed != null ? Number(seed) : nt);
+  return { watermark: nt, crossing: nt > wm, tierBefore: wm };
+}

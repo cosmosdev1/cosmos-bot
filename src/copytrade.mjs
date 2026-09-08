@@ -32,7 +32,7 @@ import { inc as mInc } from "./metrics.mjs";
 import { withS4Attribution } from "./remote-signer.mjs";
 import { gateProfile } from "./high-capture.mjs";
 import { sourceId, newestFillIdOnRow, rememberSource, seenSource } from "./source-identity.mjs";
-import { NC_PCTS_HOSTED, NC_PCTS_LEGACY, CANDLE_PCTS, POSITION_CEIL_PCT_HOSTED, pctFromBands as ladderPct } from "./tier-ladder.mjs";
+import { NC_PCTS_HOSTED, NC_PCTS_LEGACY, CANDLE_PCTS, POSITION_CEIL_PCT_HOSTED, pctFromBands as ladderPct, whaleTierStep } from "./tier-ladder.mjs";
 const POLL_MS = N("COPY_POLL_MS", 20_000);
 // How often the POLLED feed may actually be re-fetched (the cycle itself still runs every POLL_MS
 // so cash/sizing stay fresh for chainwatch). Matches the server's 45s feed cache.
@@ -953,14 +953,18 @@ export function startCopyTrade(deps) {
   // tier crossing - one ledger record per (crossing, whale fill), opened BEFORE any gate so it terminates as an attempt
   // or as the gate that stopped it. Observation only: the top-up arithmetic below is untouched by it.
   const tierForCost = (sig, cost) => { const v2t = sig?.wallets?.[0]?.auto_tiers?.v2; if (!v2t) return null; return isCandleSig(sig) ? pctFromBands(Number(cost) || 0, v2t.candle, V2_CANDLE_PCTS) : pctFromBands(Number(cost) || 0, v2t.nc, ncPcts()); };
+  // WHALE-TIER WATERMARK (owner correction 2026-09-08): crossing = previous PROCESSED whale tier -> his tier now, kept on
+  // the position as `whale_tier`, moved on every observation whether the crossing ends ATTEMPT, HARD or BELOW_MIN. It is
+  // independent of whether Cosmos filled anything; sizing stays target - held. A position from before the watermark is
+  // seeded with the tier we last sized at (his tier at our last fill), never opening a retroactive crossing.
   const observeCrossing = (tr, mine, sig, srcId, whale, positions) => {
-    if (!LADDER_V2()) return;
-    const ta = v2Pct(sig), tb = tierForCost(sig, mine?.copy_his_cost);
-    if (ta == null || tb == null) return;
-    if (!(ta > tb)) { if (Number(mine?.copy_tier_seen) > ta) { mine.copy_tier_seen = ta; store.save(positions); } return; }   // his tier fell: a later re-crossing is a new crossing
-    if (Number(mine?.copy_tier_seen) >= ta) return;                       // this crossing already terminated once
-    mine.copy_tier_seen = ta; store.save(positions);
-    tr.source(srcId || sourceId({ path: "poll", whale, token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg", { tb, ta });
+    if (!LADDER_V2() || !mine) return;
+    const ta = v2Pct(sig);
+    if (ta == null) return;
+    const step = whaleTierStep({ watermark: mine.whale_tier, newTier: ta, seed: tierForCost(sig, mine.copy_his_cost) });
+    if (mine.whale_tier !== step.watermark) { mine.whale_tier = step.watermark; store.save(positions); }
+    if (!step.crossing) return;
+    tr.source(srcId || sourceId({ path: "poll", whale, token: sig.token_id, hisShares: sig.his_shares }), srcId ? "add" : "agg", { tb: step.tierBefore, ta });
   };
   function v2Pct(sig) {
     const v2t = sig?.wallets?.[0]?.auto_tiers?.v2;

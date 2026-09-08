@@ -3,8 +3,9 @@
 //   5 the position never exceeds 6.5% locally · 6 the server 7% cap is untouched by the bot · 7 fast + poll same source tx executes once
 //   8 SELL behaviour unchanged · 9 no switch can activate the withdrawn distinct-ADD semantics.
 import assert from "node:assert";
+import { createTracer, STAGE } from "../src/opp-trace.mjs";
 import fs from "node:fs";
-import { NC_PCTS_HOSTED, NC_PCTS_LEGACY, CANDLE_PCTS, POSITION_CEIL_PCT_HOSTED, POSITION_CEIL_PCT_LEGACY, SERVER_CONDITION_CAP_PCT, pctFromBands, topUp } from "../src/tier-ladder.mjs";
+import { NC_PCTS_HOSTED, NC_PCTS_LEGACY, CANDLE_PCTS, POSITION_CEIL_PCT_HOSTED, POSITION_CEIL_PCT_LEGACY, SERVER_CONDITION_CAP_PCT, pctFromBands, topUp, whaleTierStep } from "../src/tier-ladder.mjs";
 import { sourceId, fillIdsOnRow, newestFillIdOnRow, rememberSource, seenSource } from "../src/source-identity.mjs";
 let pass = 0, fail = 0;
 const ck = (n, c) => { if (c) { pass++; console.log("  ok   " + n); } else { fail++; console.log("  FAIL " + n); } };
@@ -41,6 +42,23 @@ ck("1 money-in maps to the band: $1500->6, $500->5, $150->4, $50->0, no threshol
   ck("7 a later distinct whale fill (other tx) is a new source", seenSource(pos, sourceId({ path: "fast", whale: W, token: TOK, fillId: "0xTX2#1#0" })) === false);
   ck("7 several maker fills of one whale order (same tx) are one source", sourceId({ path: "fast", whale: W, token: TOK, fillId: "0xtx1#8#1" }) === fast);
   ck("7 a row without stamped fills has no true identity (null), never a fabricated one", newestFillIdOnRow({ token_id: TOK, wallets: [{ wallet: W }] }) === null && fillIdsOnRow({ token_id: TOK, wallets: [{ wallet: W }] }) === null); }
+// ---- the owner's regression cases (2026-09-08): crossing detection on the WHALE's tier state, not on our fills ----
+{ const run = (seq, wm = null) => { const out = []; for (const nt of seq) { const st = whaleTierStep({ watermark: wm, newTier: nt, seed: 4 }); wm = st.watermark; out.push(st.crossing ? st.tierBefore + ">" + nt : "-"); } return out.join(" "); };
+  ck("4 -> 5 attempted/filled, then same-tier ADD -> no new crossing", run([5, 5]) === "4>5 -");
+  ck("4 -> 5 BELOW_MIN (no fill), then same-tier ADD -> no new crossing (watermark moved anyway)", run([5, 5, 5]) === "4>5 - -");
+  ck("4 -> 5 HARD denial (no fill), then same-tier ADD -> no new crossing", run([5, 5]) === "4>5 -" && whaleTierStep({ watermark: 5, newTier: 5, seed: 4 }).crossing === false);
+  ck("4 -> 5 -> 6: a second genuine crossing", run([5, 6]) === "4>5 5>6");
+  ck("5 -> 4 -> 5: the fall moves the watermark down, the re-cross is a genuine new crossing", run([4, 5], 5) === "- 4>5");
+  ck("unknown watermark is seeded from the tier we last sized at: equal tier opens nothing, a higher tier opens one", whaleTierStep({ watermark: null, newTier: 4, seed: 4 }).crossing === false && whaleTierStep({ watermark: undefined, newTier: 5, seed: 4 }).crossing === true && whaleTierStep({ watermark: null, newTier: 5, seed: null }).crossing === false);
+  ck("junk tier never opens a crossing and leaves the watermark alone", whaleTierStep({ watermark: 5, newTier: NaN, seed: 4 }).crossing === false && whaleTierStep({ watermark: 5, newTier: null, seed: 4 }).watermark === 5);
+  // fast + poll seeing the SAME whale tx: the first observation opens the crossing and moves the watermark; the second
+  // sees watermark == tier (no crossing), and even a re-open with the same id is idempotent in the tracer
+  let t2 = 5_000_000; const tr = createTracer({ userId: "u", now: () => (t2 += 1000), enabled: true, sampleN: 1 });
+  const r = tr.open({ tokenId: "88", gen: 0, path: "fast", conditionId: "0xc", outcome: "Yes", category: "SPORTS", whale: "0xw", question: "q" }); r.stage(40);
+  let wm = 4; const a = whaleTierStep({ watermark: wm, newTier: 5, seed: 4 }); wm = a.watermark; if (a.crossing) r.source("f:0xw:88:0xtx9", "add", { tb: a.tierBefore, ta: 5 }); r.attempt({ kind: "add", usd: 3 });
+  const b = whaleTierStep({ watermark: wm, newTier: 5, seed: 4 }); if (b.crossing) r.source("f:0xw:88:0xtx9", "add", { tb: b.tierBefore, ta: 5 }); r.source("f:0xw:88:0xtx9", "add", { tb: 4, ta: 5 });
+  const se = tr.drain().find((x) => x.t === "88").se;
+  ck("fast + poll same tx -> ONE crossing record (watermark stops the second, the tracer id-dedups a forced repeat)", b.crossing === false && se.length === 1 && se[0].id === "f:0xw:88:0xtx9" && se[0].tb === 4 && se[0].ta === 5 && se[0].by === "attempt"); }
 // tracer: tier before/after ride the record and the export
 { let t = 1_000_000; const tr = (await import("../src/opp-trace.mjs")).createTracer({ userId: "u", now: () => (t += 1000), enabled: true, sampleN: 1 });
   const r = tr.open({ tokenId: "77", gen: 0, path: "poll", conditionId: "0xc", outcome: "Yes", category: "SPORTS", whale: "0xw", question: "q" }); r.stage(40);
@@ -55,8 +73,8 @@ ck("ladder wiring: the switch picks NC_PCTS_HOSTED, everyone else NC_PCTS_LEGACY
 ck("ceiling wiring: both posCeil sites use positionCeilPct() (switch 6.5, everyone else MAX_POSITION_PCT = 5)", count(/\(\(state\.portfolio \|\| 0\) \* positionCeilPct\(\)\) \/ 100/g) === 2 && count(/const positionCeilPct = \(\) => \(LADDER_V2\(\) \? POSITION_CEIL_PCT_HOSTED : MAX_POSITION_PCT\);/g) === 1 && count(/\* MAX_POSITION_PCT\) \/ 100/g) === 0);
 ck("top-up arithmetic is the tier-crossing delta at both sites (target - held), floored at the hosted $2 minimum", count(/let add = Math\.min\(target, posCeil\) - held;/g) === 1 && count(/const add = Math\.min\(target, posCeil\) - \(Number\(mine\.size_usd\) \|\| 0\);/g) === 1 && count(/if \(add < addFloorUsd\(\)\) \{ tr\.block\("add_below_min"\)/g) === 2 && count(/const addFloorUsd = \(\) => \(LADDER_V2\(\) \? V2_FLOOR_USD : MIN_ADD_USD\);/g) === 1);
 ck("7 both top-up sites refuse a source already executed (source_done) BEFORE sizing, and remember it only on a fill", count(/if \(srcId && seenSource\(mine, srcId\)\) \{ tr\.block\("source_done"\)/g) === 2 && count(/if \(ok && srcId\) \{ rememberSource\(mine, srcId\); store\.save\(positions\); \}/g) === 2);
-ck("ledger: a crossing record is opened at OBSERVATION (before source_done, sizing and every gate) at both top-up sites, with tier before/after; nothing is opened at attempt time", count(/observeCrossing\(tr, mine, sig, srcId, /g) === 2 && count(/const srcId = LADDER_V2\(\) \? /g) === 2 && count(/tr\.source\(srcId \|\| sourceId\(\{ path: "poll", whale, token: sig\.token_id, hisShares: sig\.his_shares \}\), srcId \? "add" : "agg", \{ tb, ta \}\)/g) === 1 && src.indexOf("observeCrossing(tr, mine, sig, srcId, driver") < src.indexOf('tr.block("source_done"); return;') && src.indexOf("observeCrossing(tr, mine, sig, srcId, String(") < src.indexOf('tr.block("source_done"); continue;'));
-ck("ledger: only an UPWARD tier move opens a record, once per crossing (copy_tier_seen), and a fall re-arms it; observation never changes sizing", /if \(!\(ta > tb\)\) \{ if \(Number\(mine\?\.copy_tier_seen\) > ta\)/.test(src) && /if \(Number\(mine\?\.copy_tier_seen\) >= ta\) return;/.test(src) && /const observeCrossing = \(tr, mine, sig, srcId, whale, positions\) => \{/.test(src) && /if \(!LADDER_V2\(\)\) return;\r?\n\s+const ta = v2Pct\(sig\), tb = tierForCost\(sig, mine\?\.copy_his_cost\);/.test(src));
+ck("ledger: a crossing record is opened at OBSERVATION (before source_done, sizing and every gate) at both top-up sites, with tier before/after; nothing is opened at attempt time", count(/observeCrossing\(tr, mine, sig, srcId, /g) === 2 && count(/const srcId = LADDER_V2\(\) \? /g) === 2 && count(/tr\.source\(srcId \|\| sourceId\(\{ path: "poll", whale, token: sig\.token_id, hisShares: sig\.his_shares \}\), srcId \? "add" : "agg", \{ tb: step\.tierBefore, ta \}\)/g) === 1 && src.indexOf("observeCrossing(tr, mine, sig, srcId, driver") < src.indexOf('tr.block("source_done"); return;') && src.indexOf("observeCrossing(tr, mine, sig, srcId, String(") < src.indexOf('tr.block("source_done"); continue;'));
+ck("ledger: crossing = previous PROCESSED whale tier -> tier now (whale_tier watermark, moved on every observation, independent of fills); observation never changes sizing", /const step = whaleTierStep\(\{ watermark: mine\.whale_tier, newTier: ta, seed: tierForCost\(sig, mine\.copy_his_cost\) \}\);/.test(src) && /if \(mine\.whale_tier !== step\.watermark\) \{ mine\.whale_tier = step\.watermark; store\.save\(positions\); \}/.test(src) && /if \(!step\.crossing\) return;/.test(src) && !/copy_tier_seen/.test(src) && /const observeCrossing = \(tr, mine, sig, srcId, whale, positions\) => \{/.test(src) && /if \(!LADDER_V2\(\) \|\| !mine\) return;\r?\n\s+const ta = v2Pct\(sig\);/.test(src));
 // 8. SELL unchanged: no exit-side line references any of this work
 const sellLines = src.split("\n").filter((l) => /\bsell\(|mirrorSell|copyExit|exitStep|sell_seq|SELL/.test(l) && /sourceId|rememberSource|seenSource|positionCeilPct|addFloorUsd|tr\.source\(/.test(l));
 ck("8 no SELL/exit line references the ladder, the ceiling, the floor or the source identity", sellLines.length === 0);
